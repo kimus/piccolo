@@ -140,7 +140,7 @@ Rebranding rules (verified against v0.3.1 client output):
 - The assistant name comes from the default agent's `AGENT.md` frontmatter (fallback: "Piccolo").
 - Interactive: swallow everything up to the `Interactive mode (Ctrl+C to exit)` sentinel; print our own header; the 🦞 emoji is replaced by the assistant name everywhere (handles emoji split across writes).
 - One-shot: swallow the leading banner up to its terminating space-only line (both color and plain banners end with `" \x1b[0m\r\n"` / `" \r\n"`).
-- PicoClaw client log lines (`HH:MM:SS ERR|WRN|INF|DBG|FTL|TRC ...`) are suppressed in chat — full detail stays available via `piccolo logs`.
+- PicoClaw client log lines (`HH:MM:SS ERR|WRN|INF|DBG|FTL|TRC ...`) are suppressed in chat — full detail stays available via `piccolo logs`. Matching strips full CSI sequences (TTY mode colorizes logs) and leading readline artifacts (space, backspace) that share the line; cursor-position queries (`\x1b[6n`) embedded in a suppressed line are forwarded, because the remote readline blocks until the terminal answers them.
 - Safety: if a sentinel is not found within 8 KiB, the filter degrades to plain pass-through + emoji replacement, so an upstream banner change can never break or eat the stream.
 
 For the web console, the wizard's **web** mode selects the launcher image; the browser chat lives at `http://127.0.0.1:18800`.
@@ -198,7 +198,7 @@ Reduced tool allowlists (research: `web_search`, `web_fetch`, `read_file`; coder
 - Docker deps pinned exactly (go-sdk is pre-1.0, never float): `github.com/docker/go-sdk/client v0.1.0-alpha013`, `github.com/moby/moby/api v1.52.0`, `github.com/moby/moby/client v0.1.0`, `github.com/containerd/errdefs v1.0.0`.
 - Reuse from `../piccolo-full`: `internal/isolation/dockerapi` pattern (prepare/start split, attach-before-start, stale removal by name, pull-once, ownership labels, demuxed stdio) and the `Runner`/`Process` interfaces.
 - Deterministic generation everywhere: sorted keys, stable templates — workspace diffs must be readable.
-- Package layout: `cmd/piccolo`, `internal/manifest`, `internal/generate`, `internal/doctor`, `internal/docker`, `internal/wizard`.
+- Package layout: `cmd/piccolo` (CLI: root/init/doctor/serve/lifecycle/chat), `internal/manifest` (piccolo.yaml), `internal/picoclaw` (config.json schema v3), `internal/generate` (plan/render/write), `internal/doctor` (checks), `internal/docker` (SDK runner), `internal/wizard` (huh prompts), `internal/workspace` (dir resolution).
 
 ## Acceptance Criteria
 
