@@ -213,6 +213,7 @@ func runServeDetached(cmd *cobra.Command) error {
 	fmt.Fprintf(sc.stdout, "  health: %s\n", sc.health)
 	if sc.webURL != "" {
 		fmt.Fprintf(sc.stdout, "  web:    %s\n", sc.webURL)
+		fmt.Fprintf(sc.stdout, "          first run: open %s/launcher-setup to create the dashboard password\n", sc.webURL)
 	}
 	fmt.Fprintf(sc.stdout, "\nNext:\n")
 	fmt.Fprintf(sc.stdout, "  piccolo chat        interactive terminal chat\n")

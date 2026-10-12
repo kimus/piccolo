@@ -160,7 +160,7 @@ piccolo chat              # interactive REPL (history, exit/quit)
 piccolo chat -m "hello"   # one-shot question
 ```
 
-For the **web console**, init with `--mode web` (launcher image) and open `http://127.0.0.1:18800` after `serve`.
+For the **web console**, init with `--mode web` (launcher image) and open `http://127.0.0.1:18800` after `serve` — on first run it redirects to `/launcher-setup` where you create the dashboard password.
 
 ### `piccolo status` / `piccolo logs` / `piccolo stop`
 

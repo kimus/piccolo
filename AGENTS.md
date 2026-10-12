@@ -27,7 +27,7 @@ Verified against `github.com/sipeed/picoclaw@v0.3.1` source (present in the Go m
 - PicoClaw home also holds `auth.json`, default `workspace/`, global `skills/`, channel state — runtime writes back, so mount the WHOLE workspace dir, not just `config.json`.
 - Health API: `/health` and `/ready` are **unauthenticated**; only `POST /reload` requires a bearer token (`pkg/health/server.go`). Served on `gateway.port` (default **18790**, config key `gateway.port`, env `PICOCLAW_GATEWAY_PORT`).
 - The gateway binds `localhost` by default. A process on the container's loopback is **unreachable through published ports** — when publishing, piccolo injects `PICOCLAW_GATEWAY_HOST=0.0.0.0` into the container env (unless the manifest already sets it, or network mode is `host`). Verified by smoke test.
-- Clients: the ONLY terminal client is `picoclaw agent` (readline REPL; `-m` for one-shot). There is no `picoclaw-launcher-tui` — the launcher is web-only (`picoclaw-launcher`, React dashboard :18800, proxies chat to the gateway via `/pico/ws`, spawns `picoclaw gateway -E` as its own child in the launcher image).
+- Clients: the ONLY terminal client is `picoclaw agent` (readline REPL; `-m` for one-shot). There is no `picoclaw-launcher-tui` — the launcher is web-only (`picoclaw-launcher`, React dashboard :18800, proxies chat to the gateway via `/pico/ws`, spawns `picoclaw gateway -E` as its own child in the launcher image). First run: `:18800` redirects to `/launcher-setup` (create dashboard password), afterwards `/launcher-login`. Verified live: launcher image works with a pre-mounted `config.json`, the gateway health port (:18790) is served by the launcher's gateway child.
 
 ## Workspace & Mounting
 
@@ -227,7 +227,6 @@ Reduced tool allowlists (research: `web_search`, `web_fetch`, `read_file`; coder
 
 ## Open Questions (verify during implementation)
 
-- Launcher image (`--mode web`) end-to-end smoke test: confirm the launcher entrypoint handles a pre-mounted `config.json`, the web console chat works, and dashboard-token behavior.
 - Container stop grace period (currently 10s, then kill).
 
-Resolved during implementation: runtime tool names verified (`web_search`, `web_fetch`, `message`, `spawn`, `subagent`, `exec`, `read_file`, ...); `~/.picoclaw/...` tilde expansion verified by a live agent turn; gateway-image entrypoint behavior verified; `/health` requires no auth.
+Resolved during implementation: runtime tool names verified (`web_search`, `web_fetch`, `message`, `spawn`, `subagent`, `exec`, `read_file`, ...); `~/.picoclaw/...` tilde expansion verified by a live agent turn; gateway-image entrypoint behavior verified; `/health` requires no auth; launcher image (`--mode web`) smoke-tested end-to-end (health via gateway child, `:18800` → `/launcher-setup` password flow).
