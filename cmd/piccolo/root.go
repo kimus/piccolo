@@ -16,6 +16,6 @@ func newRootCmd() *cobra.Command {
 		SilenceErrors: false,
 	}
 	root.PersistentFlags().StringVarP(&dirFlag, "dir", "D", "", "workspace directory (default: current directory)")
-	root.AddCommand(newInitCmd(), newDoctorCmd(), newServeCmd())
+	root.AddCommand(newInitCmd(), newDoctorCmd(), newServeCmd(), newStopCmd(), newStatusCmd(), newLogsCmd(), newChatCmd())
 	return root
 }

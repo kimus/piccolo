@@ -51,6 +51,9 @@ type Spec struct {
 	Ports   []string
 	Env     []string // KEY=value pairs, already resolved
 	Labels  map[string]string
+	// Detach runs the container in the background without stdio attachment
+	// (logs remain available through the daemon).
+	Detach bool
 }
 
 // Process is a running container with its PID1 stdio attached.
@@ -189,15 +192,16 @@ func (r *Runner) Prepare(spec Spec) (*preparedContainer, error) {
 	}
 
 	init := true
+	attach := !spec.Detach
 	config := &mobycontainer.Config{
 		Image:        spec.Image,
 		Env:          spec.Env,
 		Labels:       labels,
-		OpenStdin:    true,
-		StdinOnce:    true,
-		AttachStdin:  true,
-		AttachStdout: true,
-		AttachStderr: true,
+		OpenStdin:    attach,
+		StdinOnce:    attach,
+		AttachStdin:  attach,
+		AttachStdout: attach,
+		AttachStderr: attach,
 		Tty:          false,
 		ExposedPorts: exposedPorts,
 	}
@@ -254,13 +258,233 @@ func (r *Runner) Start(ctx context.Context, prepared *preparedContainer) (Proces
 	return proc, nil
 }
 
-// Run prepares and starts the spec in one step.
+// Run prepares and starts the spec in one step (attached, foreground).
 func (r *Runner) Run(ctx context.Context, spec Spec) (Process, error) {
 	prepared, err := r.Prepare(spec)
 	if err != nil {
 		return nil, err
 	}
 	return r.Start(ctx, prepared)
+}
+
+// StartDetached creates and starts the container in the background, returning
+// its id. The container keeps running after piccolo exits.
+func (r *Runner) StartDetached(ctx context.Context, spec Spec) (string, error) {
+	spec.Detach = true
+	prepared, err := r.Prepare(spec)
+	if err != nil {
+		return "", err
+	}
+	cli, err := r.newClient(ctx)
+	if err != nil {
+		return "", fmt.Errorf("connect to container daemon: %w", err)
+	}
+	if prepared.Name != "" {
+		removeStaleByName(ctx, cli, prepared.Name)
+	}
+	id, err := createContainer(ctx, cli, prepared)
+	if err != nil {
+		return "", err
+	}
+	if _, err := cli.ContainerStart(ctx, id, mobyclient.ContainerStartOptions{}); err != nil {
+		stopRemove(ctx, cli, id)
+		return "", fmt.Errorf("start container: %w", err)
+	}
+	return id, nil
+}
+
+// State describes a container's current lifecycle status.
+type State struct {
+	Found    bool
+	Running  bool
+	Status   string
+	ExitCode int
+}
+
+// StateByName inspects a container by name.
+func (r *Runner) StateByName(ctx context.Context, name string) (State, error) {
+	cli, err := r.newClient(ctx)
+	if err != nil {
+		return State{}, err
+	}
+	found, err := cli.FindContainerByName(ctx, name)
+	if err != nil {
+		if errdefs.IsNotFound(err) {
+			return State{}, nil
+		}
+		return State{}, err
+	}
+	if found == nil {
+		return State{}, nil
+	}
+	res, err := cli.ContainerInspect(ctx, found.ID, mobyclient.ContainerInspectOptions{})
+	if err != nil {
+		return State{}, err
+	}
+	st := State{Found: true}
+	if res.Container.State != nil {
+		st.Status = string(res.Container.State.Status)
+		st.Running = res.Container.State.Running
+		st.ExitCode = res.Container.State.ExitCode
+	}
+	return st, nil
+}
+
+// StopByName gracefully stops and removes a container by name. It reports
+// whether a container was found.
+func (r *Runner) StopByName(ctx context.Context, name string, grace time.Duration) (bool, error) {
+	cli, err := r.newClient(ctx)
+	if err != nil {
+		return false, err
+	}
+	found, err := cli.FindContainerByName(ctx, name)
+	if err != nil {
+		if errdefs.IsNotFound(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	if found == nil {
+		return false, nil
+	}
+	if grace <= 0 {
+		grace = DefaultShutdownGrace
+	}
+	timeout := int(grace / time.Second)
+	if timeout < 1 {
+		timeout = 1
+	}
+	if _, err := cli.ContainerStop(ctx, found.ID, mobyclient.ContainerStopOptions{Timeout: &timeout}); err != nil && !errdefs.IsNotFound(err) {
+		return true, fmt.Errorf("stop container: %w", err)
+	}
+	if _, err := cli.ContainerRemove(ctx, found.ID, mobyclient.ContainerRemoveOptions{Force: true}); err != nil && !errdefs.IsNotFound(err) {
+		return true, fmt.Errorf("remove container: %w", err)
+	}
+	return true, nil
+}
+
+// Logs streams container logs. The returned reader carries docker stream
+// framing (use Demux to split stdout/stderr). The caller closes it.
+func (r *Runner) Logs(ctx context.Context, name string, follow bool, tail string) (io.ReadCloser, error) {
+	cli, err := r.newClient(ctx)
+	if err != nil {
+		return nil, err
+	}
+	found, err := cli.FindContainerByName(ctx, name)
+	if err != nil {
+		return nil, err
+	}
+	if found == nil {
+		return nil, fmt.Errorf("container %q not found", name)
+	}
+	res, err := cli.ContainerLogs(ctx, found.ID, mobyclient.ContainerLogsOptions{
+		ShowStdout: true,
+		ShowStderr: true,
+		Follow:     follow,
+		Tail:       tail,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("fetch logs: %w", err)
+	}
+	return res, nil
+}
+
+// ExecSession is an attached exec instance. With tty=false the Reader carries
+// docker stream framing (use Demux); with tty=true it is a raw byte stream.
+type ExecSession struct {
+	conn   net.Conn
+	hijack mobyclient.HijackedResponse
+	Reader io.Reader
+	execID string
+	cli    client.SDKClient
+}
+
+// Stdin writes to the exec process; Close half-closes it (EOF).
+func (s *ExecSession) Stdin() io.WriteCloser {
+	return attachStdin{conn: s.conn, hijack: s.hijack}
+}
+
+// Close tears down the hijacked connection.
+func (s *ExecSession) Close() error {
+	return s.conn.Close()
+}
+
+// Wait blocks until the exec process finishes and returns its exit code.
+func (s *ExecSession) Wait(ctx context.Context) (int, error) {
+	for {
+		res, err := s.cli.ExecInspect(ctx, s.execID, mobyclient.ExecInspectOptions{})
+		if err != nil {
+			return -1, err
+		}
+		if !res.Running {
+			return res.ExitCode, nil
+		}
+		select {
+		case <-ctx.Done():
+			return -1, ctx.Err()
+		case <-time.After(300 * time.Millisecond):
+		}
+	}
+}
+
+// Exec runs a command inside the named container and attaches its streams.
+func (r *Runner) Exec(ctx context.Context, name string, cmd []string, tty bool) (*ExecSession, error) {
+	cli, err := r.newClient(ctx)
+	if err != nil {
+		return nil, err
+	}
+	found, err := cli.FindContainerByName(ctx, name)
+	if err != nil {
+		return nil, err
+	}
+	if found == nil {
+		return nil, fmt.Errorf("container %q not found — is the gateway running? (piccolo serve)", name)
+	}
+	created, err := cli.ExecCreate(ctx, found.ID, mobyclient.ExecCreateOptions{
+		Cmd:          cmd,
+		TTY:          tty,
+		AttachStdin:  tty,
+		AttachStdout: true,
+		AttachStderr: true,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("create exec: %w", err)
+	}
+	attached, err := cli.ExecAttach(ctx, created.ID, mobyclient.ExecAttachOptions{TTY: tty})
+	if err != nil {
+		return nil, fmt.Errorf("attach exec: %w", err)
+	}
+	return &ExecSession{
+		conn:   attached.Conn,
+		hijack: attached.HijackedResponse,
+		Reader: attached.Reader,
+		execID: created.ID,
+		cli:    cli,
+	}, nil
+}
+
+// Demux splits a multiplexed (non-tty) docker stream into stdout and stderr.
+func Demux(r io.Reader, stdout, stderr io.Writer) error {
+	header := make([]byte, 8)
+	for {
+		if _, err := io.ReadFull(r, header); err != nil {
+			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+				return nil
+			}
+			return err
+		}
+		size := int64(binary.BigEndian.Uint32(header[4:]))
+		out := stdout
+		if header[0] == 2 {
+			out = stderr
+		}
+		if _, err := io.CopyN(out, r, size); err != nil {
+			if errors.Is(err, io.EOF) {
+				return nil
+			}
+			return err
+		}
+	}
 }
 
 func createContainer(ctx context.Context, cli client.SDKClient, pc *preparedContainer) (string, error) {

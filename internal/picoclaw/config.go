@@ -16,6 +16,25 @@ type Config struct {
 	Agents    Agents  `json:"agents"`
 	ModelList []Model `json:"model_list"`
 	Tools     Tools   `json:"tools"`
+	Gateway   Gateway `json:"gateway,omitempty"`
+}
+
+// Gateway mirrors the picoclaw gateway section (verified v0.3.1
+// pkg/config GatewayConfig).
+type Gateway struct {
+	Host string `json:"host,omitempty"`
+	Port int    `json:"port,omitempty"`
+}
+
+// DefaultGatewayPort is the PicoClaw gateway/health port default.
+const DefaultGatewayPort = 18790
+
+// HealthPort returns the effective gateway port (config value or default).
+func (c Config) HealthPort() int {
+	if c.Gateway.Port > 0 {
+		return c.Gateway.Port
+	}
+	return DefaultGatewayPort
 }
 
 // Agents holds shared defaults plus the per-agent list.

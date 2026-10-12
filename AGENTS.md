@@ -25,6 +25,9 @@ Verified against `github.com/sipeed/picoclaw@v0.3.1` source (present in the Go m
 - Official images: `docker.io/sipeed/picoclaw:<version>` (gateway/agent) and `docker.io/sipeed/picoclaw:launcher` (web console + gateway, ports `18800`/`18790`, needs `PICOCLAW_GATEWAY_HOST=0.0.0.0`).
 - Image `/entrypoint.sh`: skips onboarding when `config.json` exists in home, removes stale `.picoclaw.pid`, then `exec picoclaw gateway "$@"`. Rely on this default entrypoint.
 - PicoClaw home also holds `auth.json`, default `workspace/`, global `skills/`, channel state — runtime writes back, so mount the WHOLE workspace dir, not just `config.json`.
+- Health API: `/health` and `/ready` are **unauthenticated**; only `POST /reload` requires a bearer token (`pkg/health/server.go`). Served on `gateway.port` (default **18790**, config key `gateway.port`, env `PICOCLAW_GATEWAY_PORT`).
+- The gateway binds `localhost` by default. A process on the container's loopback is **unreachable through published ports** — when publishing, piccolo injects `PICOCLAW_GATEWAY_HOST=0.0.0.0` into the container env (unless the manifest already sets it, or network mode is `host`). Verified by smoke test.
+- Clients: the ONLY terminal client is `picoclaw agent` (readline REPL; `-m` for one-shot). There is no `picoclaw-launcher-tui` — the launcher is web-only (`picoclaw-launcher`, React dashboard :18800, proxies chat to the gateway via `/pico/ws`, spawns `picoclaw gateway -E` as its own child in the launcher image).
 
 ## Workspace & Mounting
 
@@ -104,16 +107,33 @@ Output: `[OK]`/`[WARN]`/`[FAIL]` status lines (see README for the exact format).
 
 ### `piccolo serve`
 
+Starts the gateway container **detached** and health-gates the command:
+
 1. Critical doctor subset first (daemon reachable, both config files present + parseable). Fail fast, actionable messages.
-2. Connect via Docker Go SDK (current docker context: socket, rootless, remote).
-3. Remove stale container with the configured name (crash-safe restart).
-4. Create container: image from `piccolo.yaml` (pull once on `No such image`); bind mount abs workspace → `/root/.picoclaw`; env resolved (literals + `env:` refs); ports + network mode from manifest; labels `piccolo.workspace=<abs path>` and `piccolo.managed=true`; `Init: true`; default image entrypoint; `OpenStdin/AttachStdin/AttachStdout/AttachStderr: true`, `Tty: false`.
-5. Attach **before** start (never lose early stderr), then start.
-6. Print: `Starting PicoClaw gateway container "<name>" from workspace <path> ...`
-7. Pump container stdout/stderr to process streams; forward host SIGINT/SIGTERM → graceful container stop (timeout, then kill).
-8. On exit: stop + remove container; exit with the container's exit code when observable.
+2. Derive the gateway port from `config.json` `gateway.port` (default 18790).
+3. Compose the launch spec: image/name/network/ports/env from `piccolo.yaml`; auto-publish `127.0.0.1:<gwPort>:<gwPort>` when the manifest doesn't already map that container port (skip for `network: host`); inject `PICOCLAW_GATEWAY_HOST=0.0.0.0` unless the manifest env already sets it; labels `piccolo.managed=true`, `piccolo.workspace=<abs path>`.
+4. Remove stale container by name, create (pull once on `No such image`), start detached (`Init: true`, default entrypoint, no stdio attach).
+5. Poll `http://127.0.0.1:<gwPort>/health` (1s interval, 90s budget). Fail early if the container exits. On timeout/failure: print error + last ~30 log lines, leave the container for debugging, exit non-zero.
+6. On success: print the health URL, web console URL when a `:18800` binding exists, and next-step hints (`chat`, `logs -f`, `status`, `stop`). Exit 0.
+
+`--foreground/-f` keeps the attached behavior: pump stdio, forward SIGINT/SIGTERM to a graceful stop, remove the container, propagate its exit code.
 
 The Docker SDK SHALL be isolated behind an internal `Runner`/`Process` interface so SDK types never leak and unit tests run daemon-free.
+
+### `piccolo stop` / `piccolo status` / `piccolo logs`
+
+- `stop`: graceful `ContainerStop` (grace 10s) + remove by name; message when not running.
+- `status`: container state (found/running/status/exit code) + live `/health` probe with body.
+- `logs [-f] [--tail N]`: stream via `ContainerLogs`, demux the docker framing, stop following on Ctrl-C.
+
+### `piccolo chat`
+
+Terminal chat by wrapping PicoClaw's own client through `ExecCreate`/`ExecAttach` (no custom TUI):
+
+- `chat` (interactive): TTY exec of `picoclaw agent`; local terminal goes raw (`golang.org/x/term`), bytes flow both ways, restore on exit, propagate the remote exit code. Requires a TTY and a running gateway.
+- `chat -m <msg>` (one-shot): non-TTY exec of `picoclaw agent -m <msg>`; demux output to stdout/stderr; wait for the exec exit code via `ExecInspect`.
+
+For the web console, the wizard's **web** mode selects the launcher image; the browser chat lives at `http://127.0.0.1:18800`.
 
 ## Agent File Generation
 
@@ -155,7 +175,8 @@ Reduced tool allowlists (research: `web_search`, `web_fetch`, `read_file`; coder
 - No custom memory MCP server, SQLite store, tasks/reminders/scheduler.
 - No native PicoClaw tool registration or hooks.
 - No PicoClaw binary bundling, downloading, or `$PATH` usage.
-- No detached serve / `piccolo logs` / `piccolo stop` (fast-follow candidates).
+- No detached/foreground ambiguity: serve is detached + health-gated; `--foreground` attaches.
+- No custom terminal chat UI — `piccolo chat` wraps `picoclaw agent` via exec.
 - No `piccolo add-agent` (manual edit of `config.json` + workspace; doctor catches mistakes).
 - No channel credential setup wizard.
 - No regeneration/migration of an existing `config.json`.
@@ -175,12 +196,15 @@ Reduced tool allowlists (research: `web_search`, `web_fetch`, `read_file`; coder
 2. `piccolo init` creates a complete workspace from interactive answers (and via non-interactive flags).
 3. `piccolo init` on an existing workspace creates only missing files and asks before any overwrite.
 4. `piccolo doctor` reports all `[OK]` for a fresh workspace with a reachable daemon; `[FAIL] docker daemon not reachable` when Docker is down; non-zero exit only on failures.
-5. `piccolo serve` starts the container, attaches stdio, prints the diagnostic line, forwards SIGINT/SIGTERM to a graceful stop, removes the container, exits with the container's exit code.
-6. `piccolo serve` recovers from a crashed previous run (stale container replaced by name).
-7. Generated `config.json`: ONE gateway, multiple agents in `agents.list`, container-side workspace paths, ≥1 `model_list` entry.
-8. `piccolo.yaml` contains no PicoClaw-domain configuration.
-9. Generated `AGENT.md` files have valid frontmatter and useful role instructions.
-10. Unit tests: manifest strict parsing, config generation determinism, doctor checks (daemon-free via interface), init non-destructive behavior, container spec composition (mounts/env/ports/labels).
+5. `piccolo serve` starts the container detached, auto-publishes the health port, waits for `/health`, prints status + hints, and exits 0; on unhealthy start it prints logs and exits non-zero.
+6. `piccolo stop` removes the container; `piccolo status` reports state + health; `piccolo logs` streams (with `-f`).
+7. `piccolo chat -m <msg>` runs a one-shot agent turn through exec and propagates its output/exit code; `piccolo chat` provides an interactive TTY session.
+8. `piccolo serve --foreground` attaches stdio, forwards SIGINT/SIGTERM to a graceful stop, removes the container, exits with the container's exit code.
+9. Recovery from a crashed previous run: stale container replaced by name on next serve.
+10. Generated `config.json`: ONE gateway, multiple agents in `agents.list`, container-side workspace paths, ≥1 `model_list` entry.
+11. `piccolo.yaml` contains no PicoClaw-domain configuration.
+12. Generated `AGENT.md` files have valid frontmatter and useful role instructions.
+13. Unit tests: manifest strict parsing, config generation determinism, doctor checks (daemon-free via interface), init non-destructive behavior, container spec composition (mounts/env/ports/labels), health-port/gateway-host injection helpers.
 
 ## Decisions Log
 
@@ -189,12 +213,13 @@ Reduced tool allowlists (research: `web_search`, `web_fetch`, `read_file`; coder
 - **Workspace = picoclaw home via default mount**: init writes everything directly into the workspace dir (default cwd, user-chosen); serve mounts it onto `/root/.picoclaw`. `PICOCLAW_HOME` never set. No `.piccolo/` subfolder, no `home:` key.
 - **Config format**: PicoClaw reads JSON (schema v3); YAML only for `piccolo.yaml` and `AGENT.md` frontmatter.
 - **API keys**: plaintext in `config.json`; mitigated by generated `.gitignore` + doctor placeholder warnings.
-- **Serve lifecycle**: foreground attach for the PoC; detached deferred.
+- **Serve lifecycle**: detached + health-gated (`/health` on published 127.0.0.1 port) is the default; `--foreground` for attached stdio. Gateway gets `PICOCLAW_GATEWAY_HOST=0.0.0.0` injected when ports are published (container-loopback unreachable otherwise — verified by smoke test).
+- **Chat clients**: terminal = `piccolo chat` wrapping PicoClaw's own `picoclaw agent` REPL via docker exec; web = launcher image at `:18800`. No custom TUI is built.
 - **Interaction modes**: terminal (gateway image) or web console (launcher image, port 18800), chosen in the wizard.
 
 ## Open Questions (verify during implementation)
 
-- Launcher image entrypoint behavior when `config.json` is pre-mounted (same skip-onboarding logic as the plain image?).
-- Exact runtime tool names accepted in `AGENT.md` frontmatter `tools:` (config-side names verified; frontmatter allowlist names to double-check).
-- `~/.picoclaw/...` tilde expansion for `agents.list[].workspace` inside the container (defaults use it upstream; per-agent entries should be tested).
-- Container stop grace period (suggest 10s, then kill).
+- Launcher image (`--mode web`) end-to-end smoke test: confirm the launcher entrypoint handles a pre-mounted `config.json`, the web console chat works, and dashboard-token behavior.
+- Container stop grace period (currently 10s, then kill).
+
+Resolved during implementation: runtime tool names verified (`web_search`, `web_fetch`, `message`, `spawn`, `subagent`, `exec`, `read_file`, ...); `~/.picoclaw/...` tilde expansion verified by a live agent turn; gateway-image entrypoint behavior verified; `/health` requires no auth.

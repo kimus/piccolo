@@ -9,7 +9,12 @@ Piccolo is a thin, opinionated setup and launcher for [PicoClaw](https://github.
 ```text
 piccolo init      interactive wizard → creates the workspace in the current directory
 piccolo doctor    validates Docker, workspace, and generated files
-piccolo serve     runs the PicoClaw gateway container (foreground, stdio attached)
+piccolo serve     starts the PicoClaw gateway container in the background,
+                  waits until http://127.0.0.1:18790/health answers
+piccolo chat      talk to the assistant in the terminal (PicoClaw's own REPL)
+piccolo status    container + health state
+piccolo logs      gateway logs (-f to follow)
+piccolo stop      stop and remove the container
 ```
 
 ```text
@@ -54,8 +59,17 @@ piccolo init        # wizard: assistant name, agents, model, tools, terminal or 
 # validate
 piccolo doctor
 
-# run (foreground; Ctrl-C stops the container)
+# start the gateway in the background (returns when healthy)
 piccolo serve
+
+# talk to your assistant
+piccolo chat                 # interactive REPL
+piccolo chat -m "hello!"     # one-shot
+
+# inspect / follow / stop
+piccolo status
+piccolo logs -f
+piccolo stop
 ```
 
 With the **web console** interaction mode (launcher image), open `http://127.0.0.1:18800` after `serve` starts.
@@ -133,17 +147,34 @@ Exit code is non-zero only on `[FAIL]`; warnings never fail.
 
 ### `piccolo serve`
 
-Runs the gateway container in the foreground: pulls the image if missing, replaces a stale container of the same name (crash-safe restart), attaches stdio, forwards SIGINT/SIGTERM to a graceful stop, removes the container on exit, and exits with the container's exit code.
+Starts the gateway container **in the background**: pulls the image if missing, replaces a stale container of the same name (crash-safe restart), auto-publishes the gateway health port on `127.0.0.1:18790` (unless your `piccolo.yaml` already maps it), and injects `PICOCLAW_GATEWAY_HOST=0.0.0.0` inside the container so the published port can reach it. Then it polls `http://127.0.0.1:18790/health` until the gateway answers — on failure it prints the error plus recent container logs and exits non-zero, leaving the container in place for debugging (`piccolo logs`, `piccolo stop`).
 
-All commands resolve the workspace the same way: `-D/--dir` flag, else the current directory. `serve`/`doctor` fail with an actionable message when `piccolo.yaml` is missing.
+Use `--foreground` to attach stdio instead (Ctrl-C stops the container).
+
+### `piccolo chat`
+
+Terminal chat — wraps PicoClaw's own interactive client (`picoclaw agent`) via `docker exec`:
+
+```sh
+piccolo chat              # interactive REPL (history, exit/quit)
+piccolo chat -m "hello"   # one-shot question
+```
+
+For the **web console**, init with `--mode web` (launcher image) and open `http://127.0.0.1:18800` after `serve`.
+
+### `piccolo status` / `piccolo logs` / `piccolo stop`
+
+`status` shows container state + a live `/health` probe. `logs [-f] [--tail N]` streams gateway logs. `stop` gracefully stops and removes the container.
+
+All commands resolve the workspace the same way: `-D/--dir` flag, else the current directory. Commands fail with an actionable message when `piccolo.yaml` is missing.
 
 ## What Piccolo does NOT do (PoC scope)
 
 - No custom memory store, tasks/reminders/scheduler, MCP servers, or native PicoClaw tools
 - No PicoClaw binary bundling/downloading — the container image is the runtime
-- No detached mode yet (`serve -d`, `logs`, `stop` are fast-follow candidates)
+- No custom TUI — `piccolo chat` reuses PicoClaw's own terminal client
 - No `add-agent` command — edit `config.json` + create the workspace dir by hand; `doctor` catches mistakes
-- No channel credential wizards (Telegram, Matrix, ...)
+- No channel credential wizards (Telegram, Matrix, ...) — use the web console (`--mode web`) or edit `config.json`
 
 ## Acknowledgements
 
