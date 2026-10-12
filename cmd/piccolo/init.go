@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/spf13/cobra"
+	"golang.org/x/term"
 
 	"github.com/kimus/piccolo/internal/docker"
 	"github.com/kimus/piccolo/internal/generate"
@@ -123,6 +124,11 @@ func runInit(cmd *cobra.Command, f initFlags) error {
 		}
 		workspace = pre.Workspace
 	} else {
+		// The huh form needs a real terminal (a zero-size pty even panics
+		// inside upstream bubbles). Fail with guidance instead.
+		if !term.IsTerminal(int(os.Stdin.Fd())) {
+			return fmt.Errorf("interactive init requires a terminal — use --yes with flags for non-interactive setup (see --help)")
+		}
 		inputs, workspace, err = wizard.Run(pre)
 		if err != nil {
 			return err

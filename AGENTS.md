@@ -98,6 +98,8 @@ Generated from wizard answers, PicoClaw schema v3. Minimum shape:
 
 - Preferred prompt library: `github.com/charmbracelet/huh`. Keep wizard logic separated from file generation (upgrade path to full Bubble Tea).
 - Support non-interactive flags (`--name`, `--owner`, `--purpose`, `--yes`, ...) for scripting.
+- The huh form requires a real terminal: on a zero-size pty, upstream bubbles panics in `textinput.placeholderView` (`makeslice: len out of range`). `runInit` therefore guards the interactive path with `term.IsTerminal` and points piped/CI callers to `--yes` + flags instead.
+- Interactive flow verified end-to-end via a sized-pty harness: all questions, multi-select toggle, password input, plan preview, per-file overwrite prompts, and generation produce a doctor-clean workspace.
 
 ### `piccolo doctor`
 
