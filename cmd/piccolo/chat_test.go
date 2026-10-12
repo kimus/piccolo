@@ -181,6 +181,81 @@ func TestOneShotFilterFallbackOnUnknownBanner(t *testing.T) {
 	}
 }
 
+func TestBrandFilterSuppressesColorizedLogLines(t *testing.T) {
+	var out bytes.Buffer
+	f := newBrandFilter(&out, "Piccolo", "")
+	f.armed = false
+	// TTY mode: the upstream logger colorizes lines, so the timestamp is
+	// preceded by ANSI codes.
+	stream := "Piccolo You: \r\n" +
+		"\x1b[31m17:51:23 ERR agent pipeline_llm.go:463 > LLM call failed\x1b[0m\r\n" +
+		"\x1b[31m17:51:23 ERR events runtime_event_logger.go:184 > Runtime event: agent.error\x1b[0m\r\n" +
+		"Error: LLM call failed after retries\r\n" +
+		"Piccolo You: "
+	if _, err := f.Write([]byte(stream)); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	_ = f.Close()
+
+	got := out.String()
+	if strings.Contains(got, "ERR agent") || strings.Contains(got, "ERR events") {
+		t.Errorf("colorized log lines must be suppressed, got:\n%s", got)
+	}
+	if !strings.Contains(got, "Error: LLM call failed after retries") {
+		t.Errorf("client error output must survive, got:\n%s", got)
+	}
+	if strings.Count(got, "Piccolo You: ") != 2 {
+		t.Errorf("both prompts must survive, got:\n%q", got)
+	}
+}
+
+func TestBrandFilterHoldsColorizedPartialLogStart(t *testing.T) {
+	var out bytes.Buffer
+	f := newBrandFilter(&out, "Piccolo", "")
+	f.armed = false
+	// A colorized log line arriving in two chunks must still be suppressed.
+	f.Write([]byte("\x1b[31m17:51:23 ERR agent something"))
+	if out.Len() != 0 {
+		t.Errorf("partial colorized log line flushed early: %q", out.String())
+	}
+	f.Write([]byte(" failed\x1b[0m\r\n"))
+	_ = f.Close()
+	if out.Len() != 0 {
+		t.Errorf("completed colorized log line must be suppressed, got %q", out.String())
+	}
+}
+
+func TestBrandFilterSuppressesLogLineWithReadlineArtifacts(t *testing.T) {
+	var out bytes.Buffer
+	f := newBrandFilter(&out, "Piccolo", "")
+	f.armed = false
+	// Exact shape captured from a live TTY session: readline redraw
+	// artifacts and a cursor-position query precede the colorized log line
+	// on the same line. The CPR must survive (remote readline blocks on it),
+	// the log text must not.
+	stream := "\x1b[31mIncorrect API key provided\x1b[0m\r\n" +
+		" \x08\x1b[6n\x1b[90m17:54:37\x1b[0m \x1b[31mERR\x1b[0m \x1b[33mevents\x1b[0m \x1b[1mhome/runner/x.go:184\x1b[0m > Runtime event: agent.error severity=error\r\n" +
+		"Piccolo You: "
+	if _, err := f.Write([]byte(stream)); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	_ = f.Close()
+
+	got := out.String()
+	if strings.Contains(got, "ERR") || strings.Contains(got, "Runtime event") {
+		t.Errorf("log line must be suppressed, got:\n%q", got)
+	}
+	if !strings.Contains(got, "\x1b[6n") {
+		t.Error("cursor-position query must be forwarded")
+	}
+	if !strings.Contains(got, "Incorrect API key provided") {
+		t.Error("real error text must survive")
+	}
+	if !strings.HasSuffix(got, "Piccolo You: ") {
+		t.Errorf("prompt must survive, got %q", got)
+	}
+}
+
 func TestAssistantNameFromWorkspace(t *testing.T) {
 	dir := t.TempDir()
 	in := generate.Inputs{

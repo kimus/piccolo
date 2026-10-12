@@ -110,14 +110,30 @@ func assistantName(dir string) string {
 	return fallback
 }
 
-// bannerTailLine detection: both the color and plain picoclaw banners end
-// with a line whose visible content is a single space (verified in
-// cmd/picoclaw/main.go: " \033[0m\r\n" / " \r\n").
-var ansiSeq = regexp.MustCompile(`\x1b\[[0-9;]*m`)
+// ANSI/terminal sequence handling for log-line detection.
+//
+// csiSeq strips complete CSI sequences of any kind (SGR colors, erase, cursor
+// queries). The upstream logger colorizes in TTY mode, and readline injects
+// its own artifacts on the same line as asynchronous log output.
+var csiSeq = regexp.MustCompile(`\x1b\[[0-9;?]*[@-~]`)
 
+// cprSeq is the cursor-position report query. Readline blocks until the
+// terminal answers it, so it must survive log-line suppression.
+var cprSeq = []byte("\x1b[6n")
+
+// bannerTailLine matches the banner's terminating line: a single space,
+// optionally wrapped in an ANSI reset. Both the color and plain picoclaw
+// banners end with it (verified in cmd/picoclaw/main.go).
 func isBannerTailLine(line []byte) bool {
-	clean := ansiSeq.ReplaceAll(bytes.TrimRight(line, "\r\n"), nil)
+	clean := csiSeq.ReplaceAll(bytes.TrimRight(line, "\r\n"), nil)
 	return string(clean) == " "
+}
+
+// logContent strips terminal sequences and leading readline artifacts
+// (space, backspace, CR) so the log pattern can be recognized.
+func logContent(line []byte) []byte {
+	clean := csiSeq.ReplaceAll(line, nil)
+	return bytes.TrimLeft(clean, " \t\r\x08")
 }
 
 // brandFilter rewrites the upstream PicoClaw client chrome:
@@ -234,7 +250,7 @@ func (f *brandFilter) Close() error {
 	if len(f.lineBuf) > 0 {
 		out := f.lineBuf
 		f.lineBuf = nil
-		if !logLinePrefix.Match(out) {
+		if !isLogLine(out) {
 			if _, err := f.w.Write(out); err != nil {
 				return err
 			}
@@ -273,7 +289,9 @@ var partialLogStart = regexp.MustCompile(`^[\d:]{1,8}$|^\d{2}:\d{2}:\d{2}\b`)
 
 // writeLines suppresses complete log lines while flushing everything else
 // immediately. A trailing incomplete line is held only when it looks like
-// the beginning of a log line.
+// the beginning of a log line. Cursor-position queries embedded in a
+// suppressed line are forwarded: the remote readline blocks until the
+// terminal answers them.
 func (f *brandFilter) writeLines(data []byte) error {
 	f.lineBuf = append(f.lineBuf, data...)
 	for {
@@ -283,13 +301,21 @@ func (f *brandFilter) writeLines(data []byte) error {
 		}
 		line := f.lineBuf[:i+1]
 		f.lineBuf = append([]byte(nil), f.lineBuf[i+1:]...)
-		if !logLinePrefix.Match(bytes.TrimRight(line, "\r\n")) {
-			if _, err := f.w.Write(line); err != nil {
-				return err
+		if isLogLine(line) {
+			if n := bytes.Count(line, cprSeq); n > 0 {
+				for range n {
+					if _, err := f.w.Write(cprSeq); err != nil {
+						return err
+					}
+				}
 			}
+			continue
+		}
+		if _, err := f.w.Write(line); err != nil {
+			return err
 		}
 	}
-	if len(f.lineBuf) > 0 && !partialLogStart.Match(f.lineBuf) {
+	if len(f.lineBuf) > 0 && !partialLogStart.Match(logContent(f.lineBuf)) {
 		out := f.lineBuf
 		f.lineBuf = nil
 		if _, err := f.w.Write(out); err != nil {
@@ -297,6 +323,12 @@ func (f *brandFilter) writeLines(data []byte) error {
 		}
 	}
 	return nil
+}
+
+// isLogLine reports whether a complete line is an upstream client log line,
+// ignoring color codes and leading readline artifacts.
+func isLogLine(line []byte) bool {
+	return logLinePrefix.Match(logContent(bytes.TrimRight(line, "\r\n")))
 }
 
 // partialEmojiTail returns how many trailing bytes of data form a prefix of
