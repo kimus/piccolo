@@ -1,0 +1,131 @@
+package manifest
+
+import (
+	"errors"
+	"strings"
+	"testing"
+)
+
+const validYAML = `version: 1
+container:
+  image: docker.io/sipeed/picoclaw:v0.3.1
+  name: piccolo-gateway
+  network: bridge
+`
+
+func TestParseValid(t *testing.T) {
+	m, err := Parse(strings.NewReader(validYAML))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if m.Container.Image != "docker.io/sipeed/picoclaw:v0.3.1" {
+		t.Errorf("image = %q", m.Container.Image)
+	}
+	if m.Container.Name != "piccolo-gateway" {
+		t.Errorf("name = %q", m.Container.Name)
+	}
+}
+
+func TestParseRejectsUnknownFields(t *testing.T) {
+	_, err := Parse(strings.NewReader(validYAML + "  bogus: true\n"))
+	if err == nil {
+		t.Fatal("expected strict-parse error for unknown key")
+	}
+}
+
+func TestParseRejectsPicoclawDomainConfig(t *testing.T) {
+	// piccolo.yaml must stay launch-only; PicoClaw-domain keys are unknown.
+	_, err := Parse(strings.NewReader(validYAML + "  model: gpt-5.4\n"))
+	if err == nil {
+		t.Fatal("expected error for PicoClaw-domain key in piccolo.yaml")
+	}
+}
+
+func TestValidateRejectsUnpinnedImage(t *testing.T) {
+	for _, img := range []string{"", "sipeed/picoclaw", "sipeed/picoclaw:latest"} {
+		m := Manifest{Version: 1, Container: Container{Image: img, Name: "x"}}
+		if err := m.Validate(); err == nil {
+			t.Errorf("image %q: expected validation error", img)
+		}
+	}
+}
+
+func TestValidateAcceptsPinnedImage(t *testing.T) {
+	for _, img := range []string{
+		"docker.io/sipeed/picoclaw:v0.3.1",
+		"docker.io/sipeed/picoclaw:launcher",
+		"sipeed/picoclaw@sha256:abcdef",
+	} {
+		if !IsPinnedImage(img) {
+			t.Errorf("image %q: expected pinned", img)
+		}
+	}
+}
+
+func TestValidateBadVersionAndNetwork(t *testing.T) {
+	m := Manifest{Version: 2, Container: Container{Image: "x:1", Name: "n"}}
+	if err := m.Validate(); err == nil {
+		t.Error("expected version error")
+	}
+	m = Manifest{Version: 1, Container: Container{Image: "x:1", Name: "n", Network: "mesh"}}
+	if err := m.Validate(); err == nil {
+		t.Error("expected network error")
+	}
+}
+
+func TestValidateBadPorts(t *testing.T) {
+	m := Manifest{Version: 1, Container: Container{Image: "x:1", Name: "n", Ports: []string{"abc"}}}
+	if err := m.Validate(); err == nil {
+		t.Error("expected port error")
+	}
+	m.Container.Ports = []string{"127.0.0.1:18800:18800"}
+	if err := m.Validate(); err != nil {
+		t.Errorf("valid port rejected: %v", err)
+	}
+}
+
+func TestResolveEnv(t *testing.T) {
+	m := Manifest{
+		Version: 1,
+		Container: Container{
+			Image: "x:1", Name: "n",
+			Env: map[string]string{
+				"LITERAL": "value",
+				"SECRET":  "env:HOST_SECRET",
+				"AAAA":    "first",
+			},
+		},
+	}
+	env, err := m.ResolveEnv(func(k string) (string, bool) {
+		if k == "HOST_SECRET" {
+			return "s3cret", true
+		}
+		return "", false
+	})
+	if err != nil {
+		t.Fatalf("ResolveEnv: %v", err)
+	}
+	want := []string{"AAAA=first", "LITERAL=value", "SECRET=s3cret"}
+	if strings.Join(env, "|") != strings.Join(want, "|") {
+		t.Errorf("env = %v, want sorted %v", env, want)
+	}
+}
+
+func TestResolveEnvMissingRef(t *testing.T) {
+	m := Manifest{Version: 1, Container: Container{Image: "x:1", Name: "n", Env: map[string]string{"K": "env:MISSING"}}}
+	_, err := m.ResolveEnv(func(string) (string, bool) { return "", false })
+	var ref *ErrPlaceholderEnv
+	if !errors.As(err, &ref) || ref.Var != "MISSING" {
+		t.Fatalf("expected ErrPlaceholderEnv, got %v", err)
+	}
+}
+
+func TestEnvRefs(t *testing.T) {
+	m := Manifest{Container: Container{Env: map[string]string{
+		"A": "env:VAR_A", "B": "literal", "C": "env:VAR_C",
+	}}}
+	refs := m.EnvRefs()
+	if len(refs) != 2 || refs[0] != "VAR_A" || refs[1] != "VAR_C" {
+		t.Errorf("refs = %v", refs)
+	}
+}
