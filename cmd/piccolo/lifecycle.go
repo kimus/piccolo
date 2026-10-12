@@ -20,7 +20,7 @@ func newStopCmd() *cobra.Command {
 		Use:   "stop",
 		Short: "Stop and remove the gateway container",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			name, runner, ctx, err := containerContext(cmd)
+			name, _, runner, ctx, err := containerContext(cmd)
 			if err != nil {
 				return err
 			}
@@ -46,7 +46,7 @@ func newStatusCmd() *cobra.Command {
 		Short: "Show container and gateway health state",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			out := cmd.OutOrStdout()
-			name, runner, ctx, err := containerContext(cmd)
+			name, _, runner, ctx, err := containerContext(cmd)
 			if err != nil {
 				return err
 			}
@@ -89,7 +89,7 @@ func newLogsCmd() *cobra.Command {
 		Use:   "logs",
 		Short: "Show gateway container logs",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			name, runner, ctx, err := containerContext(cmd)
+			name, _, runner, ctx, err := containerContext(cmd)
 			if err != nil {
 				return err
 			}
@@ -121,17 +121,17 @@ func newLogsCmd() *cobra.Command {
 }
 
 // containerContext resolves workspace + manifest and returns the container
-// name, a docker runner, and the command context.
-func containerContext(cmd *cobra.Command) (string, *docker.Runner, context.Context, error) {
+// name, workspace dir, a docker runner, and the command context.
+func containerContext(cmd *cobra.Command) (string, string, *docker.Runner, context.Context, error) {
 	dir, err := workspace.Require(dirFlag)
 	if err != nil {
-		return "", nil, nil, err
+		return "", "", nil, nil, err
 	}
 	m, err := manifest.Load(filepath.Join(dir, workspace.ManifestName))
 	if err != nil {
-		return "", nil, nil, err
+		return "", "", nil, nil, err
 	}
-	return m.Container.Name, docker.New(), cmd.Context(), nil
+	return m.Container.Name, dir, docker.New(), cmd.Context(), nil
 }
 
 // healthURLFor derives the host-side health URL from the workspace config.

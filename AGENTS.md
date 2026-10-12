@@ -128,10 +128,18 @@ The Docker SDK SHALL be isolated behind an internal `Runner`/`Process` interface
 
 ### `piccolo chat`
 
-Terminal chat by wrapping PicoClaw's own client through `ExecCreate`/`ExecAttach` (no custom TUI):
+Terminal chat by wrapping PicoClaw's own client through `ExecCreate`/`ExecAttach` (no custom TUI), rebranded at the stream layer (`brandFilter`):
 
 - `chat` (interactive): TTY exec of `picoclaw agent`; local terminal goes raw (`golang.org/x/term`), bytes flow both ways, restore on exit, propagate the remote exit code. Requires a TTY and a running gateway.
-- `chat -m <msg>` (one-shot): non-TTY exec of `picoclaw agent -m <msg>`; demux output to stdout/stderr; wait for the exec exit code via `ExecInspect`.
+- `chat -m <msg>` (one-shot): non-TTY exec of `picoclaw agent -m <msg>`; demux output; wait for the exec exit code via `ExecInspect`.
+
+Rebranding rules (verified against v0.3.1 client output):
+
+- The assistant name comes from the default agent's `AGENT.md` frontmatter (fallback: "Piccolo").
+- Interactive: swallow everything up to the `Interactive mode (Ctrl+C to exit)` sentinel; print our own header; the 🦞 emoji is replaced by the assistant name everywhere (handles emoji split across writes).
+- One-shot: swallow the leading banner up to its terminating space-only line (both color and plain banners end with `" \x1b[0m\r\n"` / `" \r\n"`).
+- PicoClaw client log lines (`HH:MM:SS ERR|WRN|INF|DBG|FTL|TRC ...`) are suppressed in chat — full detail stays available via `piccolo logs`.
+- Safety: if a sentinel is not found within 8 KiB, the filter degrades to plain pass-through + emoji replacement, so an upstream banner change can never break or eat the stream.
 
 For the web console, the wizard's **web** mode selects the launcher image; the browser chat lives at `http://127.0.0.1:18800`.
 

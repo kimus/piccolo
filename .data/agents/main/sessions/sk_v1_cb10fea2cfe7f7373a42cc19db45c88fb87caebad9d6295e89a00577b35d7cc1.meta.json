@@ -1,0 +1,30 @@
+{
+  "key": "sk_v1_cb10fea2cfe7f7373a42cc19db45c88fb87caebad9d6295e89a00577b35d7cc1",
+  "summary": "",
+  "skip": 0,
+  "count": 10,
+  "created_at": "2026-10-12T17:15:36.601761712Z",
+  "updated_at": "2026-10-12T17:17:02.344683752Z",
+  "scope": {
+    "version": 1,
+    "agent_id": "main",
+    "channel": "cli",
+    "account": "default",
+    "dimensions": [
+      "chat"
+    ],
+    "values": {
+      "chat": "direct:direct"
+    }
+  },
+  "aliases": [
+    "agent:main:main",
+    "agent:main:direct:cron",
+    "agent:main:cli:direct:cron",
+    "agent:main:cli:default:direct:cron",
+    "agent:main:direct:direct",
+    "agent:main:cli:direct:direct",
+    "agent:main:cli:default:direct:direct",
+    "cli:default"
+  ]
+}

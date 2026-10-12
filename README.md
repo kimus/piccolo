@@ -153,7 +153,7 @@ Use `--foreground` to attach stdio instead (Ctrl-C stops the container).
 
 ### `piccolo chat`
 
-Terminal chat — wraps PicoClaw's own interactive client (`picoclaw agent`) via `docker exec`:
+Terminal chat — wraps PicoClaw's own interactive client (`picoclaw agent`) via `docker exec`, rebranded with your assistant's name (the upstream banner is replaced, the prompt shows your assistant instead of the lobster, and runtime log noise is kept out of the conversation — see `piccolo logs` for full detail):
 
 ```sh
 piccolo chat              # interactive REPL (history, exit/quit)
