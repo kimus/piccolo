@@ -282,3 +282,51 @@ func patchConfig(t *testing.T, dir string, mutate func(map[string]any)) {
 		t.Fatal(err)
 	}
 }
+
+func TestCheckChannels(t *testing.T) {
+	cfg := []byte(`{"channel_list":{
+		"discord":{"enabled":true,"type":"discord","allow_from":["123"],"settings":{"token":"real","proxy":""}},
+		"telegram":{"enabled":true,"type":"telegram","allow_from":[],"settings":{"token":"","streaming":{"enabled":true}}},
+		"slack":{"enabled":false,"type":"slack","settings":{"bot_token":"xoxb-1"}},
+		"open":{"enabled":true,"type":"discord","allow_from":["*"],"settings":{"token":"t"}}
+	}}`)
+	res := checkChannels(cfg)
+	var got = map[string]Status{}
+	for _, r := range res {
+		got[r.Message] = r.Status
+	}
+	if len(res) != 4 {
+		t.Fatalf("results = %+v", res)
+	}
+	byName := map[string]Result{}
+	for _, r := range res {
+		switch {
+		case strings.Contains(r.Message, "discord"):
+			byName["discord"] = r
+		case strings.Contains(r.Message, "telegram"):
+			byName["telegram"] = r
+		case strings.Contains(r.Message, "slack"):
+			byName["slack"] = r
+		case strings.Contains(r.Message, `"*"`) && strings.Contains(r.Message, "open"):
+			byName["open"] = r
+		}
+	}
+	if byName["discord"].Status != OK {
+		t.Errorf("good discord: %+v", byName["discord"])
+	}
+	if byName["telegram"].Status != WARN {
+		t.Errorf("placeholder telegram: %+v", byName["telegram"])
+	}
+	if byName["slack"].Status != OK {
+		t.Errorf("disabled slack: %+v", byName["slack"])
+	}
+	if byName["open"].Status != WARN {
+		t.Errorf("wildcard open: %+v", byName["open"])
+	}
+	_ = got
+
+	// No channel_list → no results, never a failure.
+	if n := len(checkChannels([]byte(`{"version":3}`))); n != 0 {
+		t.Errorf("absent channel_list gave %d results", n)
+	}
+}

@@ -261,25 +261,35 @@ func (p *Plan) Write(dir string, overwrite map[string]bool) (written, skipped []
 	return written, skipped, nil
 }
 
-// EnsureGitignore creates or appends to dir/.gitignore so config.json (which
-// holds API keys) is never committed. It reports whether a change was made.
+// EnsureGitignore creates or appends to dir/.gitignore so sensitive and
+// runtime files (config.json holds API keys; .picoclaw.pid holds the gateway
+// reload token) are never committed. It reports whether a change was made.
 func EnsureGitignore(dir string) (bool, error) {
 	path := filepath.Join(dir, ".gitignore")
-	const entry = "config.json"
+	entries := []string{"config.json", ".picoclaw.pid"}
 	data, err := os.ReadFile(path)
 	if err != nil && !os.IsNotExist(err) {
 		return false, err
 	}
+	existing := map[string]bool{}
 	for _, line := range strings.Split(string(data), "\n") {
-		if strings.TrimSpace(line) == entry {
-			return false, nil
-		}
+		existing[strings.TrimSpace(line)] = true
 	}
+	changed := false
 	out := string(data)
-	if out != "" && !strings.HasSuffix(out, "\n") {
-		out += "\n"
+	for _, entry := range entries {
+		if existing[entry] {
+			continue
+		}
+		if out != "" && !strings.HasSuffix(out, "\n") {
+			out += "\n"
+		}
+		out += entry + "\n"
+		changed = true
 	}
-	out += entry + "\n"
+	if !changed {
+		return false, nil
+	}
 	if err := os.WriteFile(path, []byte(out), 0o644); err != nil {
 		return false, err
 	}

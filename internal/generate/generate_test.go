@@ -233,7 +233,7 @@ func TestEnsureGitignore(t *testing.T) {
 		t.Fatalf("create: changed=%v err=%v", changed, err)
 	}
 	data, _ := os.ReadFile(filepath.Join(dir, ".gitignore"))
-	if strings.TrimSpace(string(data)) != "config.json" {
+	if strings.TrimSpace(string(data)) != "config.json\n.picoclaw.pid" {
 		t.Fatalf("gitignore = %q", data)
 	}
 
@@ -250,8 +250,19 @@ func TestEnsureGitignore(t *testing.T) {
 		t.Fatalf("append: changed=%v err=%v", changed, err)
 	}
 	data, _ = os.ReadFile(filepath.Join(dir2, ".gitignore"))
-	if string(data) != "*.log\nconfig.json\n" {
+	if string(data) != "*.log\nconfig.json\n.picoclaw.pid\n" {
 		t.Fatalf("appended gitignore = %q", data)
+	}
+
+	// Partially covered file: only the missing entry is appended.
+	os.WriteFile(filepath.Join(dir2, ".gitignore"), []byte("config.json\n"), 0o644)
+	changed, err = EnsureGitignore(dir2)
+	if err != nil || !changed {
+		t.Fatalf("partial append: changed=%v err=%v", changed, err)
+	}
+	data, _ = os.ReadFile(filepath.Join(dir2, ".gitignore"))
+	if string(data) != "config.json\n.picoclaw.pid\n" {
+		t.Fatalf("partial appended gitignore = %q", data)
 	}
 }
 

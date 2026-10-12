@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"gopkg.in/yaml.v3"
@@ -161,6 +162,68 @@ func Run(ctx context.Context, opts Options) []Result {
 	// 8. Models.
 	results = append(results, checkModels(cfg)...)
 
+	// 9. Channels (raw parse — setup manages channel_list; unknown fields
+	// are user-owned and ignored here).
+	results = append(results, checkChannels(data)...)
+
+	return results
+}
+
+// checkChannels inspects channel_list entries for the classic half-configured
+// state: enabled channel without a real token (empty/placeholder).
+func checkChannels(configData []byte) []Result {
+	var results []Result
+	add := func(s Status, format string, args ...any) {
+		results = append(results, Result{Status: s, Message: fmt.Sprintf(format, args...)})
+	}
+	var raw struct {
+		ChannelList map[string]struct {
+			Enabled   bool           `json:"enabled"`
+			Type      string         `json:"type"`
+			AllowFrom []string       `json:"allow_from"`
+			Settings  map[string]any `json:"settings"`
+		} `json:"channel_list"`
+	}
+	if err := json.Unmarshal(configData, &raw); err != nil || len(raw.ChannelList) == 0 {
+		return results // absent/other shape: not a failure, config is user-owned
+	}
+	names := make([]string, 0, len(raw.ChannelList))
+	for n := range raw.ChannelList {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		ch := raw.ChannelList[name]
+		if !ch.Enabled {
+			add(OK, "channel: %s (disabled)", name)
+			continue
+		}
+		tokenKey := ""
+		for _, k := range []string{"token", "bot_token", "app_token", "client_secret", "app_secret"} {
+			if _, ok := ch.Settings[k]; ok {
+				tokenKey = k
+				break
+			}
+		}
+		if tokenKey == "" {
+			add(WARN, "channel %q is enabled but has no token in settings", name)
+			continue
+		}
+		tok, _ := ch.Settings[tokenKey].(string)
+		if isPlaceholderKey(tok) {
+			add(WARN, "channel %q is enabled but %q is empty or a placeholder", name, tokenKey)
+			continue
+		}
+		if len(ch.AllowFrom) == 0 {
+			add(WARN, "channel %q: allow_from is empty — PicoClaw accepts messages from ANYONE (set user IDs or use \"*\" to acknowledge)", name)
+			continue
+		}
+		if len(ch.AllowFrom) == 1 && ch.AllowFrom[0] == "*" {
+			add(WARN, "channel %q: allow_from is \"*\" — open to everyone who can reach the bot", name)
+			continue
+		}
+		add(OK, "channel: %s", name)
+	}
 	return results
 }
 
@@ -209,8 +272,7 @@ func checkAgents(workspace string, cfg picoclaw.Config) []Result {
 			continue
 		}
 		agentMD := filepath.Join(hostPath, "AGENT.md")
-		fm, err := parseFrontmatter(agentMD)
-		if err != nil {
+		if _, err := parseFrontmatter(agentMD); err != nil {
 			add(FAIL, "agent %q: %v", a.ID, err)
 			continue
 		}
@@ -219,7 +281,6 @@ func checkAgents(workspace string, cfg picoclaw.Config) []Result {
 			suffix = " (default)"
 		}
 		add(OK, "agent: %s%s", a.ID, suffix)
-		_ = fm
 	}
 
 	// Subagent references must resolve to configured agents.

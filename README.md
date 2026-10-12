@@ -8,9 +8,14 @@ Piccolo is a thin, opinionated setup and launcher for [PicoClaw](https://github.
 
 ```text
 piccolo init      interactive wizard → creates the workspace in the current directory
+piccolo setup     arrow-navigable editor for an existing workspace
+                  (channels like Discord, models, tool toggles — merge-patched,
+                  with provider setup steps, diff preview, and config.json.bak)
 piccolo doctor    validates Docker, workspace, and generated files
 piccolo serve     starts the PicoClaw gateway container in the background,
                   waits until http://127.0.0.1:18790/health answers
+piccolo restart   stop + serve in one step (apply config or piccolo.yaml changes)
+piccolo reload    apply config.json changes without recreating the container
 piccolo chat      talk to the assistant in the terminal (PicoClaw's own REPL)
 piccolo status    container + health state
 piccolo logs      gateway logs (-f to follow)
@@ -128,6 +133,17 @@ Interactive wizard: assistant name, owner, purpose template, specialist agents (
 - Non-interactive flags (`--name`, `--owner`, `--purpose`, `--yes`, ...) are supported for scripting.
 - Ensures `config.json` is git-ignored.
 
+
+### `piccolo setup`
+
+The editing counterpart of `init` for an existing workspace. `piccolo setup` opens an arrow-navigable home menu (↑/↓ move, enter open, q quit); deep-links work too: `piccolo setup channels`, `piccolo setup channels discord`, `piccolo setup models`, `piccolo setup tools`.
+
+- **v1-editable**: channels (Discord/Telegram/Slack — list, add, toggle, edit with pre-filled values), `model_list` entries, web/exec/spawn/subagent toggles. Agents/container/identity sections are listed but require manual edits for now.
+- Channel flows print the **provider-side steps first** (create app, token, privileged intents, invite URL, how to get your user ID) — piccolo cannot do those for you.
+- **Merge-patched writes**: unknown keys and untouched subtrees of your user-owned `config.json` are preserved; every change shows a diff preview, requires confirmation, and backs the previous file up to `config.json.bak`.
+- API keys/bot tokens are stored plaintext (PicoClaw has no env expansion — verified) — mitigated by the generated `.gitignore` and `doctor` placeholder warnings.
+- If the gateway container is running afterwards, setup reminds you to `piccolo reload` (config.json) or `piccolo restart` (piccolo.yaml).
+
 ### `piccolo doctor`
 
 Validates the setup and prints `[OK]` / `[WARN]` / `[FAIL]` lines:
@@ -153,7 +169,7 @@ Use `--foreground` to attach stdio instead (Ctrl-C stops the container).
 
 ### `piccolo chat`
 
-Terminal chat — wraps PicoClaw's own interactive client (`picoclaw agent`) via `docker exec`, rebranded with your assistant's name (the upstream banner is replaced, the prompt shows your assistant instead of the lobster, and runtime log noise is kept out of the conversation — see `piccolo logs` for full detail):
+Terminal chat — wraps PicoClaw's own interactive client (`picoclaw agent`) via `docker exec` and passes its output through unmodified (upstream banner, prompt, and client log lines all show as-is; see `piccolo logs` for gateway logs):
 
 ```sh
 piccolo chat              # interactive REPL (history, exit/quit)

@@ -192,11 +192,9 @@ func runServeDetached(cmd *cobra.Command) error {
 	ctx := cmd.Context()
 
 	fmt.Fprintf(sc.stdout, "Starting PicoClaw gateway container %q from workspace %s ...\n", sc.spec.Name, sc.dir)
-	id, err := sc.runner.StartDetached(ctx, sc.spec)
-	if err != nil {
+	if _, err := sc.runner.StartDetached(ctx, sc.spec); err != nil {
 		return err
 	}
-	_ = id
 
 	if err := waitForHealthy(ctx, sc); err != nil {
 		// Dump recent logs to explain the failure, keep the container for
@@ -220,6 +218,8 @@ func runServeDetached(cmd *cobra.Command) error {
 	fmt.Fprintf(sc.stdout, "  piccolo chat -m …   one-shot question\n")
 	fmt.Fprintf(sc.stdout, "  piccolo logs -f     follow gateway logs\n")
 	fmt.Fprintf(sc.stdout, "  piccolo status      container + health state\n")
+	fmt.Fprintf(sc.stdout, "  piccolo reload      apply config.json changes in place\n")
+	fmt.Fprintf(sc.stdout, "  piccolo restart     restart the container (piccolo.yaml changes)\n")
 	fmt.Fprintf(sc.stdout, "  piccolo stop        stop and remove the container\n")
 	return nil
 }

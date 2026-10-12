@@ -152,7 +152,10 @@ func runInit(cmd *cobra.Command, f initFlags) error {
 		fmt.Fprintf(stdout, "  %s\n", file.Rel)
 	}
 
-	// Create-only: decide overwrites explicitly.
+	// Create-only: decide overwrites explicitly. A single bufio.Reader must
+	// serve every prompt: a second reader on the same stdin would miss
+	// type-ahead the first one buffered (Proceed? would then default to yes).
+	reader := bufio.NewReader(stdin)
 	overwrite := map[string]bool{}
 	existing := plan.Existing(dir)
 	if len(existing) > 0 {
@@ -163,7 +166,6 @@ func runInit(cmd *cobra.Command, f initFlags) error {
 		if f.yes {
 			fmt.Fprintln(stdout, "\n--yes: existing files will be kept")
 		} else {
-			reader := bufio.NewReader(stdin)
 			for _, rel := range existing {
 				fmt.Fprintf(stdout, "Overwrite %s? [y/N] ", rel)
 				line, _ := reader.ReadString('\n')
@@ -175,9 +177,13 @@ func runInit(cmd *cobra.Command, f initFlags) error {
 	}
 
 	if !f.yes {
-		reader := bufio.NewReader(stdin)
 		fmt.Fprint(stdout, "\nProceed? [Y/n] ")
-		line, _ := reader.ReadString('\n')
+		line, err := reader.ReadString('\n')
+		if err != nil && line == "" {
+			// No confirmation available (EOF without input): do not proceed.
+			fmt.Fprintln(stdout, "\nNo confirmation — aborted, nothing written.")
+			return nil
+		}
 		if answer := strings.ToLower(strings.TrimSpace(line)); answer != "" && answer != "y" && answer != "yes" {
 			fmt.Fprintln(stdout, "Aborted — nothing written.")
 			return nil

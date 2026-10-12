@@ -12,6 +12,7 @@ import (
 
 	"github.com/kimus/piccolo/internal/docker"
 	"github.com/kimus/piccolo/internal/manifest"
+	"github.com/kimus/piccolo/internal/picoclaw"
 	"github.com/kimus/piccolo/internal/workspace"
 )
 
@@ -144,19 +145,9 @@ func healthURLFor(cmd *cobra.Command) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	var cfg picoclawConfigPort
+	var cfg picoclaw.Config
 	if err := json.Unmarshal(data, &cfg); err != nil {
 		return "", fmt.Errorf("config.json does not parse: %w", err)
 	}
-	port := cfg.Gateway.Port
-	if port <= 0 {
-		port = 18790
-	}
-	return fmt.Sprintf("http://127.0.0.1:%d/health", port), nil
-}
-
-type picoclawConfigPort struct {
-	Gateway struct {
-		Port int `json:"port"`
-	} `json:"gateway"`
+	return fmt.Sprintf("http://127.0.0.1:%d/health", cfg.HealthPort()), nil
 }
