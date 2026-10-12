@@ -1,3 +1,0 @@
-{"level":"warn","component":"channels","time":"2026-10-12T16:57:45Z","caller":"/home/runner/work/picoclaw/picoclaw/pkg/channels/manager.go:1190","message":"No channels enabled"}
-{"level":"warn","component":"channels","time":"2026-10-12T17:14:00Z","caller":"/home/runner/work/picoclaw/picoclaw/pkg/channels/manager.go:1190","message":"No channels enabled"}
-{"level":"warn","component":"channels","time":"2026-10-12T17:51:03Z","caller":"/home/runner/work/picoclaw/picoclaw/pkg/channels/manager.go:1190","message":"No channels enabled"}
