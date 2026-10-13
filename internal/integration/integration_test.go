@@ -2,26 +2,54 @@ package integration
 
 import "testing"
 
-func TestResolveAlias(t *testing.T) {
-	r, err := Resolve("gws")
+func TestParsePackageRef(t *testing.T) {
+	r, err := ParsePackageRef("kimus/piccolo-gws@3.1.0")
 	if err != nil {
-		t.Fatalf("Resolve: %v", err)
+		t.Fatalf("ParsePackageRef: %v", err)
 	}
-	if r.Ref != "github:kimus/piccolo-gws" || r.Name != "gws" || r.DescriptorCommand[0] != "piccolo-gws" {
-		t.Fatalf("resolved = %#v", r)
+	if r.Provider != "github" || r.Owner != "kimus" || r.Repo != "piccolo-gws" || r.Selector != "3.1.0" {
+		t.Fatalf("ref = %#v", r)
 	}
-	if !r.Unpinned {
-		t.Fatal("alias should be marked unpinned")
+	if r.Package() != "github:kimus/piccolo-gws" || r.Short() != "kimus/piccolo-gws" || r.StatePath() != "integrations/kimus/piccolo-gws" {
+		t.Fatalf("derived values from %#v", r)
 	}
 }
 
-func TestResolveExplicitGithub(t *testing.T) {
-	r, err := Resolve("github:kimus/piccolo-makerworld")
+func TestParsePackageRefPreservesSelector(t *testing.T) {
+	r, err := ParsePackageRef("github:johndoe/piccolo-maker@v2.1.10")
 	if err != nil {
-		t.Fatalf("Resolve: %v", err)
+		t.Fatalf("ParsePackageRef: %v", err)
 	}
-	if r.Name != "piccolo-makerworld" || r.DescriptorCommand[0] != "piccolo-makerworld" {
-		t.Fatalf("resolved = %#v", r)
+	if r.Selector != "v2.1.10" {
+		t.Fatalf("selector = %q", r.Selector)
+	}
+}
+
+func TestParsePackageRefRejectsAlias(t *testing.T) {
+	if _, err := ParsePackageRef("gws"); err == nil {
+		t.Fatal("expected alias-like ref to be rejected")
+	}
+}
+
+func TestParseReleaseManifest(t *testing.T) {
+	m, err := ParseReleaseManifest([]byte(`{"schema":"piccolo.integration.release.v1","package":"github:kimus/piccolo-gws","version":"3.1.0","artifacts":[{"platform":"linux/amd64","asset":"piccolo-gws_3.1.0_linux_amd64.tar.gz","sha256":"abc"}]}`))
+	if err != nil {
+		t.Fatalf("ParseReleaseManifest: %v", err)
+	}
+	if a, ok := m.ArtifactFor("linux/amd64"); !ok || a.Asset == "" {
+		t.Fatalf("artifact = %#v %v", a, ok)
+	}
+	if _, err := ParseReleaseManifest([]byte(`{"schema":"bad"}`)); err == nil {
+		t.Fatal("expected schema error")
+	}
+}
+
+func TestVerifySHA256(t *testing.T) {
+	if err := VerifySHA256([]byte("hello"), "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"); err != nil {
+		t.Fatalf("VerifySHA256: %v", err)
+	}
+	if err := VerifySHA256([]byte("hello"), "bad"); err == nil {
+		t.Fatal("expected mismatch")
 	}
 }
 

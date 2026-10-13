@@ -43,15 +43,23 @@ type Toolchain struct {
 // into the configured gateway image. Provider-specific runtime settings remain
 // in config.json or integration-owned state files.
 type Integration struct {
-	Name              string   `yaml:"name"`
-	DisplayName       string   `yaml:"display_name,omitempty"`
-	Ref               string   `yaml:"ref"`
-	Commands          []string `yaml:"commands,omitempty"`
-	DescriptorCommand []string `yaml:"descriptor_command,omitempty"`
-	SetupCommand      []string `yaml:"setup_command,omitempty"`
-	StatusCommand     []string `yaml:"status_command,omitempty"`
-	SetupRequiresTTY  bool     `yaml:"setup_requires_tty,omitempty"`
-	SetupPorts        []string `yaml:"setup_ports,omitempty"`
+	Package           string   `yaml:"package,omitempty" json:"package,omitempty"`
+	Requested         string   `yaml:"requested,omitempty" json:"requested,omitempty"`
+	Source            string   `yaml:"source,omitempty" json:"source,omitempty"`
+	Channel           string   `yaml:"channel,omitempty" json:"channel,omitempty"`
+	Selector          string   `yaml:"selector,omitempty" json:"selector,omitempty"`
+	ResolvedVersion   string   `yaml:"resolved_version,omitempty" json:"resolvedVersion,omitempty"`
+	ArtifactDigest    string   `yaml:"artifact_digest,omitempty" json:"artifactDigest,omitempty"`
+	StatePath         string   `yaml:"state_path,omitempty" json:"statePath,omitempty"`
+	Name              string   `yaml:"name" json:"name"`
+	DisplayName       string   `yaml:"display_name,omitempty" json:"displayName,omitempty"`
+	Ref               string   `yaml:"ref,omitempty" json:"ref,omitempty"` // legacy source-build ref
+	Commands          []string `yaml:"commands,omitempty" json:"commands,omitempty"`
+	DescriptorCommand []string `yaml:"descriptor_command,omitempty" json:"descriptorCommand,omitempty"`
+	SetupCommand      []string `yaml:"setup_command,omitempty" json:"setupCommand,omitempty"`
+	StatusCommand     []string `yaml:"status_command,omitempty" json:"statusCommand,omitempty"`
+	SetupRequiresTTY  bool     `yaml:"setup_requires_tty,omitempty" json:"setupRequiresTty,omitempty"`
+	SetupPorts        []string `yaml:"setup_ports,omitempty" json:"setupPorts,omitempty"`
 }
 
 // Setup holds non-secret Piccolo setup metadata that is useful across setup
@@ -178,8 +186,8 @@ func (m *Manifest) Validate() error {
 			return fmt.Errorf("%s.name %q is duplicated", prefix, in.Name)
 		}
 		seenIntegrations[in.Name] = true
-		if strings.TrimSpace(in.Ref) == "" {
-			return fmt.Errorf("%s.ref is required", prefix)
+		if strings.TrimSpace(in.Ref) == "" && strings.TrimSpace(in.Package) == "" {
+			return fmt.Errorf("%s.package is required", prefix)
 		}
 		if err := validateStringList(prefix+".commands", in.Commands); err != nil {
 			return err

@@ -32,7 +32,6 @@ type integrationFlags struct {
 type integrationUpgradeFlags struct {
 	integrationFlags
 	all bool
-	to  string
 }
 
 type integrationStatusFlags struct {
@@ -50,15 +49,15 @@ var newIntegrationRunner = func() integrationRunner { return docker.New() }
 
 func newIntegrationCmd() *cobra.Command {
 	cmd := &cobra.Command{Use: "integration", Short: "Install and set up containerized integrations"}
-	cmd.AddCommand(newIntegrationAddCmd(), newIntegrationSetupCmd(), newIntegrationUpgradeCmd(), newIntegrationStatusCmd())
+	cmd.AddCommand(newIntegrationAddCmd(), newIntegrationBuildCmd(), newIntegrationListCmd(), newIntegrationSetupCmd(), newIntegrationUpgradeCmd(), newIntegrationStatusCmd())
 	return cmd
 }
 
 func newIntegrationAddCmd() *cobra.Command {
 	var f integrationFlags
 	cmd := &cobra.Command{
-		Use:   "add <alias-or-ref>",
-		Short: "Build a gateway image with an integration installed",
+		Use:   "add <package-ref>",
+		Short: "Install or update an integration from a release artifact",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runIntegrationAdd(cmd, args[0], f)
@@ -67,6 +66,36 @@ func newIntegrationAddCmd() *cobra.Command {
 	cmd.Flags().BoolVar(&f.yes, "yes", false, "non-interactive: accept prompts")
 	cmd.Flags().BoolVar(&f.pull, "pull", false, "ask Docker to pull a newer base image before building")
 	cmd.Flags().StringVar(&f.tag, "tag", "", "local image tag to build (default: deterministic content-derived tag)")
+	return cmd
+}
+
+func newIntegrationBuildCmd() *cobra.Command {
+	var f integrationFlags
+	cmd := &cobra.Command{
+		Use:   "build <package-ref>",
+		Short: "Build and install an integration from source (developer path)",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runIntegrationBuild(cmd, args[0], f)
+		},
+	}
+	cmd.Flags().BoolVar(&f.yes, "yes", false, "non-interactive: accept prompts")
+	cmd.Flags().BoolVar(&f.pull, "pull", false, "ask Docker to pull a newer base image before building")
+	cmd.Flags().StringVar(&f.tag, "tag", "", "local image tag to build (default: deterministic content-derived tag)")
+	return cmd
+}
+
+func newIntegrationListCmd() *cobra.Command {
+	var jsonOut bool
+	cmd := &cobra.Command{
+		Use:   "list",
+		Short: "List installed integrations",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runIntegrationList(cmd, jsonOut)
+		},
+	}
+	cmd.Flags().BoolVar(&jsonOut, "json", false, "emit JSON output")
 	return cmd
 }
 
@@ -118,17 +147,11 @@ func newIntegrationUpgradeCmd() *cobra.Command {
 		Use:   "upgrade [name]",
 		Short: "Rebuild installed integrations and refresh descriptor metadata",
 		Args: func(cmd *cobra.Command, args []string) error {
-			if f.all {
-				if len(args) != 0 {
-					return fmt.Errorf("use either 'piccolo integration upgrade <name>' or 'piccolo integration upgrade --all', not both")
-				}
-				if strings.TrimSpace(f.to) != "" {
-					return fmt.Errorf("--to can only be used with a single integration name")
-				}
-				return nil
+			if f.all && len(args) != 0 {
+				return fmt.Errorf("use either 'piccolo integration upgrade <package>' or 'piccolo integration upgrade --all', not both")
 			}
-			if len(args) != 1 {
-				return fmt.Errorf("use either 'piccolo integration upgrade <name>' or 'piccolo integration upgrade --all'")
+			if len(args) > 1 {
+				return fmt.Errorf("use 'piccolo integration upgrade [package]' or 'piccolo integration upgrade --all'")
 			}
 			return nil
 		},
@@ -143,8 +166,7 @@ func newIntegrationUpgradeCmd() *cobra.Command {
 	cmd.Flags().BoolVar(&f.yes, "yes", false, "non-interactive: accept prompts")
 	cmd.Flags().BoolVar(&f.pull, "pull", false, "ask Docker to pull a newer base image before building")
 	cmd.Flags().StringVar(&f.tag, "tag", "", "local image tag to build (default: deterministic content-derived tag)")
-	cmd.Flags().BoolVar(&f.all, "all", false, "upgrade all installed integrations")
-	cmd.Flags().StringVar(&f.to, "to", "", "alias or ref to use for the selected integration")
+	cmd.Flags().BoolVar(&f.all, "all", false, "upgrade all installed latest-channel integrations")
 	return cmd
 }
 
@@ -164,14 +186,133 @@ func runIntegrationAdd(cmd *cobra.Command, input string, f integrationFlags) err
 	if err != nil {
 		return err
 	}
-	resolved, err := picintegration.Resolve(input)
+	pkg, err := picintegration.ParsePackageRef(input)
 	if err != nil {
 		return err
 	}
-	fmt.Fprintf(out, "Integration: %s\n", resolved.Name)
-	fmt.Fprintf(out, "Source:      %s\n", resolved.Ref)
-	if picintegration.IsUnpinned(resolved.Ref) {
-		fmt.Fprintf(out, "[WARN] integration ref is unpinned; future rebuilds may resolve different code\n")
+	fmt.Fprintf(out, "Integration package: %s\n", pkg.Short())
+	fmt.Fprintf(out, "Provider:            %s\n", pkg.Provider)
+	fmt.Fprintf(out, "Selector:            %s\n", pkg.EffectiveSelector())
+	if pkg.Channel() == picintegration.ChannelLatest {
+		fmt.Fprintf(out, "[WARN] integration tracks latest; future upgrades may resolve newer releases\n")
+	}
+	if !f.yes && term.IsTerminal(int(os.Stdin.Fd())) {
+		fmt.Fprintf(out, "Install or update this integration release? [y/N] ")
+		line, _ := bufio.NewReader(cmd.InOrStdin()).ReadString('\n')
+		if !strings.EqualFold(strings.TrimSpace(line), "y") && !strings.EqualFold(strings.TrimSpace(line), "yes") {
+			return errors.New("integration add cancelled")
+		}
+	}
+	runner := newIntegrationRunner()
+	pingCtx, cancel := context.WithTimeout(ctx, defaultImageBuildProbeTimeout)
+	defer cancel()
+	if err := runner.Ping(pingCtx); err != nil {
+		return fmt.Errorf("docker daemon not reachable: %w", err)
+	}
+	fetcher := newReleaseFetcher()
+	bundles, err := fetchReleaseBundlesForManifest(ctx, fetcher, m.Runtime.Integrations)
+	if err != nil {
+		return err
+	}
+	fetched, err := fetcher.Fetch(ctx, pkg)
+	if err != nil {
+		return err
+	}
+	base := integrationBuildBase(m)
+	bundles = upsertBundle(bundles, fetched.Bundle)
+	plan, err := runtimeimage.BuildPlan(runtimeimage.Options{BaseImage: base, Tag: f.tag, Packages: effectiveToolchain(m).Packages, Commands: effectiveToolchain(m).Commands, Bundles: bundles, Integrations: sourceManifestIntegrationsForBuild(m.Runtime.Integrations)})
+	if err != nil {
+		return err
+	}
+	buildCtx, err := plan.ContextTar()
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(out, "\nBuilding Piccolo runtime image with integration release\n")
+	fmt.Fprintf(out, "  base:    %s\n", plan.BaseImage)
+	fmt.Fprintf(out, "  tag:     %s\n", plan.Tag)
+	fmt.Fprintf(out, "  package: %s\n", pkg.Short())
+	fmt.Fprintf(out, "  version: %s\n\n", fetched.Version)
+	if err := runner.BuildImage(ctx, buildCtx, docker.ImageBuildOptions{Tag: plan.Tag, Dockerfile: "Dockerfile", Pull: f.pull, Remove: true}, out); err != nil {
+		return fmt.Errorf("build image: %w", err)
+	}
+	if err := layout.EnsureDirs(); err != nil {
+		return err
+	}
+	descCmd := pkg.DescriptorCommand()
+	descEntrypoint, descCommand := splitEntrypointCommand(descCmd)
+	descData, err := runContainerCapture(ctx, runner, docker.Spec{Image: plan.Tag, Source: layout.PicoclawHome(), Volumes: integrationSetupBinds(layout), Entrypoint: descEntrypoint, Command: descCommand, Env: nil, Labels: map[string]string{docker.LabelWorkspace: dir}})
+	if err != nil {
+		return fmt.Errorf("describe integration: %w", err)
+	}
+	desc, err := picintegration.ParseDescriptor(descData)
+	if err != nil {
+		return err
+	}
+	statePath := pkg.StatePath()
+	containerState := pkg.ContainerStatePath()
+	item := manifest.Integration{
+		Package:           pkg.Package(),
+		Requested:         input,
+		Source:            string(picintegration.SourceRelease),
+		Channel:           string(pkg.Channel()),
+		Selector:          pkg.EffectiveSelector(),
+		ResolvedVersion:   fetched.Version,
+		ArtifactDigest:    fetched.Digest,
+		StatePath:         statePath,
+		Name:              desc.Name,
+		DisplayName:       desc.DisplayName,
+		Commands:          []string(desc.Commands),
+		DescriptorCommand: descCmd,
+		SetupCommand:      rewriteStateArgs(desc.Setup.Command, containerState),
+		StatusCommand:     rewriteStateArgs(desc.StatusCommand, containerState),
+		SetupRequiresTTY:  desc.Setup.RequiresTTY,
+		SetupPorts:        desc.Setup.Ports,
+	}
+	m.Container.Image = plan.Tag
+	m.Runtime.Integrations = upsertManifestIntegration(m.Runtime.Integrations, item)
+	if err := m.Write(manifestPath); err != nil {
+		return fmt.Errorf("update %s: %w", workspace.ManifestName, err)
+	}
+	fmt.Fprintf(out, "\n✓ Added integration: %s\n", desc.DisplayName)
+	fmt.Fprintf(out, "  package: %s\n", pkg.Short())
+	fmt.Fprintf(out, "  version: %s\n", fetched.Version)
+	fmt.Fprintf(out, "  state:   %s\n", statePath)
+	fmt.Fprintf(out, "  image:   %s\n", plan.Tag)
+	fmt.Fprintf(out, "\nNext:\n  piccolo integration setup %s\n  piccolo restart\n", pkg.Short())
+	return nil
+}
+
+func runIntegrationBuild(cmd *cobra.Command, input string, f integrationFlags) error {
+	out := cmd.OutOrStdout()
+	ctx := cmd.Context()
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	dir, err := workspace.Require(dirFlag)
+	if err != nil {
+		return err
+	}
+	layout := workspace.NewLayout(dir)
+	manifestPath := layout.Manifest()
+	m, err := manifest.Load(manifestPath)
+	if err != nil {
+		return err
+	}
+	pkg, err := picintegration.ParsePackageRef(input)
+	if err != nil {
+		return err
+	}
+	resolvedRef := "github:" + pkg.Owner + "/" + pkg.Repo
+	if pkg.Selector != "" && pkg.Selector != "latest" {
+		resolvedRef += "?ref=" + pkg.Selector
+	}
+	descCmd := pkg.DescriptorCommand()
+	fmt.Fprintf(out, "Integration package: %s\n", pkg.Short())
+	fmt.Fprintf(out, "Source build ref:     %s\n", resolvedRef)
+	fmt.Fprintf(out, "[WARN] source builds can download compilers and build dependencies; prefer 'piccolo integration add %s' for normal release installs\n", pkg.Short())
+	if picintegration.IsUnpinned(resolvedRef) {
+		fmt.Fprintf(out, "[WARN] integration source ref is unpinned; future rebuilds may resolve different code\n")
 	}
 	if !f.yes && term.IsTerminal(int(os.Stdin.Fd())) {
 		fmt.Fprintf(out, "Build a new gateway image including this integration? [y/N] ")
@@ -188,9 +329,13 @@ func runIntegrationAdd(cmd *cobra.Command, input string, f integrationFlags) err
 	}
 
 	base := integrationBuildBase(m)
-	integrations := manifestIntegrationsForBuild(m.Runtime.Integrations)
-	integrations = upsertBuildIntegration(integrations, runtimeimage.Integration{Ref: resolved.Ref, Commands: []string{resolved.DescriptorCommand[0]}})
-	plan, err := runtimeimage.BuildPlan(runtimeimage.Options{BaseImage: base, Tag: f.tag, Packages: effectiveToolchain(m).Packages, Commands: effectiveToolchain(m).Commands, Integrations: integrations})
+	bundles, err := fetchReleaseBundlesForManifest(ctx, newReleaseFetcher(), m.Runtime.Integrations)
+	if err != nil {
+		return err
+	}
+	integrations := sourceManifestIntegrationsForBuild(m.Runtime.Integrations)
+	integrations = upsertBuildIntegration(integrations, runtimeimage.Integration{Ref: resolvedRef, Commands: []string{descCmd[0]}})
+	plan, err := runtimeimage.BuildPlan(runtimeimage.Options{BaseImage: base, Tag: f.tag, Packages: effectiveToolchain(m).Packages, Commands: effectiveToolchain(m).Commands, Integrations: integrations, Bundles: bundles})
 	if err != nil {
 		return err
 	}
@@ -201,7 +346,7 @@ func runIntegrationAdd(cmd *cobra.Command, input string, f integrationFlags) err
 	fmt.Fprintf(out, "\nBuilding Piccolo runtime image with integrations\n")
 	fmt.Fprintf(out, "  base: %s\n", plan.BaseImage)
 	fmt.Fprintf(out, "  tag:  %s\n", plan.Tag)
-	fmt.Fprintf(out, "  integration: %s\n\n", resolved.Ref)
+	fmt.Fprintf(out, "  integration: %s\n\n", resolvedRef)
 	buildArgs := integrationBuildArgs(integrations)
 	if len(buildArgs) > 0 {
 		fmt.Fprintf(out, "[WARN] refreshing integration install layer for unpinned refs so latest code is resolved\n")
@@ -212,7 +357,7 @@ func runIntegrationAdd(cmd *cobra.Command, input string, f integrationFlags) err
 	if err := layout.EnsureDirs(); err != nil {
 		return err
 	}
-	descEntrypoint, descCommand := splitEntrypointCommand(resolved.DescriptorCommand)
+	descEntrypoint, descCommand := splitEntrypointCommand(descCmd)
 	descData, err := runContainerCapture(ctx, runner, docker.Spec{Image: plan.Tag, Source: layout.PicoclawHome(), Volumes: integrationSetupBinds(layout), Entrypoint: descEntrypoint, Command: descCommand, Env: nil, Labels: map[string]string{docker.LabelWorkspace: dir}})
 	if err != nil {
 		return fmt.Errorf("describe integration: %w", err)
@@ -225,11 +370,17 @@ func runIntegrationAdd(cmd *cobra.Command, input string, f integrationFlags) err
 	m.Runtime.Integrations = upsertManifestIntegration(m.Runtime.Integrations, manifest.Integration{
 		Name:              desc.Name,
 		DisplayName:       desc.DisplayName,
-		Ref:               resolved.Ref,
+		Package:           pkg.Package(),
+		Requested:         input,
+		Source:            string(picintegration.SourceBuild),
+		Channel:           string(pkg.Channel()),
+		Selector:          pkg.EffectiveSelector(),
+		StatePath:         pkg.StatePath(),
+		Ref:               resolvedRef,
 		Commands:          []string(desc.Commands),
-		DescriptorCommand: resolved.DescriptorCommand,
-		SetupCommand:      desc.Setup.Command,
-		StatusCommand:     desc.StatusCommand,
+		DescriptorCommand: descCmd,
+		SetupCommand:      rewriteStateArgs(desc.Setup.Command, pkg.ContainerStatePath()),
+		StatusCommand:     rewriteStateArgs(desc.StatusCommand, pkg.ContainerStatePath()),
 		SetupRequiresTTY:  desc.Setup.RequiresTTY,
 		SetupPorts:        desc.Setup.Ports,
 	})
@@ -237,9 +388,36 @@ func runIntegrationAdd(cmd *cobra.Command, input string, f integrationFlags) err
 		return fmt.Errorf("update %s: %w", workspace.ManifestName, err)
 	}
 	fmt.Fprintf(out, "\n✓ Added integration: %s\n", desc.DisplayName)
-	fmt.Fprintf(out, "  source: %s\n", resolved.Ref)
+	fmt.Fprintf(out, "  source: %s\n", resolvedRef)
 	fmt.Fprintf(out, "  image:  %s\n", plan.Tag)
 	fmt.Fprintf(out, "\nNext:\n  piccolo integration setup %s\n  piccolo restart\n", desc.Name)
+	return nil
+}
+
+func runIntegrationList(cmd *cobra.Command, jsonOut bool) error {
+	out := cmd.OutOrStdout()
+	dir, err := workspace.Require(dirFlag)
+	if err != nil {
+		return err
+	}
+	m, err := manifest.Load(workspace.NewLayout(dir).Manifest())
+	if err != nil {
+		return err
+	}
+	if jsonOut {
+		enc := json.NewEncoder(out)
+		enc.SetIndent("", "  ")
+		return enc.Encode(m.Runtime.Integrations)
+	}
+	if len(m.Runtime.Integrations) == 0 {
+		fmt.Fprintln(out, "No integrations installed.")
+		return nil
+	}
+	fmt.Fprintf(out, "%-28s %-12s %-32s %-10s %-8s\n", "PACKAGE", "NAME", "DISPLAY", "VERSION", "CHANNEL")
+	for _, in := range m.Runtime.Integrations {
+		pkg := displayPackage(in)
+		fmt.Fprintf(out, "%-28s %-12s %-32s %-10s %-8s\n", pkg, in.Name, displayIntegration(in), valueOrDash(in.ResolvedVersion), valueOrDash(in.Channel))
+	}
 	return nil
 }
 
@@ -265,20 +443,20 @@ func runIntegrationStatus(cmd *cobra.Command, name string, f integrationStatusFl
 		return err
 	}
 	if len(m.Runtime.Integrations) == 0 {
-		return fmt.Errorf("no integrations installed — run 'piccolo integration add <alias-or-ref>' first")
+		return fmt.Errorf("no integrations installed — run 'piccolo integration add <owner/repo>' first")
 	}
 	selected := []manifest.Integration{}
 	if f.all {
 		selected = append(selected, m.Runtime.Integrations...)
 	} else {
 		for _, item := range m.Runtime.Integrations {
-			if item.Name == name {
+			if integrationMatches(item, name) {
 				selected = append(selected, item)
 				break
 			}
 		}
 		if len(selected) == 0 {
-			return fmt.Errorf("integration %q is not installed — run 'piccolo integration add %s' first", name, name)
+			return fmt.Errorf("integration %q is not installed — run 'piccolo integration add <owner/repo>' first", name)
 		}
 	}
 	if err := layout.EnsureDirs(); err != nil {
@@ -384,13 +562,7 @@ func runIntegrationUpgrade(cmd *cobra.Command, name string, f integrationUpgrade
 		ctx = context.Background()
 	}
 	if f.all && strings.TrimSpace(name) != "" {
-		return fmt.Errorf("use either 'piccolo integration upgrade <name>' or 'piccolo integration upgrade --all', not both")
-	}
-	if !f.all && strings.TrimSpace(name) == "" {
-		return fmt.Errorf("use either 'piccolo integration upgrade <name>' or 'piccolo integration upgrade --all'")
-	}
-	if f.all && strings.TrimSpace(f.to) != "" {
-		return fmt.Errorf("--to can only be used with a single integration name")
+		return fmt.Errorf("use either 'piccolo integration upgrade <package>' or 'piccolo integration upgrade --all', not both")
 	}
 	dir, err := workspace.Require(dirFlag)
 	if err != nil {
@@ -403,65 +575,73 @@ func runIntegrationUpgrade(cmd *cobra.Command, name string, f integrationUpgrade
 		return err
 	}
 	if len(m.Runtime.Integrations) == 0 {
-		return fmt.Errorf("no integrations installed — run 'piccolo integration add <alias-or-ref>' first")
+		return fmt.Errorf("no integrations installed — run 'piccolo integration add <owner/repo>' first")
 	}
-
-	upgradeAll := f.all
-	targetIndex := -1
-	var targetResolved picintegration.Resolved
-	if !upgradeAll {
-		for i := range m.Runtime.Integrations {
-			if m.Runtime.Integrations[i].Name == name {
-				targetIndex = i
+	indexes := []int{}
+	if strings.TrimSpace(name) == "" || f.all {
+		for i, item := range m.Runtime.Integrations {
+			if item.Source == string(picintegration.SourceRelease) && item.Channel == string(picintegration.ChannelLatest) {
+				indexes = append(indexes, i)
+			}
+		}
+	} else {
+		for i, item := range m.Runtime.Integrations {
+			if integrationMatches(item, name) {
+				if item.Source != string(picintegration.SourceRelease) {
+					return fmt.Errorf("integration %s was source-built; use 'piccolo integration build %s' to rebuild it", name, displayPackage(item))
+				}
+				if item.Channel != string(picintegration.ChannelLatest) {
+					return fmt.Errorf("%s is pinned to %s. Use 'piccolo integration add %s@<selector>' to change versions, or 'piccolo integration add %s' to track latest", displayPackage(item), item.Selector, displayPackage(item), displayPackage(item))
+				}
+				indexes = append(indexes, i)
 				break
 			}
 		}
-		if targetIndex < 0 {
-			return fmt.Errorf("integration %q is not installed — run 'piccolo integration add %s' first", name, name)
-		}
-		if strings.TrimSpace(f.to) != "" {
-			targetResolved, err = picintegration.Resolve(f.to)
-			if err != nil {
-				return err
-			}
+		if len(indexes) == 0 {
+			return fmt.Errorf("integration %q is not installed — run 'piccolo integration add <owner/repo>' first", name)
 		}
 	}
-
-	planned := append([]manifest.Integration(nil), m.Runtime.Integrations...)
-	if targetIndex >= 0 && strings.TrimSpace(f.to) != "" {
-		planned[targetIndex].Ref = targetResolved.Ref
-		planned[targetIndex].DescriptorCommand = targetResolved.DescriptorCommand
-		planned[targetIndex].Commands = []string{targetResolved.DescriptorCommand[0]}
-	}
-
-	fmt.Fprintf(out, "Upgrading Piccolo integrations\n")
-	if upgradeAll {
-		fmt.Fprintf(out, "  target: all (%d installed)\n", len(planned))
-	} else {
-		fmt.Fprintf(out, "  target: %s\n", name)
-	}
-	for _, item := range planned {
-		if picintegration.IsUnpinned(item.Ref) {
-			fmt.Fprintf(out, "[WARN] integration ref for %s is unpinned; rebuild may resolve different code (%s)\n", item.Name, item.Ref)
-		}
+	if len(indexes) == 0 {
+		fmt.Fprintln(out, "No latest-channel integrations to upgrade.")
+		return nil
 	}
 	if !f.yes && term.IsTerminal(int(os.Stdin.Fd())) {
-		fmt.Fprintf(out, "Build a new gateway image for this upgrade? [y/N] ")
+		fmt.Fprintf(out, "Upgrade %d latest-channel integration(s)? [y/N] ", len(indexes))
 		line, _ := bufio.NewReader(cmd.InOrStdin()).ReadString('\n')
 		if !strings.EqualFold(strings.TrimSpace(line), "y") && !strings.EqualFold(strings.TrimSpace(line), "yes") {
 			return errors.New("integration upgrade cancelled")
 		}
 	}
-
 	runner := newIntegrationRunner()
 	pingCtx, cancel := context.WithTimeout(ctx, defaultImageBuildProbeTimeout)
 	defer cancel()
 	if err := runner.Ping(pingCtx); err != nil {
 		return fmt.Errorf("docker daemon not reachable: %w", err)
 	}
-
+	planned := append([]manifest.Integration(nil), m.Runtime.Integrations...)
+	fetches := map[int]fetchedRelease{}
+	fetcher := newReleaseFetcher()
+	bundles, err := fetchReleaseBundlesForManifest(ctx, fetcher, planned)
+	if err != nil {
+		return err
+	}
+	for _, i := range indexes {
+		item := planned[i]
+		pkg, err := packageRefForManifest(item)
+		if err != nil {
+			return err
+		}
+		pkg.Selector = ""
+		fetched, err := fetcher.Fetch(ctx, pkg)
+		if err != nil {
+			return err
+		}
+		fetches[i] = fetched
+		bundles = upsertBundle(bundles, fetched.Bundle)
+		fmt.Fprintf(out, "Resolved %s: %s -> %s\n", pkg.Short(), valueOrDash(item.ResolvedVersion), fetched.Version)
+	}
 	base := integrationBuildBase(m)
-	plan, err := runtimeimage.BuildPlan(runtimeimage.Options{BaseImage: base, Tag: f.tag, Packages: effectiveToolchain(m).Packages, Commands: effectiveToolchain(m).Commands, Integrations: manifestIntegrationsForBuild(planned)})
+	plan, err := runtimeimage.BuildPlan(runtimeimage.Options{BaseImage: base, Tag: f.tag, Packages: effectiveToolchain(m).Packages, Commands: effectiveToolchain(m).Commands, Integrations: sourceManifestIntegrationsForBuild(planned), Bundles: bundles})
 	if err != nil {
 		return err
 	}
@@ -469,78 +649,56 @@ func runIntegrationUpgrade(cmd *cobra.Command, name string, f integrationUpgrade
 	if err != nil {
 		return err
 	}
-	fmt.Fprintf(out, "\nBuilding Piccolo runtime image with upgraded integrations\n")
+	fmt.Fprintf(out, "\nBuilding Piccolo runtime image with upgraded integration releases\n")
 	fmt.Fprintf(out, "  base: %s\n", plan.BaseImage)
-	fmt.Fprintf(out, "  tag:  %s\n", plan.Tag)
-	for _, item := range planned {
-		fmt.Fprintf(out, "  integration: %s (%s)\n", item.Name, item.Ref)
-	}
-	fmt.Fprintln(out)
-	buildIntegrations := manifestIntegrationsForBuild(planned)
-	buildArgs := integrationBuildArgs(buildIntegrations)
-	if len(buildArgs) > 0 {
-		fmt.Fprintf(out, "[WARN] refreshing integration install layer for unpinned refs so latest code is resolved\n")
-	}
-	if err := runner.BuildImage(ctx, buildCtx, docker.ImageBuildOptions{Tag: plan.Tag, Dockerfile: "Dockerfile", Pull: f.pull, Remove: true, BuildArgs: buildArgs}, out); err != nil {
+	fmt.Fprintf(out, "  tag:  %s\n\n", plan.Tag)
+	if err := runner.BuildImage(ctx, buildCtx, docker.ImageBuildOptions{Tag: plan.Tag, Dockerfile: "Dockerfile", Pull: f.pull, Remove: true}, out); err != nil {
 		return fmt.Errorf("build image: %w", err)
 	}
 	if err := layout.EnsureDirs(); err != nil {
 		return err
 	}
-
-	refreshIndexes := []int{}
-	if upgradeAll {
-		for i := range planned {
-			refreshIndexes = append(refreshIndexes, i)
-		}
-	} else {
-		refreshIndexes = append(refreshIndexes, targetIndex)
-	}
-	refreshed := append([]manifest.Integration(nil), planned...)
-	for _, i := range refreshIndexes {
-		item := refreshed[i]
-		descCmd := descriptorCommandFor(item)
-		if len(descCmd) == 0 {
-			return fmt.Errorf("integration %q has no descriptor command metadata", item.Name)
-		}
+	for i, fetched := range fetches {
+		pkg := fetched.Ref
+		descCmd := pkg.DescriptorCommand()
 		descEntrypoint, descCommand := splitEntrypointCommand(descCmd)
-		fmt.Fprintf(out, "Validating descriptor for %s...\n", item.Name)
+		fmt.Fprintf(out, "Validating descriptor for %s...\n", pkg.Short())
 		descData, err := runContainerCapture(ctx, runner, docker.Spec{Image: plan.Tag, Source: layout.PicoclawHome(), Volumes: integrationSetupBinds(layout), Entrypoint: descEntrypoint, Command: descCommand, Env: nil, Labels: map[string]string{docker.LabelWorkspace: dir}})
 		if err != nil {
-			return fmt.Errorf("describe integration %s: %w", item.Name, err)
+			return fmt.Errorf("describe integration %s: %w", pkg.Short(), err)
 		}
 		desc, err := picintegration.ParseDescriptor(descData)
 		if err != nil {
-			return fmt.Errorf("parse integration descriptor for %s: %w", item.Name, err)
+			return fmt.Errorf("parse integration descriptor for %s: %w", pkg.Short(), err)
 		}
-		if desc.Name != item.Name {
-			return fmt.Errorf("integration %q descriptor reported name %q; refusing to replace state owned by %q", item.Name, desc.Name, item.Name)
-		}
-		refreshed[i] = manifest.Integration{
+		containerState := pkg.ContainerStatePath()
+		planned[i] = manifest.Integration{
+			Package:           pkg.Package(),
+			Requested:         planned[i].Requested,
+			Source:            string(picintegration.SourceRelease),
+			Channel:           string(picintegration.ChannelLatest),
+			Selector:          "latest",
+			ResolvedVersion:   fetched.Version,
+			ArtifactDigest:    fetched.Digest,
+			StatePath:         pkg.StatePath(),
 			Name:              desc.Name,
 			DisplayName:       desc.DisplayName,
-			Ref:               item.Ref,
 			Commands:          []string(desc.Commands),
 			DescriptorCommand: descCmd,
-			SetupCommand:      desc.Setup.Command,
-			StatusCommand:     desc.StatusCommand,
+			SetupCommand:      rewriteStateArgs(desc.Setup.Command, containerState),
+			StatusCommand:     rewriteStateArgs(desc.StatusCommand, containerState),
 			SetupRequiresTTY:  desc.Setup.RequiresTTY,
 			SetupPorts:        desc.Setup.Ports,
 		}
 	}
-
 	m.Container.Image = plan.Tag
-	m.Runtime.Integrations = refreshed
+	m.Runtime.Integrations = planned
 	if err := m.Write(manifestPath); err != nil {
 		return fmt.Errorf("update %s: %w", workspace.ManifestName, err)
 	}
 	fmt.Fprintf(out, "\n✓ Upgraded integrations\n")
 	fmt.Fprintf(out, "  image: %s\n", plan.Tag)
-	if upgradeAll {
-		fmt.Fprintf(out, "\nNext:\n  piccolo restart\n  piccolo integration setup <name>  # optional, only if reconfiguration is needed\n")
-	} else {
-		fmt.Fprintf(out, "\nNext:\n  piccolo restart\n  piccolo integration setup %s  # optional, only if reconfiguration is needed\n", name)
-	}
+	fmt.Fprintf(out, "\nNext:\n  piccolo restart\n")
 	return nil
 }
 
@@ -561,13 +719,13 @@ func runIntegrationSetup(cmd *cobra.Command, name string) error {
 	}
 	var found *manifest.Integration
 	for i := range m.Runtime.Integrations {
-		if m.Runtime.Integrations[i].Name == name {
+		if integrationMatches(m.Runtime.Integrations[i], name) {
 			found = &m.Runtime.Integrations[i]
 			break
 		}
 	}
 	if found == nil {
-		return fmt.Errorf("integration %q not installed — run 'piccolo integration add %s' first", name, name)
+		return fmt.Errorf("integration %q not installed — run 'piccolo integration add <owner/repo>' first", name)
 	}
 	if len(found.SetupCommand) == 0 {
 		return fmt.Errorf("integration %q has no setup command", name)
@@ -699,9 +857,12 @@ func descriptorCommandFor(item manifest.Integration) []string {
 	return nil
 }
 
-func manifestIntegrationsForBuild(in []manifest.Integration) []runtimeimage.Integration {
+func sourceManifestIntegrationsForBuild(in []manifest.Integration) []runtimeimage.Integration {
 	out := make([]runtimeimage.Integration, 0, len(in))
 	for _, item := range in {
+		if item.Source != string(picintegration.SourceBuild) && item.Ref == "" {
+			continue
+		}
 		cmds := append([]string(nil), item.Commands...)
 		if len(cmds) == 0 && len(item.DescriptorCommand) > 0 {
 			cmds = []string{item.DescriptorCommand[0]}
@@ -711,20 +872,29 @@ func manifestIntegrationsForBuild(in []manifest.Integration) []runtimeimage.Inte
 	return out
 }
 
+func fetchReleaseBundlesForManifest(ctx context.Context, fetcher releaseFetcher, in []manifest.Integration) ([]runtimeimage.IntegrationBundle, error) {
+	bundles := []runtimeimage.IntegrationBundle{}
+	for _, item := range in {
+		if item.Source != string(picintegration.SourceRelease) {
+			continue
+		}
+		pkg, err := packageRefForManifest(item)
+		if err != nil {
+			return nil, err
+		}
+		fetched, err := fetcher.Fetch(ctx, pkg)
+		if err != nil {
+			return nil, err
+		}
+		bundles = upsertBundle(bundles, fetched.Bundle)
+	}
+	return bundles, nil
+}
+
 func upsertBuildIntegration(in []runtimeimage.Integration, item runtimeimage.Integration) []runtimeimage.Integration {
 	for i := range in {
 		if in[i].Ref == item.Ref {
 			in[i].Commands = append(in[i].Commands, item.Commands...)
-			return in
-		}
-	}
-	return append(in, item)
-}
-
-func upsertManifestIntegration(in []manifest.Integration, item manifest.Integration) []manifest.Integration {
-	for i := range in {
-		if in[i].Name == item.Name {
-			in[i] = item
 			return in
 		}
 	}
@@ -740,4 +910,77 @@ func displayIntegration(in manifest.Integration) string {
 		return in.DisplayName
 	}
 	return in.Name
+}
+
+func displayPackage(in manifest.Integration) string {
+	if strings.HasPrefix(in.Package, "github:") {
+		return strings.TrimPrefix(in.Package, "github:")
+	}
+	if in.Package != "" {
+		return in.Package
+	}
+	if strings.HasPrefix(in.Ref, "github:") {
+		ref := strings.TrimPrefix(in.Ref, "github:")
+		if i := strings.IndexAny(ref, "?#"); i >= 0 {
+			ref = ref[:i]
+		}
+		return ref
+	}
+	return in.Name
+}
+
+func valueOrDash(v string) string {
+	if strings.TrimSpace(v) == "" {
+		return "-"
+	}
+	return v
+}
+
+func integrationMatches(in manifest.Integration, input string) bool {
+	input = strings.TrimSpace(input)
+	if input == "" {
+		return false
+	}
+	return input == in.Name || input == in.Package || input == displayPackage(in)
+}
+
+func upsertBundle(in []runtimeimage.IntegrationBundle, item runtimeimage.IntegrationBundle) []runtimeimage.IntegrationBundle {
+	for i := range in {
+		if in[i].Package == item.Package {
+			in[i] = item
+			return in
+		}
+	}
+	return append(in, item)
+}
+
+func upsertManifestIntegration(in []manifest.Integration, item manifest.Integration) []manifest.Integration {
+	for i := range in {
+		if (item.Package != "" && in[i].Package == item.Package) || (item.Package == "" && in[i].Name == item.Name) {
+			in[i] = item
+			return in
+		}
+	}
+	return append(in, item)
+}
+
+func packageRefForManifest(in manifest.Integration) (picintegration.PackageRef, error) {
+	if strings.TrimSpace(in.Package) != "" {
+		ref := in.Package
+		if in.Channel == string(picintegration.ChannelFixed) && in.Selector != "" && in.Selector != "latest" {
+			ref += "@" + in.Selector
+		}
+		return picintegration.ParsePackageRef(ref)
+	}
+	return picintegration.ParsePackageRef(displayPackage(in))
+}
+
+func rewriteStateArgs(args []string, containerState string) []string {
+	out := append([]string(nil), args...)
+	for i, arg := range out {
+		if strings.HasPrefix(arg, "/root/.piccolo/integrations/") {
+			out[i] = containerState
+		}
+	}
+	return out
 }

@@ -11,10 +11,10 @@ piccolo init      interactive wizard → creates the workspace in the current di
 piccolo setup     arrow-navigable editor for an existing workspace
                   (channels like Discord, models, tool toggles — merge-patched,
                   with provider setup steps, diff preview, and config.json.bak)
-piccolo integration add gws
-                  build/select a gateway image containing a self-describing
-                  integration package (does not patch config.json itself)
-piccolo integration setup gws
+piccolo integration add kimus/piccolo-gws
+                  install/select a release-packaged integration in the gateway
+                  image (does not patch config.json itself)
+piccolo integration setup kimus/piccolo-gws
                   run the integration-owned setup command in a temporary
                   container from the configured image
 piccolo doctor    validates Docker, workspace, and generated files
@@ -52,9 +52,25 @@ piccolo stop      stop and remove the container
 └────────────────────────────┘
 ```
 
+## Install
+
+```sh
+curl -fsSL https://kimus.github.io/piccolo/install.sh | sh
+```
+
+Install a specific version:
+
+```sh
+curl -fsSL https://kimus.github.io/piccolo/install.sh | sh -s -- --version 3.1.0
+```
+
+The installer downloads the matching GitHub Release archive, verifies `checksums.txt`, and installs only the host `piccolo` CLI. It does not install Docker, PicoClaw, Devbox/Nix, or integrations.
+
+Manual installs can download a release archive and `checksums.txt` from GitHub Releases, verify the SHA-256 digest, and place `piccolo` on `PATH`.
+
 ## Requirements
 
-- Go 1.25+ (to build)
+- Go 1.25+ (only when building from source)
 - A reachable Docker daemon (Docker Desktop, colima, podman socket, ...). The `docker` CLI is **not** required — Piccolo talks to the daemon through the Docker Go SDK.
 
 ## Quickstart
@@ -160,46 +176,55 @@ The PicoClaw gateway always runs; the **web console** is an optional add-on. It 
 
 ### `piccolo integration`
 
-Containerized integrations are self-describing packages baked into the gateway image before PicoClaw starts. For example:
+Containerized integrations are self-describing packages baked into the gateway image before PicoClaw starts. Normal installs use GitHub Release bundles addressed by package reference:
 
 ```sh
-piccolo integration add gws
-piccolo integration setup gws
+piccolo integration add kimus/piccolo-gws          # latest release
+piccolo integration add kimus/piccolo-gws@3.1.0   # exact release tag/selector
+piccolo integration setup kimus/piccolo-gws
 piccolo restart
 
-# later, rebuild the installed integration from its recorded ref
-piccolo integration upgrade gws
+# later, advance latest-channel integrations
+piccolo integration upgrade kimus/piccolo-gws
+piccolo integration upgrade        # all latest-channel integrations
 piccolo restart
 
 # verify provider connectivity
-piccolo integration status gws
+piccolo integration status kimus/piccolo-gws
 ```
 
-`add` resolves aliases such as `gws` to an integration package reference, asks before building third-party code into the runtime image, runs the installed binary's `describe --json` in a container, and records Piccolo-owned integration metadata in `piccolo.yaml`. It does **not** patch provider-specific `config.json` entries.
+Package refs use `[provider:]owner/repo[@selector]`; the default provider is GitHub. Short aliases such as `gws` are not supported. The selector is provider/repository-owned and opaque, so `kimus/piccolo-gws@3.1.0` and `johndoe/piccolo-maker@v2.1.10` are both valid if those GitHub Release tags exist.
 
-`setup` runs the integration-owned setup command in a one-shot container from the configured image with `picoclaw/` mounted at `/root/.picoclaw` and `integrations/` mounted at `/root/.piccolo/integrations`. The integration owns provider prompts, auth, state files, and any `config.json` merge-patching. After setup, run `piccolo restart`.
+`add` installs or updates the selected release artifact, verifies its digest from `piccolo-integration-release.json`, runs the installed binary's `describe --json` in a container, and records Piccolo-owned integration metadata in `piccolo.yaml`. It preserves state and does **not** patch provider-specific `config.json` entries.
 
-`upgrade <name>` rebuilds a newly selected runtime image from the installed integration's recorded ref, validates the upgraded integration descriptor, and updates `piccolo.yaml` only after the build and descriptor check succeed. It preserves state under `integrations/<name>` and does **not** rerun setup automatically:
+`list` shows locally installed integrations without live provider checks:
 
 ```sh
-piccolo integration upgrade gws       # rebuild just gws, preserving other installed integrations in the image
-piccolo integration upgrade --all     # rebuild and refresh descriptors for every installed integration
-piccolo integration upgrade gws --to github:kimus/piccolo-gws?ref=v0.2.0
+piccolo integration list
+piccolo integration list --json
 ```
 
-Unpinned refs such as `github:kimus/piccolo-gws` may resolve newer code on each upgrade, so Piccolo prints a warning before rebuilding. Rerun `piccolo integration setup <name>` only when the upgraded integration's release notes or setup output says reconfiguration is needed; otherwise `piccolo restart` is enough to use the new image.
+`setup` runs the integration-owned setup command in a one-shot container from the configured image with `picoclaw/` mounted at `/root/.picoclaw` and `integrations/` mounted at `/root/.piccolo/integrations`. Integration state is package-scoped under `integrations/<owner>/<repo>` on the host and `/root/.piccolo/integrations/<owner>/<repo>` in the container. The integration owns provider prompts, auth, state files, and any `config.json` merge-patching. After setup, run `piccolo restart`.
 
-`status <name>` runs the integration-owned connectivity checks in a one-shot container and renders provider-specific results through a generic Piccolo status format. For Google Workspace, this is where Gmail, Calendar, and Drive connectivity is checked:
+`upgrade [package]` advances latest-channel release installs. Fixed selector installs remain pinned; change versions by running `piccolo integration add <owner/repo@selector>` again. Setup is not rerun automatically.
+
+`build <package-ref>` is the explicit developer/source-build path using Devbox/Nix and may download compilers/build dependencies:
 
 ```sh
-piccolo integration status gws
+piccolo integration build kimus/piccolo-gws@main
+```
+
+`status <package>` runs the integration-owned connectivity checks in a one-shot container and renders provider-specific results through a generic Piccolo status format. For Google Workspace, this is where Gmail, Calendar, and Drive connectivity is checked:
+
+```sh
+piccolo integration status kimus/piccolo-gws
 piccolo integration status --all
-piccolo integration status gws --json
+piccolo integration status kimus/piccolo-gws --json
 ```
 
 Piccolo itself stays provider-neutral: if a check fails, the integration supplies the service-specific message and remediation. Status uses the same structured mounts as setup (`picoclaw/` and `integrations/`) and can run even when the gateway is stopped.
 
-Integration authors provide an executable whose descriptor command returns JSON like:
+Integration authors publish release bundles plus provide an executable whose descriptor command returns JSON like:
 
 ```json
 {
@@ -208,14 +233,14 @@ Integration authors provide an executable whose descriptor command returns JSON 
   "displayName": "Google Workspace",
   "commands": ["piccolo-gws"],
   "setup": {
-    "command": ["piccolo-gws", "setup", "--config-dir", "/root/.piccolo/integrations/gws"],
+    "command": ["piccolo-gws", "setup", "--config-dir", "/root/.piccolo/integrations/kimus/piccolo-gws"],
     "requiresTty": true,
     "ports": ["127.0.0.1:8000:8000"]
   }
 }
 ```
 
-Only use integrations you trust; integration refs install code into the assistant runtime image.
+Only use integrations you trust; integration packages install code into the assistant runtime image.
 
 ### `piccolo setup`
 

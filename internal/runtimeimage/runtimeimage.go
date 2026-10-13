@@ -19,6 +19,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 )
@@ -90,12 +92,22 @@ type Options struct {
 	Packages     []string
 	Commands     []string
 	Integrations []Integration
+	Bundles      []IntegrationBundle
 }
 
 // Integration is a build-time package that must be available before the
 // gateway entrypoint starts (for example, a stdio MCP server binary).
 type Integration struct {
 	Ref      string
+	Commands []string
+}
+
+// IntegrationBundle is a verified, already-expanded release artifact directory.
+// Its contents are copied into the image; bin/* is installed onto PATH.
+type IntegrationBundle struct {
+	Package  string
+	Version  string
+	Root     string
 	Commands []string
 }
 
@@ -108,6 +120,7 @@ type Plan struct {
 	Packages         []string
 	Commands         []string
 	Integrations     []Integration
+	Bundles          []IntegrationBundle
 }
 
 func BuildPlan(opts Options) (Plan, error) {
@@ -134,12 +147,13 @@ func BuildPlan(opts Options) (Plan, error) {
 	if err != nil {
 		return Plan{}, err
 	}
-	dockerfile := renderDockerfile(base, integrations)
+	bundles := normalizeBundles(opts.Bundles)
+	dockerfile := renderDockerfile(base, integrations, bundles)
 	tag := strings.TrimSpace(opts.Tag)
 	if tag == "" {
 		tag = DefaultTag(base, dockerfile, devbox, integrationsJSON)
 	}
-	return Plan{BaseImage: base, Tag: tag, Dockerfile: dockerfile, DevboxJSON: devbox, IntegrationsJSON: integrationsJSON, Packages: packages, Commands: commands, Integrations: integrations}, nil
+	return Plan{BaseImage: base, Tag: tag, Dockerfile: dockerfile, DevboxJSON: devbox, IntegrationsJSON: integrationsJSON, Packages: packages, Commands: commands, Integrations: integrations, Bundles: bundles}, nil
 }
 
 func IsLocalRuntimeImage(ref string) bool {
@@ -179,6 +193,37 @@ func (p Plan) ContextTar() (io.Reader, error) {
 			return nil, err
 		}
 	}
+	for i, bundle := range p.Bundles {
+		root := filepath.Clean(bundle.Root)
+		if err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+			if d.IsDir() {
+				return nil
+			}
+			rel, err := filepath.Rel(root, path)
+			if err != nil {
+				return err
+			}
+			info, err := d.Info()
+			if err != nil {
+				return err
+			}
+			b, err := os.ReadFile(path)
+			if err != nil {
+				return err
+			}
+			name := filepath.ToSlash(filepath.Join("release-integrations", fmt.Sprintf("bundle-%d", i), rel))
+			if err := tw.WriteHeader(&tar.Header{Name: name, Mode: int64(info.Mode().Perm()), Size: int64(len(b))}); err != nil {
+				return err
+			}
+			_, err = tw.Write(b)
+			return err
+		}); err != nil {
+			return nil, err
+		}
+	}
 	if err := tw.Close(); err != nil {
 		return nil, err
 	}
@@ -190,10 +235,13 @@ func (p Plan) ContextTar() (io.Reader, error) {
 // installed after run (the setup script, triggered by `piccolo serve`) into the
 // persisted volumes and symlinked onto PATH. The default PicoClaw entrypoint is
 // left untouched.
-func renderDockerfile(base string, integrations []Integration) string {
+func renderDockerfile(base string, integrations []Integration, bundles []IntegrationBundle) string {
 	integrationBlock := ""
 	if len(integrations) > 0 {
 		integrationBlock = renderIntegrationInstallBlock(integrations)
+	}
+	if len(bundles) > 0 {
+		integrationBlock += renderBundleInstallBlock(bundles)
 	}
 	return fmt.Sprintf(`FROM %s
 USER root
@@ -312,6 +360,35 @@ func normalizeIntegrations(in []Integration) []Integration {
 		out = append(out, byRef[ref])
 	}
 	return out
+}
+
+func normalizeBundles(in []IntegrationBundle) []IntegrationBundle {
+	out := append([]IntegrationBundle(nil), in...)
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Package == out[j].Package {
+			return out[i].Version < out[j].Version
+		}
+		return out[i].Package < out[j].Package
+	})
+	for i := range out {
+		out[i].Commands = uniqueSorted(out[i].Commands)
+	}
+	return out
+}
+
+func renderBundleInstallBlock(bundles []IntegrationBundle) string {
+	var b strings.Builder
+	for i, bundle := range bundles {
+		commands := uniqueSorted(bundle.Commands)
+		b.WriteString(fmt.Sprintf("COPY release-integrations/bundle-%d/ /opt/piccolo/release-integrations/bundle-%d/\n", i, i))
+		b.WriteString(fmt.Sprintf("RUN set -eu; src=/opt/piccolo/release-integrations/bundle-%d; \\\n", i))
+		b.WriteString(" if [ -d \"$src/bin\" ]; then for bin in \"$src\"/bin/*; do [ -f \"$bin\" ] || continue; install -m 0755 \"$bin\" /usr/local/bin/\"$(basename \"$bin\")\"; done; fi")
+		for _, cmd := range commands {
+			b.WriteString(fmt.Sprintf("; command -v %s >/dev/null", shellQuote(cmd)))
+		}
+		b.WriteString("\n")
+	}
+	return b.String()
 }
 
 func renderIntegrationInstallBlock(integrations []Integration) string {
