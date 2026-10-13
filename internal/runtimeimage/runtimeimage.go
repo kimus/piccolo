@@ -382,6 +382,7 @@ func renderBundleInstallBlock(bundles []IntegrationBundle) string {
 		commands := uniqueSorted(bundle.Commands)
 		b.WriteString(fmt.Sprintf("COPY release-integrations/bundle-%d/ /opt/piccolo/release-integrations/bundle-%d/\n", i, i))
 		b.WriteString(fmt.Sprintf("RUN set -eu; src=/opt/piccolo/release-integrations/bundle-%d; \\\n", i))
+		b.WriteString(" if [ -d \"$src/nix/store\" ]; then mkdir -p /nix/store; cp -a \"$src/nix/store/.\" /nix/store/; fi; \\\n")
 		b.WriteString(" if [ -d \"$src/bin\" ]; then for bin in \"$src\"/bin/*; do [ -f \"$bin\" ] || continue; install -m 0755 \"$bin\" /usr/local/bin/\"$(basename \"$bin\")\"; done; fi")
 		for _, cmd := range commands {
 			b.WriteString(fmt.Sprintf("; command -v %s >/dev/null", shellQuote(cmd)))
