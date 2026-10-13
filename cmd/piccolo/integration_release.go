@@ -139,7 +139,14 @@ func extractIntegrationArchive(data []byte) (string, []string, error) {
 			return "", nil, err
 		}
 		clean := filepath.Clean(hdr.Name)
-		if clean == "." || strings.HasPrefix(clean, "..") || filepath.IsAbs(clean) {
+		if clean == "." {
+			if hdr.Typeflag == tar.TypeDir {
+				continue
+			}
+			_ = os.RemoveAll(root)
+			return "", nil, fmt.Errorf("unsafe path in integration archive: %s", hdr.Name)
+		}
+		if strings.HasPrefix(clean, "..") || filepath.IsAbs(clean) {
 			_ = os.RemoveAll(root)
 			return "", nil, fmt.Errorf("unsafe path in integration archive: %s", hdr.Name)
 		}

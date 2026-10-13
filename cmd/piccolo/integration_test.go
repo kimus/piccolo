@@ -258,6 +258,36 @@ type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) { return f(req) }
 
+func TestExtractIntegrationArchiveAllowsDotDirectory(t *testing.T) {
+	var buf bytes.Buffer
+	gz := gzip.NewWriter(&buf)
+	tw := tar.NewWriter(gz)
+	if err := tw.WriteHeader(&tar.Header{Name: "./", Typeflag: tar.TypeDir, Mode: 0o755}); err != nil {
+		t.Fatal(err)
+	}
+	b := []byte("#!/bin/sh\n")
+	if err := tw.WriteHeader(&tar.Header{Name: "./bin/piccolo-gws", Typeflag: tar.TypeReg, Mode: 0o755, Size: int64(len(b))}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tw.Write(b); err != nil {
+		t.Fatal(err)
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := gz.Close(); err != nil {
+		t.Fatal(err)
+	}
+	root, commands, err := extractIntegrationArchive(buf.Bytes())
+	if err != nil {
+		t.Fatalf("extract: %v", err)
+	}
+	defer os.RemoveAll(root)
+	if len(commands) != 1 || commands[0] != "piccolo-gws" {
+		t.Fatalf("commands = %#v", commands)
+	}
+}
+
 func makeBundleArchive(t *testing.T) []byte {
 	t.Helper()
 	var buf bytes.Buffer
