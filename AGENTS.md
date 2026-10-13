@@ -7,7 +7,7 @@ Instructions for coding agents implementing Piccolo. Read [README.md](README.md)
 - The binary produced by this project SHALL be named `piccolo`.
 - A reachable Docker daemon SHALL be required. Piccolo talks to it through the Docker Go SDK (`github.com/docker/go-sdk/client`, pinned exactly: `v0.1.0-alpha013`, plus `github.com/moby/moby/api` and `github.com/moby/moby/client`). The `docker` CLI SHALL NOT be a hard dependency.
 - There SHALL be no `picoclaw` binary requirement on `$PATH`, no binary-path flag, and no binary downloader.
-- `piccolo.yaml` SHALL contain only Piccolo launch configuration. There SHALL be NO duplicated configuration between `piccolo.yaml` and `config.json` (no assistant name, model, tools, or agent lists in `piccolo.yaml`).
+- `piccolo.yaml` SHALL contain Piccolo-owned configuration: container launch settings plus non-secret setup metadata. There SHALL be NO duplicated PicoClaw runtime configuration between `piccolo.yaml` and `config.json` (no assistant name, model, tools, agent lists, channel tokens, allowlists, or enabled state in `piccolo.yaml`).
 - `config.json` and agent workspace files are generated **once** by `piccolo init` and are **user-owned** afterwards. Piccolo SHALL never silently regenerate or overwrite them.
 - The implementation SHALL run a single gateway container hosting multiple PicoClaw agents — not one container per agent.
 - Do NOT implement custom Piccolo memory, native PicoClaw tools, MCP servers, or custom runtime logic.
@@ -44,8 +44,12 @@ container:
   image: docker.io/sipeed/picoclaw:v0.3.1  # pinned tag, never "latest" in generated manifests
   name: piccolo-gateway
   network: bridge                           # none | bridge | host
-  ports: []                                 # launcher: ["127.0.0.1:18800:18800"]
+  ports: []                                 # web console enabled: ["127.0.0.1:18800:18800"]
   env: {}                                   # literal or "env:HOST_VAR" (resolved at serve time)
+setup:                                      # optional non-secret setup metadata
+  channels:
+    discord:
+      application_id: ""                    # used to regenerate invite/setup links
 ```
 
 - Strict decoding: unknown keys SHALL cause a parse error.
@@ -72,7 +76,7 @@ Generated from wizard answers, PicoClaw schema v3. Minimum shape:
     ]
   },
   "model_list": [
-    { "model_name": "<alias>", "model": "<provider>/<model>", "api_keys": ["<key>"], "api_base": "<optional>" }
+    { "model_name": "<alias>", "provider": "<provider>", "model": "<model-id>", "api_keys": ["<key>"], "api_base": "<optional>" }
   ],
   "tools": {
     "web":  { "enabled": true },
@@ -84,6 +88,7 @@ Generated from wizard answers, PicoClaw schema v3. Minimum shape:
 ```
 
 - Re-verify the exact field set against `config/config.example.json` of the pinned version during implementation.
+- **Model entries use the explicit-provider form** (`provider` + bare `model`, never a `provider/model` concatenation). PicoClaw resolves in two steps: when `provider` is set, `model` is sent to that provider **unchanged** (a redundant `<provider>/` prefix is NOT stripped upstream, so piccolo strips it at generation); when `provider` is empty, PicoClaw infers it from the first `/` segment. Explicit provider is upstream's preferred shape (see picoclaw `docs/operations/troubleshooting.md`, OpenRouter free-tier). Both `init` (wizard collects provider + model separately) and `setup models` emit it.
 - Deterministic output: stable key order, 2-space indent. No Piccolo branding inside the file.
 
 ## Command Behavior
@@ -91,7 +96,7 @@ Generated from wizard answers, PicoClaw schema v3. Minimum shape:
 ### `piccolo init`
 
 1. Check Docker daemon reachability; warn (not fail) if unreachable.
-2. Ask wizard questions: assistant name; owner name; purpose template (personal/research/coding/operations/blank); specialist agents (research, planner, coder, ops); interaction mode (**terminal** = gateway image + stdio, **web console** = launcher image + `127.0.0.1:18800` + `PICOCLAW_GATEWAY_HOST=0.0.0.0` env); model provider + model + API key (placeholder allowed with warning); web search (default yes); shell exec (default no); workspace path (default cwd).
+2. Ask wizard questions: assistant name; owner name; purpose template (personal/research/coding/operations/blank); specialist agents (research, planner, coder, ops); expose the optional **web console** (`--dashboard`; gateway always runs, this only adds the launcher image + `127.0.0.1:18800` + `PICOCLAW_GATEWAY_HOST=0.0.0.0` env); model provider + model + API key (placeholder allowed with warning); web search (`--web-search`, default yes); shell exec (default no); workspace path (default cwd).
 3. Preview the generation plan (files, image, ports), then final confirmation.
 4. Write files. **Create-only**: if files exist, list them and require explicit per-file confirmation before any overwrite.
 5. Ensure `config.json` is git-ignored: create `.gitignore` or append if the entry is missing.
@@ -103,7 +108,7 @@ Generated from wizard answers, PicoClaw schema v3. Minimum shape:
 
 ### `piccolo doctor`
 
-Checks: Docker daemon reachable (SDK ping); image present locally (warn + pull hint if missing, not a failure); `piccolo.yaml` exists/parses strictly/pinned tag; `config.json` exists/parses/`version == 3`; `agents.list` non-empty with exactly one `default: true`; every referenced agent workspace exists **on the host** (translate `~/.picoclaw/...` → `<workspace>/...`) with parseable `AGENT.md` frontmatter; `model_list` non-empty (warn on placeholder/empty keys); every `env:VAR` ref resolves (warn); stale container with configured name (warn — `serve` will replace it).
+Checks: Docker daemon reachable (SDK ping); image present locally (warn + pull hint if missing, not a failure); `piccolo.yaml` exists/parses strictly/pinned tag; `config.json` exists/parses/`version == 3`; `agents.list` non-empty with exactly one `default: true`; every referenced agent workspace exists **on the host** (translate `~/.picoclaw/...` → `<workspace>/...`) with parseable `AGENT.md` frontmatter; `model_list` non-empty (warn on placeholder/empty keys); every `env:VAR` ref resolves (warn); stale container with configured name (warn — `serve` will replace it); web-console consistency (a `:18800` binding paired with a non-launcher image → warn about the dead port; a disabled console is clean, never warned).
 
 Output: `[OK]`/`[WARN]`/`[FAIL]` status lines (see README for the exact format). Exit `0` unless any `[FAIL]`; warnings never fail.
 
@@ -137,7 +142,7 @@ Terminal chat by wrapping PicoClaw's own client through `ExecCreate`/`ExecAttach
 
 The upstream banner, lobster emoji, and client log lines are shown as-is; gateway logs remain available via `piccolo logs`.
 
-For the web console, the wizard's **web** mode selects the launcher image; the browser chat lives at `http://127.0.0.1:18800`.
+The web console is optional and enabled solely by a `:18800` binding in `piccolo.yaml` (which pairs with the launcher image); the browser chat lives at `http://127.0.0.1:18800`. The gateway runs regardless of this choice.
 
 ## Agent File Generation
 
@@ -182,7 +187,7 @@ Reduced tool allowlists (research: `web_search`, `web_fetch`, `read_file`; coder
 - No detached/foreground ambiguity: serve is detached + health-gated; `--foreground` attaches.
 - No custom terminal chat UI — `piccolo chat` wraps `picoclaw agent` via exec.
 - No `piccolo add-agent` (manual edit of `config.json` + workspace; doctor catches mistakes).
-- No channel credential setup wizard.
+- No full channel automation; setup may guide credentials and provider links, but provider-side app/server installation remains user-driven.
 - No regeneration/migration of an existing `config.json`.
 - No migration from piccolo-full beyond code reuse.
 
@@ -206,23 +211,23 @@ Reduced tool allowlists (research: `web_search`, `web_fetch`, `read_file`; coder
 8. `piccolo serve --foreground` attaches stdio, forwards SIGINT/SIGTERM to a graceful stop, removes the container, exits with the container's exit code.
 9. Recovery from a crashed previous run: stale container replaced by name on next serve.
 10. Generated `config.json`: ONE gateway, multiple agents in `agents.list`, container-side workspace paths, ≥1 `model_list` entry.
-11. `piccolo.yaml` contains no PicoClaw-domain configuration.
+11. `piccolo.yaml` contains no duplicated PicoClaw runtime configuration; only launch settings and non-secret Piccolo setup metadata.
 12. Generated `AGENT.md` files have valid frontmatter and useful role instructions.
 13. Unit tests: manifest strict parsing, config generation determinism, doctor checks (daemon-free via interface), init non-destructive behavior, container spec composition (mounts/env/ports/labels), health-port/gateway-host injection helpers.
 
 ## Decisions Log
 
 - **Runtime delivery**: Docker container via Go SDK — no `picoclaw` on `$PATH`.
-- **Config split**: `piccolo.yaml` = launch-only; `config.json` = PicoClaw behavior, generated once, user-owned forever. No duplication.
+- **Config split**: `piccolo.yaml` = Piccolo-owned launch settings + non-secret setup metadata; `config.json` = PicoClaw runtime behavior, generated once, user-owned forever. No duplicated runtime configuration.
 - **Workspace = picoclaw home via default mount**: init writes everything directly into the workspace dir (default cwd, user-chosen); serve mounts it onto `/root/.picoclaw`. `PICOCLAW_HOME` never set. No `.piccolo/` subfolder, no `home:` key.
 - **Config format**: PicoClaw reads JSON (schema v3); YAML only for `piccolo.yaml` and `AGENT.md` frontmatter.
 - **API keys**: plaintext in `config.json`; mitigated by generated `.gitignore` + doctor placeholder warnings.
 - **Serve lifecycle**: detached + health-gated (`/health` on published 127.0.0.1 port) is the default; `--foreground` for attached stdio. Gateway gets `PICOCLAW_GATEWAY_HOST=0.0.0.0` injected when ports are published (container-loopback unreachable otherwise — verified by smoke test).
 - **Chat clients**: terminal = `piccolo chat` wrapping PicoClaw's own `picoclaw agent` REPL via docker exec; web = launcher image at `:18800`. No custom TUI is built.
-- **Interaction modes**: terminal (gateway image) or web console (launcher image, port 18800), chosen in the wizard.
+- **Web console (optional)**: gateway always runs (required); the web console is an add-on enabled by `--dashboard`. The `:18800` binding in `piccolo.yaml` is the single source of truth — no separate boolean that can drift from the ports. Console-off uses the lean gateway image and runs no dashboard process (no dead `:18800`); console-on uses the launcher image. `--web` was renamed to `--web-search` (agent tool toggle) to avoid ambiguity with `--dashboard`.
 
 ## Open Questions (verify during implementation)
 
 - Container stop grace period (currently 10s, then kill).
 
-Resolved during implementation: runtime tool names verified (`web_search`, `web_fetch`, `message`, `spawn`, `subagent`, `exec`, `read_file`, ...); `~/.picoclaw/...` tilde expansion verified by a live agent turn; gateway-image entrypoint behavior verified; `/health` requires no auth; launcher image (`--mode web`) smoke-tested end-to-end (health via gateway child, `:18800` → `/launcher-setup` password flow).
+Resolved during implementation: runtime tool names verified (`web_search`, `web_fetch`, `message`, `spawn`, `subagent`, `exec`, `read_file`, ...); `~/.picoclaw/...` tilde expansion verified by a live agent turn; gateway-image entrypoint behavior verified; `/health` requires no auth; launcher image (`--dashboard`) smoke-tested end-to-end (health via gateway child, `:18800` → `/launcher-setup` password flow).

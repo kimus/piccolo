@@ -3,17 +3,25 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
+	"github.com/charmbracelet/bubbles/key"
+	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/huh"
 	"github.com/spf13/cobra"
 	"golang.org/x/term"
 
 	"github.com/kimus/piccolo/internal/configdoc"
+	"github.com/kimus/piccolo/internal/generate"
+	"github.com/kimus/piccolo/internal/manifest"
+	"github.com/kimus/piccolo/internal/runtimeimage"
 	"github.com/kimus/piccolo/internal/setup"
 	"github.com/kimus/piccolo/internal/workspace"
 )
@@ -40,6 +48,12 @@ func newSetupCmd() *cobra.Command {
 	return cmd
 }
 
+func setupForm(groups ...*huh.Group) *huh.Form {
+	km := huh.NewDefaultKeyMap()
+	km.Quit = key.NewBinding(key.WithKeys("ctrl+c", "esc"), key.WithHelp("esc", "back/quit"))
+	return huh.NewForm(groups...).WithKeyMap(km).WithProgramOptions(tea.WithAltScreen())
+}
+
 type setupState struct {
 	cmd   *cobra.Command
 	out   *os.File
@@ -48,6 +62,12 @@ type setupState struct {
 	doc   *configdoc.Doc
 	orig  []byte // config.json as loaded (for diff + bak)
 	write bool   // any confirmed write happened
+
+	manifestPath string
+	manifest     *manifest.Manifest
+
+	pendingDiscordApplicationID string
+	pendingDiscordMentionOnly   bool
 }
 
 func runSetup(cmd *cobra.Command, args []string) error {
@@ -63,8 +83,13 @@ func runSetup(cmd *cobra.Command, args []string) error {
 		}
 		return fmt.Errorf("config.json does not parse (fix it manually first): %w", err)
 	}
+	manifestPath := filepath.Join(dir, "piccolo.yaml")
+	mf, err := manifest.Load(manifestPath)
+	if err != nil {
+		return fmt.Errorf("piccolo.yaml does not parse (fix it manually first): %w", err)
+	}
 	orig, _ := os.ReadFile(path)
-	st := &setupState{cmd: cmd, out: os.Stdout, dir: dir, path: path, doc: doc, orig: orig}
+	st := &setupState{cmd: cmd, out: os.Stdout, dir: dir, path: path, doc: doc, orig: orig, manifestPath: manifestPath, manifest: mf}
 
 	// Deep links.
 	if len(args) >= 1 {
@@ -88,10 +113,15 @@ func runSetup(cmd *cobra.Command, args []string) error {
 				return err
 			}
 			return st.finish()
-		case "agents", "container", "identity":
+		case "container":
+			if err := st.containerScreen(); err != nil {
+				return err
+			}
+			return st.finish()
+		case "agents", "identity":
 			return fmt.Errorf("%q is not editable yet — edit %s / piccolo.yaml manually", args[0], "config.json")
 		default:
-			return fmt.Errorf("unknown setup section %q (want: channels, models, tools)", args[0])
+			return fmt.Errorf("unknown setup section %q (want: channels, models, tools, container)", args[0])
 		}
 	}
 
@@ -99,6 +129,9 @@ func runSetup(cmd *cobra.Command, args []string) error {
 	for {
 		choice, err := st.homeMenu()
 		if err != nil {
+			if isCancel(err) {
+				return st.finish()
+			}
 			return err
 		}
 		if choice == "__quit__" {
@@ -112,6 +145,8 @@ func runSetup(cmd *cobra.Command, args []string) error {
 			screenErr = st.modelsScreen()
 		case "tools":
 			screenErr = st.toolsScreen()
+		case "container":
+			screenErr = st.containerScreen()
 		}
 		if screenErr != nil {
 			if isCancel(screenErr) {
@@ -127,7 +162,7 @@ func (st *setupState) finish() error {
 		fmt.Fprintln(st.out, "no changes written.")
 		return nil
 	}
-	fmt.Fprintf(st.out, "\n\u2713 config.json updated (previous copy: config.json.bak)\n")
+	fmt.Fprintf(st.out, "\n\u2713 config.json updated (previous copy: config.json.bak); piccolo.yaml setup metadata may also be updated\n")
 	if running := st.containerRunning(); running {
 		fmt.Fprintf(st.out, "warning: the gateway container is RUNNING — config changes are not applied yet.\n"+
 			"  piccolo reload    apply config.json in place (channels/models/tools restart inside the gateway)\n"+
@@ -170,16 +205,16 @@ func (st *setupState) homeMenu() (string, error) {
 	toolSummary := toolStateSummary(tools)
 
 	var choice string
-	form := huh.NewForm(huh.NewGroup(
+	form := setupForm(huh.NewGroup(
 		huh.NewSelect[string]().
 			Title("Piccolo setup — what do you want to change?").
-			Description("↑/↓ move · enter open · q quit").
+			Description("↑/↓ move · enter open · esc quit").
 			Options(
 				huh.NewOption(fmt.Sprintf("Channels   (%s)", chansSummary), "channels"),
 				huh.NewOption(fmt.Sprintf("Models     (%s)", modelSummary), "models"),
 				huh.NewOption(fmt.Sprintf("Tools      (%s)", toolSummary), "tools"),
+				huh.NewOption(fmt.Sprintf("Container  (web console: %s)", yesNo(st.webConsoleEnabled())), "container"),
 				huh.NewOption("Agents       (not editable yet — edit config.json manually)", "__agents__"),
-				huh.NewOption("Container    (not editable yet — edit piccolo.yaml manually)", "__container__"),
 				huh.NewOption("Identity     (not editable yet — edit agents/*/SOUL.md manually)", "__identity__"),
 				huh.NewOption("Quit", "__quit__"),
 			).
@@ -189,11 +224,96 @@ func (st *setupState) homeMenu() (string, error) {
 		return "", err
 	}
 	switch choice {
-	case "__agents__", "__container__", "__identity__":
-		fmt.Fprintln(st.out, "Agents/Container/Identity editing is not implemented yet — edit config.json / piccolo.yaml directly; piccolo doctor validates your changes.")
+	case "__agents__", "__identity__":
+		fmt.Fprintln(st.out, "Agents/Identity editing is not implemented yet — edit config.json / piccolo.yaml directly; piccolo doctor validates your changes.")
 		return "__back__", nil
 	}
 	return choice, nil
+}
+
+func (st *setupState) webConsoleEnabled() bool {
+	return webConsoleURL(st.manifest) != ""
+}
+
+func (st *setupState) containerScreen() error {
+	for {
+		enabled := st.webConsoleEnabled()
+		status := "off"
+		verb := "enable"
+		if enabled {
+			status = "on"
+			verb = "disable"
+		}
+		var pick string
+		form := setupForm(huh.NewGroup(
+			huh.NewSelect[string]().
+				Title("Container").
+				Description("Container launch settings; esc back.").
+				Options(
+					huh.NewOption(fmt.Sprintf("Web console [%s] — %s browser dashboard", status, verb), "web_console:"+verb),
+					huh.NewOption("← Back", "__back__"),
+				).
+				Value(&pick),
+		))
+		if err := form.Run(); err != nil {
+			return err
+		}
+		if pick == "__back__" {
+			return nil
+		}
+		_, verb, ok := strings.Cut(pick, ":")
+		if !ok {
+			continue
+		}
+		if err := st.applyWebConsoleChange(verb == "enable"); err != nil {
+			if isCancel(err) {
+				continue
+			}
+			return err
+		}
+	}
+}
+
+func (st *setupState) applyWebConsoleChange(enabled bool) error {
+	currently := st.webConsoleEnabled()
+	if currently == enabled {
+		fmt.Fprintf(st.out, "web console already %s.\n", yesNo(enabled))
+		return nil
+	}
+	if enabled {
+		if !hasContainerPort(st.manifest.Container.Ports, 18800) {
+			st.manifest.Container.Ports = append(st.manifest.Container.Ports, generate.LauncherPort)
+		}
+		if st.manifest.Container.Env == nil {
+			st.manifest.Container.Env = map[string]string{}
+		}
+		st.manifest.Container.Env["PICOCLAW_GATEWAY_HOST"] = "0.0.0.0"
+		if runtimeimage.IsLocalRuntimeImage(st.manifest.Container.Image) {
+			st.manifest.Container.Image = generate.LauncherImage
+			fmt.Fprintln(st.out, "note: switched to the official launcher image so the web console listens on :18800. Run 'piccolo image build --set' after this if you want a local launcher runtime with Devbox tools.")
+		} else {
+			st.manifest.Container.Image = generate.LauncherImage
+		}
+	} else {
+		st.manifest.Container.Ports = removeContainerPort(st.manifest.Container.Ports, 18800)
+		if runtimeimage.IsLocalRuntimeImage(st.manifest.Container.Image) {
+			st.manifest.Container.Image = generate.DefaultImage
+			fmt.Fprintln(st.out, "note: switched to the official gateway image. Run 'piccolo image build --set' after this if you want a local gateway runtime with Devbox tools.")
+		} else {
+			st.manifest.Container.Image = generate.DefaultImage
+		}
+	}
+	return st.applyManifestAndConfirm(fmt.Sprintf("web console %s", yesNo(enabled)))
+}
+
+func removeContainerPort(ports []string, containerPort int) []string {
+	out := ports[:0]
+	for _, p := range ports {
+		if !hasContainerPort([]string{p}, containerPort) {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 func toolStateSummary(t setup.ToolsState) string {
@@ -203,7 +323,7 @@ func toolStateSummary(t setup.ToolsState) string {
 		}
 		return "off"
 	}
-	return fmt.Sprintf("web:%s exec:%s spawn:%s subagent:%s", on(t.Web), on(t.Exec), on(t.Spawn), on(t.Subagent))
+	return fmt.Sprintf("web:%s exec:%s remote-exec:%s spawn:%s subagent:%s images:%s", on(t.Web), on(t.Exec), on(t.ExecAllowRemote), on(t.Spawn), on(t.Subagent), on(t.LoadImage))
 }
 
 // ---------- channels ----------
@@ -262,10 +382,10 @@ func (st *setupState) channelsScreen(deepLink string) error {
 			pick = deepLink
 			deepLink = ""
 		} else {
-			form := huh.NewForm(huh.NewGroup(
+			form := setupForm(huh.NewGroup(
 				huh.NewSelect[string]().
 					Title("Channels").
-					Description("↑/↓ move · enter manage · q back").
+					Description("↑/↓ move · enter manage · esc back").
 					Options(opts...).
 					Value(&pick),
 			))
@@ -305,7 +425,7 @@ func (st *setupState) addChannel() error {
 		}
 		opts = append(opts, huh.NewOption(t.Label, t.Name))
 	}
-	form := huh.NewForm(huh.NewGroup(
+	form := setupForm(huh.NewGroup(
 		huh.NewSelect[string]().Title("Add which channel?").Options(opts...).Value(&typeName),
 	))
 	if err := form.Run(); err != nil {
@@ -359,7 +479,7 @@ func (st *setupState) manageChannel(name string) error {
 	if known {
 		opts = append(opts, huh.NewOption("Edit settings…", "__edit__"))
 	}
-	form := huh.NewForm(huh.NewGroup(
+	form := setupForm(huh.NewGroup(
 		huh.NewSelect[string]().Title(fmt.Sprintf("Channel %q (type: %s)", name, chType)).Options(opts...).Value(&action),
 	))
 	if err := form.Run(); err != nil {
@@ -378,11 +498,23 @@ func (st *setupState) manageChannel(name string) error {
 
 // channelForm prints the guided provider steps, collects values, patches.
 func (st *setupState) channelForm(t setup.ChannelType, name string, prefill *setup.ChannelValues) error {
-	fmt.Fprintf(st.out, "\n\u2500\u2500 Set up %s \u2500\u2500 steps to do FIRST (piccolo cannot do them for you):\n", t.Label)
-	for _, s := range t.Steps {
-		fmt.Fprintf(st.out, "  %s\n", s)
+	var discordApplicationID string
+	if t.Name == "discord" {
+		var err error
+		discordApplicationID, err = st.discordApplicationSetup(prefill != nil)
+		if err != nil {
+			return err
+		}
+		fmt.Fprintf(st.out, "\n\u2500\u2500 Configure %s runtime settings \u2500\u2500\n", t.Label)
+		fmt.Fprintln(st.out, "Piccolo will store the bot token in config.json and the non-secret Application ID in piccolo.yaml.")
+		fmt.Fprintln(st.out)
+	} else {
+		fmt.Fprintf(st.out, "\n\u2500\u2500 Set up %s \u2500\u2500 steps to do FIRST (piccolo cannot do them for you):\n", t.Label)
+		for _, s := range t.Steps {
+			fmt.Fprintf(st.out, "  %s\n", s)
+		}
+		fmt.Fprintln(st.out)
 	}
-	fmt.Fprintln(st.out)
 
 	var allowRaw string
 	var restrict bool = true
@@ -401,13 +533,17 @@ func (st *setupState) channelForm(t setup.ChannelType, name string, prefill *set
 	if prefill == nil {
 		allowInput.Description("from the provider steps above")
 	}
+	restrictDesc := "Recommended: yes. If NO, ANYONE who can message the bot can talk to your assistant."
+	if prefill != nil {
+		restrictDesc = fmt.Sprintf("Current: %s. %s", yesNo(restrict), restrictDesc)
+	}
 	groups := []*huh.Group{
 		// Navigating away from a confirm commits it, so the hide func
 		// reads the fresh restrict value when the next group renders.
 		huh.NewGroup(
 			huh.NewConfirm().
 				Title("Restrict the bot to specific user IDs?").
-				Description("Recommended: yes. If NO, ANYONE who can message the bot can talk to your assistant.").
+				Description(restrictDesc).
 				Value(&restrict),
 		),
 	}
@@ -427,10 +563,14 @@ func (st *setupState) channelForm(t setup.ChannelType, name string, prefill *set
 		if prefill == nil {
 			mentionOnly = true
 		}
+		mentionDesc := "DMs always work; this controls group channels."
+		if prefill != nil {
+			mentionDesc = fmt.Sprintf("Current: %s. %s", yesNo(mentionOnly), mentionDesc)
+		}
 		groups = append(groups, huh.NewGroup(
 			huh.NewConfirm().
 				Title("Require @mentions in group/channel conversations?").
-				Description("DMs always work; this controls group channels.").
+				Description(mentionDesc).
 				Value(&mentionOnly),
 		))
 	}
@@ -457,8 +597,15 @@ func (st *setupState) channelForm(t setup.ChannelType, name string, prefill *set
 		groups = append(groups, huh.NewGroup(in))
 	}
 
-	if err := huh.NewForm(groups...).Run(); err != nil {
+	if err := setupForm(groups...).Run(); err != nil {
 		return err
+	}
+	if t.Name == "discord" {
+		st.pendingDiscordApplicationID = discordApplicationID
+		st.pendingDiscordMentionOnly = mentionOnly
+		if token := strings.TrimSpace(valueOf(inputs["token"])); token != "" {
+			st.checkDiscordToken(token)
+		}
 	}
 
 	v := setup.ChannelValues{MentionOnly: mentionOnly, Fields: map[string]string{}}
@@ -494,24 +641,174 @@ func (st *setupState) channelForm(t setup.ChannelType, name string, prefill *set
 	return st.applyAndConfirm("channel " + name)
 }
 
+const discordInvitePermissions = "68608" // View Channels + Send Messages + Read Message History.
+
+func (st *setupState) discordApplicationSetup(alreadyConfigured bool) (string, error) {
+	existing := strings.TrimSpace(st.manifest.Setup.Channels.Discord.ApplicationID)
+	hasApp := existing != "" || alreadyConfigured
+	if !alreadyConfigured {
+		form := setupForm(huh.NewGroup(
+			huh.NewConfirm().
+				Title("Do you already have a Discord application for this bot?").
+				Description("If not, piccolo will show the creation links before asking for the Application ID.").
+				Affirmative("Yes, I already have one").
+				Negative("No, help me create one").
+				Value(&hasApp),
+		))
+		if err := form.Run(); err != nil {
+			return "", err
+		}
+	}
+	if !hasApp {
+		appsURL := "https://discord.com/developers/applications"
+		docsURL := "https://discord.com/developers/docs/quick-start/getting-started#configuring-your-bot"
+		if err := setupForm(huh.NewGroup(huh.NewNote().
+			Title("Create a Discord application first").
+			Description(fmt.Sprintf("1. Open %s\n"+
+				"2. Click New Application, give it a name, and open it.\n"+
+				"3. Copy General Information → Application ID.\n"+
+				"4. Open Bot settings, create/reset the bot token, and copy it.\n"+
+				"5. Enable Bot → Privileged Gateway Intents → Message Content Intent.\n\n"+
+				"Discord docs: %s", terminalLink("Discord Developer Portal", appsURL), terminalLink("Configuring your bot", docsURL))))).Run(); err != nil {
+			return "", err
+		}
+	}
+	appID := existing
+	form := setupForm(huh.NewGroup(
+		huh.NewInput().
+			Title("Discord Application ID / Client ID").
+			Description(fmt.Sprintf("Required. Open %s and copy General Information → Application ID. Piccolo stores this non-secret ID in piccolo.yaml to regenerate invite/setup links later.", terminalLink("your Discord applications", "https://discord.com/developers/applications"))).
+			Placeholder("e.g. 123456789012345678").
+			Value(&appID),
+	))
+	if err := form.Run(); err != nil {
+		return "", err
+	}
+	appID = strings.TrimSpace(appID)
+	if appID == "" {
+		return "", fmt.Errorf("Discord Application ID is required")
+	}
+	return appID, nil
+}
+
+func (st *setupState) checkDiscordToken(token string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://discord.com/api/v10/users/@me", nil)
+	if err != nil {
+		return
+	}
+	req.Header.Set("Authorization", "Bot "+token)
+	req.Header.Set("User-Agent", "piccolo setup")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		fmt.Fprintf(st.out, "warning: could not validate Discord token: %v\n", err)
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		fmt.Fprintf(st.out, "warning: Discord token check failed (%s). Make sure you copied the Bot token, not the Client Secret.\n", resp.Status)
+		return
+	}
+	var body struct {
+		Username      string `json:"username"`
+		Discriminator string `json:"discriminator"`
+		ID            string `json:"id"`
+	}
+	_ = json.NewDecoder(resp.Body).Decode(&body)
+	name := strings.TrimSpace(body.Username)
+	if body.Discriminator != "" && body.Discriminator != "0" {
+		name += "#" + body.Discriminator
+	}
+	if name == "" {
+		name = body.ID
+	}
+	fmt.Fprintf(st.out, "\u2713 Discord token validated: authenticated as %s\n", name)
+}
+
+func (st *setupState) printDiscordNextSteps(appID string, mentionOnly bool) {
+	invite := fmt.Sprintf("https://discord.com/oauth2/authorize?client_id=%s&scope=bot&permissions=%s", appID, discordInvitePermissions)
+	botURL := fmt.Sprintf("https://discord.com/developers/applications/%s/bot", appID)
+	oauthURL := fmt.Sprintf("https://discord.com/developers/applications/%s/oauth2/url-generator", appID)
+	fmt.Fprintln(st.out)
+	fmt.Fprintln(st.out, "Discord next steps:")
+	fmt.Fprintf(st.out, "  1. Invite the bot to your server:\n     %s\n", terminalLink("Open invite URL", invite))
+	fmt.Fprintln(st.out, "     Permissions requested: View Channels, Send Messages, Read Message History.")
+	fmt.Fprintf(st.out, "  2. Verify Message Content Intent is enabled:\n     %s\n", terminalLink("Open Bot settings", botURL))
+	fmt.Fprintf(st.out, "  3. OAuth2 URL Generator, if you want to inspect the invite manually:\n     %s\n", terminalLink("Open OAuth2 URL Generator", oauthURL))
+	if st.containerRunning() {
+		fmt.Fprintln(st.out, "  4. Apply the new channel config: piccolo reload  (or piccolo restart if reload fails)")
+	} else {
+		fmt.Fprintln(st.out, "  4. Start the gateway: piccolo serve")
+	}
+	if mentionOnly {
+		fmt.Fprintln(st.out, "  5. Test: DM the bot, or mention it in a server channel: @YourBot hello")
+	} else {
+		fmt.Fprintln(st.out, "  5. Test: DM the bot or send a message in a server channel it can read.")
+	}
+	fmt.Fprintln(st.out, "  6. Debug: piccolo doctor; piccolo logs -f")
+	fmt.Fprintln(st.out)
+}
+
+func valueOf(p *string) string {
+	if p == nil {
+		return ""
+	}
+	return *p
+}
+
+func terminalLink(label, url string) string {
+	// OSC 8 hyperlinks are supported by many modern terminals. Keep the raw URL
+	// visible too so the output remains useful in terminals that ignore OSC 8.
+	return fmt.Sprintf("\x1b]8;;%s\x1b\\%s\x1b]8;;\x1b\\ (%s)", url, label, url)
+}
+
+func yesNo(v bool) string {
+	if v {
+		return "yes"
+	}
+	return "no"
+}
+
 // ---------- models ----------
+
+// modelRef renders a model entry as "provider/model" for display (or just
+// "model" when no explicit provider is set).
+func modelRef(m setup.ModelInfo) string {
+	if m.Provider != "" {
+		return m.Provider + "/" + m.Model
+	}
+	return m.Model
+}
 
 func (st *setupState) modelsScreen() error {
 	for {
 		models := setup.Models(st.doc)
+		imageModel := strings.TrimSpace(setup.DefaultImageModel(st.doc))
+		imageLabel := "not set"
+		if imageModel != "" {
+			imageLabel = imageModel
+		}
 		opts := []huh.Option[string]{huh.NewOption("+ Add a model…", "__add__")}
 		for _, m := range models {
 			state := "no key!"
 			if m.KeySet {
 				state = "key set"
 			}
-			opts = append(opts, huh.NewOption(fmt.Sprintf("%-16s %s (%s)", m.Alias, state, m.Model), m.Alias))
+			opts = append(opts, huh.NewOption(fmt.Sprintf("%-16s %s (%s)", m.Alias, state, modelRef(m)), m.Alias))
 		}
-		opts = append(opts, huh.NewOption("← Back", "__back__"))
+		opts = append(opts,
+			huh.NewOption(fmt.Sprintf("Set image/vision model… (%s)", imageLabel), "__image_model__"),
+			huh.NewOption("← Back", "__back__"),
+		)
 
 		var pick string
-		form := huh.NewForm(huh.NewGroup(
-			huh.NewSelect[string]().Title("Models").Description("agents pick the default model in config.json agents.defaults").Options(opts...).Value(&pick),
+		form := setupForm(huh.NewGroup(
+			huh.NewSelect[string]().
+				Title("Models").
+				Description("agents use agents.defaults.model_name for text and agents.defaults.image_model for image attachments").
+				Options(opts...).
+				Value(&pick),
 		))
 		if err := form.Run(); err != nil {
 			return err
@@ -521,6 +818,13 @@ func (st *setupState) modelsScreen() error {
 			return nil
 		case "__add__":
 			if err := st.modelForm(""); err != nil {
+				if isCancel(err) {
+					continue
+				}
+				return err
+			}
+		case "__image_model__":
+			if err := st.imageModelForm(); err != nil {
 				if isCancel(err) {
 					continue
 				}
@@ -538,18 +842,22 @@ func (st *setupState) modelsScreen() error {
 }
 
 func (st *setupState) modelForm(alias string) error {
-	var model, base, key string
+	var provider, model, base, key string
 	if alias != "" {
-		model, key, base, _ = setup.ReadModel(st.doc, alias)
+		provider, model, key, base, _ = setup.ReadModel(st.doc, alias)
 		// `key` keeps the stored value; a non-empty API key input overrides it.
 	}
 	var newKey string
-	form := huh.NewForm(
+	form := setupForm(
 		huh.NewGroup(
 			huh.NewInput().Title("Model alias (model_name in config.json)").
 				Placeholder("gpt-5.4").Value(&alias),
-			huh.NewInput().Title("Model reference (provider/model)").
-				Placeholder("openai/gpt-5.4").Value(&model),
+			huh.NewInput().Title("Provider").
+				Description("e.g. openai, openrouter, anthropic — sent to config.json as an explicit provider").
+				Placeholder("openai").Value(&provider),
+			huh.NewInput().Title("Model id").
+				Description("the provider-side model id, without the provider prefix").
+				Placeholder("gpt-5.4").Value(&model),
 			huh.NewInput().Title("API key").
 				Description("stored plaintext in config.json (git-ignored)").
 				EchoMode(huh.EchoModePassword).Value(&newKey),
@@ -567,62 +875,522 @@ func (st *setupState) modelForm(alias string) error {
 	if newKey != "" {
 		key = newKey
 	}
-	setup.PatchModel(st.doc, alias, strings.TrimSpace(model), key, strings.TrimSpace(base))
+	setup.PatchModel(st.doc, alias, strings.TrimSpace(provider), strings.TrimSpace(model), key, strings.TrimSpace(base))
 	return st.applyAndConfirm("model " + alias)
+}
+
+func (st *setupState) imageModelForm() error {
+	models := setup.Models(st.doc)
+	if len(models) == 0 {
+		return fmt.Errorf("add a model before setting agents.defaults.image_model")
+	}
+	current := strings.TrimSpace(setup.DefaultImageModel(st.doc))
+	if current == "" {
+		current = models[0].Alias
+	}
+	opts := make([]huh.Option[string], 0, len(models))
+	for _, m := range models {
+		label := fmt.Sprintf("%s (%s)", m.Alias, modelRef(m))
+		opts = append(opts, huh.NewOption(label, m.Alias))
+	}
+	form := setupForm(huh.NewGroup(
+		huh.NewSelect[string]().
+			Title("Image/vision model").
+			Description("Recommended: choose a multimodal model. PicoClaw uses this for image attachments from Discord/Telegram/etc.").
+			Options(opts...).
+			Value(&current),
+	))
+	if err := form.Run(); err != nil {
+		return err
+	}
+	current = strings.TrimSpace(current)
+	if current == "" {
+		return fmt.Errorf("image model alias is required")
+	}
+	setup.SetDefaultImageModel(st.doc, current)
+	return st.applyAndConfirm("image model " + current)
 }
 
 // ---------- tools ----------
 
 func (st *setupState) toolsScreen() error {
-	cur := setup.GetTools(st.doc)
-	state := map[string]*bool{"web": cur.Web, "exec": cur.Exec, "spawn": cur.Spawn, "subagent": cur.Subagent}
-	answers := make([]bool, len(setup.ToolNames))
-	var groups []*huh.Group
-	for i, spec := range setup.ToolNames {
-		val := false
-		if p := state[spec.Key]; p != nil {
-			val = *p
+	for {
+		cur := setup.GetTools(st.doc)
+		state := map[string]*bool{"web": cur.Web, "exec": cur.Exec, "spawn": cur.Spawn, "subagent": cur.Subagent, "load_image": cur.LoadImage}
+		opts := make([]huh.Option[string], 0, len(setup.ToolNames)+3)
+		opts = append(opts, huh.NewOption("Sync AGENT.md allowlists and file-handling skill…", "__sync__"))
+		for _, spec := range setup.ToolNames {
+			enabled := false
+			if p := state[spec.Key]; p != nil {
+				enabled = *p
+			}
+			status := "off"
+			verb := "enable"
+			if enabled {
+				status = "on"
+				verb = "disable"
+			}
+			if enabled && len(st.agentToolAllowlistChanges(spec.Key, true)) > 0 {
+				status += ", md out-of-sync"
+			}
+			opts = append(opts, huh.NewOption(
+				fmt.Sprintf("%-22s [%s] — %s", spec.Label, status, spec.Help),
+				spec.Key+":"+verb,
+			))
 		}
-		answers[i] = val
-		groups = append(groups, huh.NewGroup(
-			huh.NewConfirm().Title(spec.Label).Description(spec.Help).Value(&answers[i]),
+		feedbackEnabled := false
+		if p := setup.ToolFeedbackEnabled(st.doc); p != nil {
+			feedbackEnabled = *p
+		}
+		feedbackStatus := "off"
+		feedbackVerb := "enable"
+		if feedbackEnabled {
+			feedbackStatus = "on"
+			feedbackVerb = "disable"
+		}
+		opts = append(opts, huh.NewOption(
+			fmt.Sprintf("%-22s [%s] — %s", "Tool feedback", feedbackStatus, "show tool calls/args in chat for debugging and audit"),
+			"tool_feedback:"+feedbackVerb,
 		))
+
+		remoteEnabled := false
+		if cur.ExecAllowRemote != nil {
+			remoteEnabled = *cur.ExecAllowRemote
+		}
+		remoteStatus := "off"
+		remoteVerb := "enable"
+		if remoteEnabled {
+			remoteStatus = "on"
+			remoteVerb = "disable"
+		}
+		opts = append(opts, huh.NewOption(
+			fmt.Sprintf("%-22s [%s] — %s", "Remote shell execution", remoteStatus, "allow exec from Discord/Telegram/etc.; use only for trusted chats"),
+			"exec_remote:"+remoteVerb,
+		))
+		opts = append(opts, huh.NewOption("← Back", "__back__"))
+
+		var pick string
+		form := setupForm(huh.NewGroup(
+			huh.NewSelect[string]().
+				Title("Tools").
+				Description("Pick one tool to toggle; esc back.").
+				Options(opts...).
+				Value(&pick),
+		))
+		if err := form.Run(); err != nil {
+			return err
+		}
+		if pick == "__back__" {
+			return nil
+		}
+		if pick == "__sync__" {
+			if err := st.syncEnabledToolAllowlists(); err != nil {
+				if isCancel(err) {
+					continue
+				}
+				return err
+			}
+			continue
+		}
+		key, verb, ok := strings.Cut(pick, ":")
+		if !ok {
+			continue
+		}
+		enabled := verb == "enable"
+		if key == "tool_feedback" {
+			if err := st.applyToolFeedbackChange(enabled); err != nil {
+				if isCancel(err) {
+					continue
+				}
+				return err
+			}
+			continue
+		}
+		if key == "exec_remote" {
+			if err := st.applyRemoteExecChange(enabled); err != nil {
+				if isCancel(err) {
+					continue
+				}
+				return err
+			}
+			continue
+		}
+		setup.SetTool(st.doc, key, enabled)
+		if err := st.applyToolChange(key, enabled); err != nil {
+			if isCancel(err) {
+				continue
+			}
+			return err
+		}
 	}
-	if err := huh.NewForm(groups...).Run(); err != nil {
+}
+
+type agentFileChange struct {
+	path    string
+	content []byte
+}
+
+func (st *setupState) syncEnabledToolAllowlists() error {
+	changes, err := st.syncEnabledToolWorkspaceChanges()
+	if err != nil {
 		return err
 	}
-	changed := false
-	for i, spec := range setup.ToolNames {
-		p := state[spec.Key]
-		if p == nil || *p != answers[i] {
-			setup.SetTool(st.doc, spec.Key, answers[i])
-			changed = true
+	return st.applyAgentFileChanges("agent tool allowlists, file-handling skill, and workspace Devbox config", changes)
+}
+
+func (st *setupState) syncEnabledToolWorkspaceChanges() ([]agentFileChange, error) {
+	setup.EnsureMediaReadConfig(st.doc)
+	cur := setup.GetTools(st.doc)
+	state := map[string]*bool{"web": cur.Web, "exec": cur.Exec, "spawn": cur.Spawn, "subagent": cur.Subagent, "load_image": cur.LoadImage}
+	var enabledTools []string
+	for _, spec := range setup.ToolNames {
+		if p := state[spec.Key]; p != nil && *p {
+			enabledTools = append(enabledTools, spec.Key)
 		}
 	}
-	if !changed {
-		fmt.Fprintln(st.out, "no tool changes.")
+	var changes []agentFileChange
+	for _, path := range st.agentMDPaths() {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		content := string(data)
+		changed := false
+		for _, key := range enabledTools {
+			updated, oneChanged := updateAgentToolsFrontmatter(content, frontmatterToolsForConfigTool(key), true)
+			if oneChanged {
+				content = updated
+				changed = true
+			}
+		}
+		updated, skillChanged := updateAgentSkillsFrontmatter(content, []string{generate.FileHandlingSkillName}, true)
+		if skillChanged {
+			content = updated
+			changed = true
+		}
+		if changed {
+			changes = append(changes, agentFileChange{path: path, content: []byte(content)})
+		}
+	}
+	skillPath := filepath.Join(st.dir, "skills", generate.FileHandlingSkillName, "SKILL.md")
+	skillContent := []byte(generate.FileHandlingSkillMD())
+	if data, err := os.ReadFile(skillPath); err != nil || !bytes.Equal(data, skillContent) {
+		changes = append(changes, agentFileChange{path: skillPath, content: skillContent})
+	}
+	return changes, nil
+}
+
+func (st *setupState) applyToolChange(key string, enabled bool) error {
+	changes := st.agentToolAllowlistChanges(key, enabled)
+	return st.applyConfigAndAgentChanges(fmt.Sprintf("tool %s %s", key, yesNo(enabled)), changes)
+}
+
+func (st *setupState) applyToolFeedbackChange(enabled bool) error {
+	setup.SetToolFeedback(st.doc, enabled)
+	return st.applyConfigAndAgentChanges(fmt.Sprintf("tool feedback %s", yesNo(enabled)), nil)
+}
+
+func (st *setupState) applyRemoteExecChange(enabled bool) error {
+	setup.SetExecAllowRemote(st.doc, enabled)
+	var changes []agentFileChange
+	if enabled {
+		setup.SetTool(st.doc, "exec", true)
+		changes = st.agentToolAllowlistChanges("exec", true)
+		setup.SetToolFeedback(st.doc, true)
+		fmt.Fprintln(st.out, "warning: remote shell execution allows Discord/Telegram/etc. chats to request shell commands inside the container subject to PicoClaw safety checks; enable only for trusted channels/users. Tool feedback was enabled for audit/debug visibility.")
+	}
+	return st.applyConfigAndAgentChanges(fmt.Sprintf("remote exec %s", yesNo(enabled)), changes)
+}
+
+func (st *setupState) applyConfigAndAgentChanges(what string, agentChanges []agentFileChange) error {
+	newBytes := st.doc.Marshal()
+	configChanged := !bytes.Equal(st.orig, newBytes)
+	if !configChanged && len(agentChanges) == 0 {
+		fmt.Fprintf(st.out, "no actual change to workspace config (%s).\n", what)
 		return nil
 	}
-	return st.applyAndConfirm("tools")
+	confirm := true
+	desc := "updates config.json and matching AGENT.md tool allowlists; previous config.json is kept as config.json.bak"
+	if !configChanged {
+		desc = "updates matching AGENT.md tool allowlists only"
+	} else if len(agentChanges) == 0 {
+		desc = "your previous config.json is kept as config.json.bak"
+	}
+	if err := setupForm(huh.NewGroup(
+		huh.NewConfirm().
+			Title(fmt.Sprintf("Apply %s to workspace config?", what)).
+			Description(desc).
+			Affirmative("Yes, write it").
+			Negative("No, discard").
+			Value(&confirm),
+	)).Run(); err != nil {
+		return err
+	}
+	if !confirm {
+		reverted, perr := configdoc.Parse(st.orig)
+		if perr != nil {
+			return perr
+		}
+		st.doc = reverted
+		fmt.Fprintln(st.out, "discarded.")
+		return nil
+	}
+	if configChanged {
+		if err := configdoc.Write(st.path, st.doc); err != nil {
+			return err
+		}
+		st.orig = newBytes
+	}
+	for _, ch := range agentChanges {
+		if err := os.MkdirAll(filepath.Dir(ch.path), 0o755); err != nil {
+			return err
+		}
+		if err := os.WriteFile(ch.path, ch.content, 0o644); err != nil {
+			return err
+		}
+	}
+	st.write = true
+	fmt.Fprintf(st.out, "✓ wrote %s", what)
+	if len(agentChanges) > 0 {
+		fmt.Fprintf(st.out, " and %d workspace file(s)", len(agentChanges))
+	}
+	fmt.Fprintln(st.out)
+	return nil
+}
+
+func (st *setupState) applyAgentFileChanges(what string, agentChanges []agentFileChange) error {
+	return st.applyConfigAndAgentChanges(what, agentChanges)
+}
+
+func (st *setupState) agentToolAllowlistChanges(configTool string, enabled bool) []agentFileChange {
+	frontTools := frontmatterToolsForConfigTool(configTool)
+	if len(frontTools) == 0 {
+		return nil
+	}
+	var changes []agentFileChange
+	for _, path := range st.agentMDPaths() {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		updated, changed := updateAgentToolsFrontmatter(string(data), frontTools, enabled)
+		if changed {
+			changes = append(changes, agentFileChange{path: path, content: []byte(updated)})
+		}
+	}
+	return changes
+}
+
+func frontmatterToolsForConfigTool(configTool string) []string {
+	switch configTool {
+	case "web":
+		return []string{"web_search", "web_fetch"}
+	case "exec":
+		return []string{"exec"}
+	case "spawn":
+		return []string{"spawn"}
+	case "subagent":
+		return []string{"subagent"}
+	case "load_image":
+		return []string{"load_image"}
+	default:
+		return nil
+	}
+}
+
+func (st *setupState) agentMDPaths() []string {
+	var paths []string
+	for _, dir := range st.agentWorkspaceDirs() {
+		paths = append(paths, filepath.Join(dir, "AGENT.md"))
+	}
+	return paths
+}
+
+func (st *setupState) agentWorkspaceDirs() []string {
+	agents, ok := st.doc.GetObject("agents")
+	if !ok {
+		return nil
+	}
+	defaults, _ := agents.GetObject("defaults")
+	defaultWS := ""
+	if defaults != nil {
+		defaultWS, _ = defaults.GetString("workspace")
+	}
+	listRaw, ok := agents.Get("list")
+	if !ok {
+		return nil
+	}
+	list, ok := listRaw.([]configdoc.Value)
+	if !ok {
+		return nil
+	}
+	seen := map[string]bool{}
+	var dirs []string
+	for _, item := range list {
+		ag, ok := item.(*configdoc.Doc)
+		if !ok {
+			continue
+		}
+		ws, _ := ag.GetString("workspace")
+		if ws == "" {
+			ws = defaultWS
+		}
+		host, ok := setupWorkspacePath(st.dir, ws)
+		if !ok {
+			continue
+		}
+		if !seen[host] {
+			dirs = append(dirs, host)
+			seen[host] = true
+		}
+	}
+	return dirs
+}
+
+func setupWorkspacePath(workspace, containerPath string) (string, bool) {
+	p := strings.TrimSpace(containerPath)
+	for _, prefix := range []string{"~/.picoclaw/", "/root/.picoclaw/"} {
+		if rest, ok := strings.CutPrefix(p, prefix); ok {
+			return filepath.Join(workspace, filepath.FromSlash(rest)), true
+		}
+	}
+	return "", false
+}
+
+var (
+	toolsLineRE  = regexp.MustCompile(`(?m)^tools:\s*\[([^\]]*)\]\s*$`)
+	skillsLineRE = regexp.MustCompile(`(?m)^skills:\s*\[([^\]]*)\]\s*$`)
+)
+
+func updateAgentToolsFrontmatter(content string, tools []string, enabled bool) (string, bool) {
+	return updateAgentFrontmatterList(content, toolsLineRE, "tools", tools, enabled)
+}
+
+func updateAgentSkillsFrontmatter(content string, skills []string, enabled bool) (string, bool) {
+	return updateAgentFrontmatterList(content, skillsLineRE, "skills", skills, enabled)
+}
+
+func updateAgentFrontmatterList(content string, lineRE *regexp.Regexp, key string, values []string, enabled bool) (string, bool) {
+	if !strings.HasPrefix(content, "---\n") {
+		return content, false
+	}
+	rest := content[len("---\n"):]
+	end := strings.Index(rest, "\n---")
+	if end < 0 {
+		return content, false
+	}
+	fm := rest[:end]
+	body := rest[end:]
+	match := lineRE.FindStringSubmatchIndex(fm)
+	if match == nil {
+		if !enabled {
+			return content, false
+		}
+		line := key + ": [" + strings.Join(values, ", ") + "]"
+		return "---\n" + strings.TrimRight(fm, "\n") + "\n" + line + body, true
+	}
+	currentRaw := fm[match[2]:match[3]]
+	var current []string
+	present := map[string]bool{}
+	for _, part := range strings.Split(currentRaw, ",") {
+		t := strings.TrimSpace(part)
+		if t == "" {
+			continue
+		}
+		current = append(current, t)
+		present[t] = true
+	}
+	changed := false
+	if enabled {
+		for _, t := range values {
+			if !present[t] {
+				current = append(current, t)
+				present[t] = true
+				changed = true
+			}
+		}
+	} else {
+		remove := map[string]bool{}
+		for _, t := range values {
+			remove[t] = true
+		}
+		kept := current[:0]
+		for _, t := range current {
+			if remove[t] {
+				changed = true
+				continue
+			}
+			kept = append(kept, t)
+		}
+		current = kept
+	}
+	if !changed {
+		return content, false
+	}
+	newLine := key + ": [" + strings.Join(current, ", ") + "]"
+	newFM := fm[:match[0]] + newLine + fm[match[1]:]
+	return "---\n" + newFM + body, true
 }
 
 // ---------- write path ----------
+
+func (st *setupState) applyManifestAndConfirm(what string) error {
+	confirm := true
+	err := setupForm(huh.NewGroup(
+		huh.NewConfirm().
+			Title(fmt.Sprintf("Apply %s to piccolo.yaml?", what)).
+			Description("updates container launch settings; restart required").
+			Affirmative("Yes, write it").
+			Negative("No, discard").
+			Value(&confirm),
+	)).Run()
+	if err != nil {
+		return err
+	}
+	if !confirm {
+		fresh, err := manifest.Load(st.manifestPath)
+		if err != nil {
+			return err
+		}
+		st.manifest = fresh
+		fmt.Fprintln(st.out, "discarded.")
+		return nil
+	}
+	if err := st.manifest.Write(st.manifestPath); err != nil {
+		return fmt.Errorf("write piccolo.yaml: %w", err)
+	}
+	st.write = true
+	fmt.Fprintf(st.out, "✓ wrote %s\n", what)
+	return nil
+}
 
 // applyAndConfirm writes the merge-patched config.json on explicit confirmation
 // (no diff preview — the change summary is shown in the confirm title, and the
 // previous file is always kept as config.json.bak).
 func (st *setupState) applyAndConfirm(what string) error {
 	newBytes := st.doc.Marshal()
-	if bytes.Equal(st.orig, newBytes) {
-		fmt.Fprintf(st.out, "no actual change to config.json (%s).\n", what)
+	configChanged := !bytes.Equal(st.orig, newBytes)
+	manifestChanged := st.pendingDiscordApplicationID != "" && st.pendingDiscordApplicationID != strings.TrimSpace(st.manifest.Setup.Channels.Discord.ApplicationID)
+	if !configChanged && !manifestChanged {
+		fmt.Fprintf(st.out, "no actual change to workspace config (%s).\n", what)
+		if st.pendingDiscordApplicationID != "" {
+			st.printDiscordNextSteps(st.pendingDiscordApplicationID, st.pendingDiscordMentionOnly)
+			st.pendingDiscordApplicationID = ""
+		}
 		return nil
 	}
 
 	confirm := true
-	err := huh.NewForm(huh.NewGroup(
+	desc := "your previous config.json is kept as config.json.bak"
+	if !configChanged {
+		desc = "updates piccolo.yaml setup metadata only"
+	} else if manifestChanged {
+		desc = "updates config.json and piccolo.yaml; your previous config.json is kept as config.json.bak"
+	}
+	err := setupForm(huh.NewGroup(
 		huh.NewConfirm().
-			Title(fmt.Sprintf("Apply %s to %s?", what, filepath.Base(st.path))).
-			Description("your previous config.json is kept as config.json.bak").
+			Title(fmt.Sprintf("Apply %s to workspace config?", what)).
+			Description(desc).
 			Affirmative("Yes, write it").
 			Negative("No, discard").
 			Value(&confirm),
@@ -637,15 +1405,28 @@ func (st *setupState) applyAndConfirm(what string) error {
 			return perr
 		}
 		st.doc = reverted
+		st.pendingDiscordApplicationID = ""
 		fmt.Fprintln(st.out, "discarded.")
 		return nil
 	}
-	if err := configdoc.Write(st.path, st.doc); err != nil {
-		return err
+	if configChanged {
+		if err := configdoc.Write(st.path, st.doc); err != nil {
+			return err
+		}
+		st.orig = newBytes
 	}
-	st.orig = newBytes
+	if manifestChanged {
+		st.manifest.Setup.Channels.Discord.ApplicationID = st.pendingDiscordApplicationID
+		if err := st.manifest.Write(st.manifestPath); err != nil {
+			return fmt.Errorf("write piccolo.yaml: %w", err)
+		}
+	}
 	st.write = true
 	fmt.Fprintf(st.out, "\u2713 wrote %s\n", what)
+	if st.pendingDiscordApplicationID != "" {
+		st.printDiscordNextSteps(st.pendingDiscordApplicationID, st.pendingDiscordMentionOnly)
+		st.pendingDiscordApplicationID = ""
+	}
 	return nil
 }
 

@@ -57,6 +57,20 @@ func TestPrepareComposesSpec(t *testing.T) {
 	}
 }
 
+func TestPrepareAddsNamedVolumes(t *testing.T) {
+	r := New()
+	pc, err := r.Prepare(Spec{Name: "n", Image: "img:1", Source: "/ws", Volumes: []string{"piccolo-devbox-nix-cache:/nix:rw"}})
+	if err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
+	if len(pc.HostConfig.Binds) != 2 {
+		t.Fatalf("binds = %v", pc.HostConfig.Binds)
+	}
+	if pc.HostConfig.Binds[1] != "piccolo-devbox-nix-cache:/nix:rw" {
+		t.Errorf("named volume bind = %q", pc.HostConfig.Binds[1])
+	}
+}
+
 func TestPrepareNetworkModes(t *testing.T) {
 	r := New()
 	for network, want := range map[string]string{"none": "none", "host": "host", "bridge": "", "": ""} {

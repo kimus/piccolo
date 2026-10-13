@@ -5,7 +5,26 @@ import (
 	"testing"
 
 	"github.com/kimus/piccolo/internal/manifest"
+	"github.com/kimus/piccolo/internal/picoclaw"
 )
+
+func TestAgentMediaMirrorMounts(t *testing.T) {
+	cfg := picoclaw.Config{Agents: picoclaw.Agents{
+		Defaults: picoclaw.Defaults{Workspace: "~/.picoclaw/agents/main"},
+		List: []picoclaw.Agent{
+			{ID: "main", Default: true},
+			{ID: "research", Workspace: "~/.picoclaw/agents/research"},
+		},
+	}}
+	mounts := agentMediaMirrorMounts(cfg)
+	want := []string{
+		"piccolo-media:/root/.picoclaw/agents/main/media:rw",
+		"piccolo-media:/root/.picoclaw/agents/research/media:rw",
+	}
+	if strings.Join(mounts, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("mounts = %#v, want %#v", mounts, want)
+	}
+}
 
 func TestHasContainerPort(t *testing.T) {
 	ports := []string{"127.0.0.1:18800:18800", "9000:9000/tcp"}
@@ -33,6 +52,48 @@ func TestWithGatewayHost(t *testing.T) {
 	env = withGatewayHost([]string{"PICOCLAW_GATEWAY_HOST=127.0.0.1"})
 	if len(env) != 1 || !strings.HasSuffix(env[0], "127.0.0.1") {
 		t.Errorf("user value overwritten: %v", env)
+	}
+}
+
+// TestComposePortsConsoleOff asserts a console-off manifest publishes only the
+// auto-added gateway/health port — never :18800 (no dead published port).
+func TestComposePortsConsoleOff(t *testing.T) {
+	m := &manifest.Manifest{Container: manifest.Container{
+		Image:   "docker.io/sipeed/picoclaw:v0.3.1",
+		Network: "bridge",
+		// no :18800 binding — web console disabled
+	}}
+	ports := composePorts(m, 18790)
+	if len(ports) != 1 || ports[0] != "127.0.0.1:18790:18790" {
+		t.Fatalf("console-off ports = %v, want only the gateway port", ports)
+	}
+	if hasContainerPort(ports, 18800) {
+		t.Error("console-off must not publish :18800")
+	}
+}
+
+// TestComposePortsConsoleOn asserts a console-on manifest keeps its :18800
+// binding and still auto-adds the gateway port.
+func TestComposePortsConsoleOn(t *testing.T) {
+	m := &manifest.Manifest{Container: manifest.Container{
+		Image:   "docker.io/sipeed/picoclaw:launcher",
+		Network: "bridge",
+		Ports:   []string{"127.0.0.1:18800:18800"},
+	}}
+	ports := composePorts(m, 18790)
+	if !hasContainerPort(ports, 18800) {
+		t.Errorf("console-on ports = %v, want :18800 published", ports)
+	}
+	if !hasContainerPort(ports, 18790) {
+		t.Errorf("console-on ports = %v, want gateway port auto-added", ports)
+	}
+}
+
+// TestComposePortsHostNetwork asserts host networking publishes nothing extra.
+func TestComposePortsHostNetwork(t *testing.T) {
+	m := &manifest.Manifest{Container: manifest.Container{Network: "host"}}
+	if ports := composePorts(m, 18790); len(ports) != 0 {
+		t.Errorf("host-network ports = %v, want none", ports)
 	}
 }
 

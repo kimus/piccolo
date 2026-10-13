@@ -16,29 +16,24 @@ import (
 
 	"github.com/kimus/piccolo/internal/manifest"
 	"github.com/kimus/piccolo/internal/picoclaw"
+	"github.com/kimus/piccolo/internal/runtimeimage"
 )
 
-// DefaultImage is the pinned PicoClaw gateway image used for terminal mode.
+// DefaultImage is the pinned PicoClaw gateway image used when the optional
+// web console (dashboard) is disabled.
 const DefaultImage = "docker.io/sipeed/picoclaw:v0.3.1"
 
-// LauncherImage is the PicoClaw launcher image (web console + gateway).
+// LauncherImage is the PicoClaw launcher image (web console + gateway), used
+// when the optional web console is enabled.
 const LauncherImage = "docker.io/sipeed/picoclaw:launcher"
 
-// LauncherPort is the web console port published by the launcher image.
+// LauncherPort is the web console port published by the launcher image. Its
+// presence in piccolo.yaml is the single source of truth for "web console
+// enabled".
 const LauncherPort = "127.0.0.1:18800:18800"
 
 // DefaultContainerName is the deterministic gateway container name.
 const DefaultContainerName = "piccolo-gateway"
-
-// Mode selects the interaction flavor chosen in the wizard.
-type Mode string
-
-const (
-	// ModeTerminal runs the plain gateway image with stdio attached.
-	ModeTerminal Mode = "terminal"
-	// ModeWeb runs the launcher image and publishes the web console.
-	ModeWeb Mode = "web"
-)
 
 // ModelInput describes the single model_list entry collected by the wizard.
 type ModelInput struct {
@@ -55,10 +50,12 @@ type Inputs struct {
 	OwnerName     string
 	Purpose       string   // personal | research | coding | operations | blank
 	Specialists   []string // subset of research, planner, coder, ops
-	Mode          Mode
-	Model         ModelInput
-	WebSearch     bool
-	ShellExec     bool
+	// Dashboard enables the optional web console. The gateway always runs;
+	// when true piccolo uses the launcher image and publishes :18800.
+	Dashboard bool
+	Model     ModelInput
+	WebSearch bool
+	ShellExec bool
 }
 
 // Validate checks inputs before generation.
@@ -70,11 +67,6 @@ func (in Inputs) Validate() error {
 	case "personal", "research", "coding", "operations", "blank":
 	default:
 		return fmt.Errorf("invalid purpose %q", in.Purpose)
-	}
-	switch in.Mode {
-	case ModeTerminal, ModeWeb:
-	default:
-		return fmt.Errorf("invalid interaction mode %q", in.Mode)
 	}
 	for _, s := range in.Specialists {
 		switch s {
@@ -89,7 +81,8 @@ func (in Inputs) Validate() error {
 	return nil
 }
 
-// Manifest builds the piccolo.yaml content (launch config only).
+// Manifest builds the piccolo.yaml content (Piccolo-owned launch config plus
+// non-secret setup metadata).
 func (in Inputs) Manifest() *manifest.Manifest {
 	m := &manifest.Manifest{
 		Version: manifest.CurrentVersion,
@@ -98,8 +91,14 @@ func (in Inputs) Manifest() *manifest.Manifest {
 			Name:    DefaultContainerName,
 			Network: "bridge",
 		},
+		Runtime: manifest.Runtime{
+			Toolchain: manifest.Toolchain{
+				Packages: append([]string(nil), runtimeimage.DefaultPackages...),
+				Commands: append([]string(nil), runtimeimage.DefaultCommands...),
+			},
+		},
 	}
-	if in.Mode == ModeWeb {
+	if in.Dashboard {
 		m.Container.Image = LauncherImage
 		m.Container.Ports = []string{LauncherPort}
 		m.Container.Env = map[string]string{"PICOCLAW_GATEWAY_HOST": "0.0.0.0"}
@@ -109,10 +108,7 @@ func (in Inputs) Manifest() *manifest.Manifest {
 
 // PicoclawConfig builds the config.json content (schema v3).
 func (in Inputs) PicoclawConfig() *picoclaw.Config {
-	modelRef := in.Model.Model
-	if in.Model.Provider != "" {
-		modelRef = in.Model.Provider + "/" + in.Model.Model
-	}
+	provider, model := normalizeModelRef(in.Model.Provider, in.Model.Model)
 
 	main := picoclaw.Agent{
 		ID:        "main",
@@ -137,25 +133,50 @@ func (in Inputs) PicoclawConfig() *picoclaw.Config {
 		Version: picoclaw.SchemaVersion,
 		Agents: picoclaw.Agents{
 			Defaults: picoclaw.Defaults{
-				Workspace:           picoclaw.AgentWorkspace("main"),
-				RestrictToWorkspace: true,
-				ModelName:           in.Model.Alias,
+				Workspace:                 picoclaw.AgentWorkspace("main"),
+				RestrictToWorkspace:       true,
+				AllowReadOutsideWorkspace: true,
+				ModelName:                 in.Model.Alias,
+				ImageModel:                in.Model.Alias,
+				ToolFeedback: picoclaw.ToolFeedback{
+					Enabled:       true,
+					MaxArgsLength: 300,
+				},
 			},
 			List: list,
 		},
 		ModelList: []picoclaw.Model{{
 			ModelName: in.Model.Alias,
-			Model:     modelRef,
+			Provider:  provider,
+			Model:     model,
 			APIKeys:   []string{in.Model.APIKey},
 			APIBase:   in.Model.APIBase,
 		}},
 		Tools: picoclaw.Tools{
-			Web:      picoclaw.ToolToggle{Enabled: in.WebSearch},
-			Exec:     picoclaw.ToolToggle{Enabled: in.ShellExec},
-			Spawn:    picoclaw.ToolToggle{Enabled: true},
-			Subagent: picoclaw.ToolToggle{Enabled: true},
+			Web:       picoclaw.ToolToggle{Enabled: in.WebSearch},
+			Exec:      picoclaw.ToolToggle{Enabled: in.ShellExec},
+			Spawn:     picoclaw.ToolToggle{Enabled: true},
+			Subagent:  picoclaw.ToolToggle{Enabled: true},
+			LoadImage: picoclaw.ToolToggle{Enabled: true},
 		},
 	}
+}
+
+// normalizeModelRef returns the explicit (provider, model) pair PicoClaw
+// prefers. Because an explicit provider means PicoClaw sends model UNCHANGED,
+// a redundant "<provider>/" prefix is stripped from model so it is never
+// double-prefixed. When provider is empty, model is returned as-is and
+// PicoClaw infers the provider from its first "/" segment (unchanged legacy
+// behavior).
+func normalizeModelRef(provider, model string) (string, string) {
+	provider = strings.TrimSpace(provider)
+	model = strings.TrimSpace(model)
+	if provider != "" {
+		if rest, ok := strings.CutPrefix(model, provider+"/"); ok {
+			model = strings.TrimSpace(rest)
+		}
+	}
+	return provider, model
 }
 
 // File is one generated workspace file.
@@ -198,6 +219,7 @@ func BuildPlan(in Inputs) (*Plan, error) {
 		return nil, fmt.Errorf("render config.json: %w", err)
 	}
 	p.add("config.json", append(jsonBytes, '\n'))
+	p.add(filepath.Join("skills", FileHandlingSkillName, "SKILL.md"), []byte(FileHandlingSkillMD()))
 
 	agents := append([]string{"main"}, sortedSpecialists(in.Specialists)...)
 	for _, id := range agents {
@@ -212,8 +234,8 @@ func BuildPlan(in Inputs) (*Plan, error) {
 	return p, nil
 }
 
-const manifestHeader = "# Generated by piccolo init. Launch configuration only —\n" +
-	"# PicoClaw behavior (agents, models, tools) lives in config.json.\n"
+const manifestHeader = "# Generated by piccolo init. Piccolo-owned configuration —\n" +
+	"# PicoClaw runtime behavior (agents, models, tools, tokens) lives in config.json.\n"
 
 func (p *Plan) add(rel string, content []byte) {
 	p.Files = append(p.Files, File{Rel: rel, Content: content, Mode: 0o644})

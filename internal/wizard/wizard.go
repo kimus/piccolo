@@ -19,7 +19,8 @@ type Prefill struct {
 	OwnerName     string
 	Purpose       string
 	Specialists   []string
-	Mode          string
+	// Dashboard is the optional web-console choice; nil means "ask".
+	Dashboard     *bool
 	Provider      string
 	Model         string
 	ModelAlias    string
@@ -46,8 +47,12 @@ func Run(pre Prefill) (generate.Inputs, string, error) {
 			APIBase:  pre.APIBase,
 		},
 	}
-	mode := pre.Mode
 	workspace := pre.Workspace
+
+	dash := false
+	if pre.Dashboard != nil {
+		dash = *pre.Dashboard
+	}
 
 	web := true
 	if pre.WebSearch != nil {
@@ -97,15 +102,12 @@ func Run(pre Prefill) (generate.Inputs, string, error) {
 				Value(&in.Specialists),
 		))
 	}
-	if mode == "" {
+	if pre.Dashboard == nil {
 		groups = append(groups, huh.NewGroup(
-			huh.NewSelect[string]().
-				Title("How do you want to interact?").
-				Options(
-					huh.NewOption("Terminal (stdio)", string(generate.ModeTerminal)),
-					huh.NewOption("Web console (http://127.0.0.1:18800)", string(generate.ModeWeb)),
-				).
-				Value(&mode),
+			huh.NewConfirm().
+				Title("Expose the optional web console?").
+				Description("The gateway always runs; this adds the browser dashboard at http://127.0.0.1:18800").
+				Value(&dash),
 		))
 	}
 	if in.Model.Provider == "" {
@@ -167,7 +169,7 @@ func Run(pre Prefill) (generate.Inputs, string, error) {
 		}
 	}
 
-	in.Mode = generate.Mode(mode)
+	in.Dashboard = dash
 	in.WebSearch = web
 	in.ShellExec = sh
 	if strings.TrimSpace(in.Model.Alias) == "" {

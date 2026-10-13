@@ -19,6 +19,7 @@ import (
 	"github.com/kimus/piccolo/internal/docker"
 	"github.com/kimus/piccolo/internal/manifest"
 	"github.com/kimus/piccolo/internal/picoclaw"
+	"github.com/kimus/piccolo/internal/runtimeimage"
 	"github.com/kimus/piccolo/internal/workspace"
 )
 
@@ -49,13 +50,14 @@ func newServeCmd() *cobra.Command {
 
 // serveContext holds everything the serve paths share after preflight.
 type serveContext struct {
-	runner *docker.Runner
-	spec   docker.Spec
-	health string // host-side health URL, e.g. http://127.0.0.1:18790/health
-	gwPort int
-	webURL string // non-empty in launcher/web mode
-	dir    string
-	stdout io.Writer
+	runner    *docker.Runner
+	spec      docker.Spec
+	health    string // host-side health URL, e.g. http://127.0.0.1:18790/health
+	gwPort    int
+	webURL    string // non-empty in launcher/web mode
+	dir       string
+	stdout    io.Writer
+	toolchain manifest.Toolchain
 }
 
 // preflight resolves the workspace, checks the daemon, and composes the
@@ -100,7 +102,7 @@ func preflight(cmd *cobra.Command) (*serveContext, error) {
 	}
 
 	gwPort := cfg.HealthPort()
-	ports := append([]string(nil), m.Container.Ports...)
+	ports := composePorts(m, gwPort)
 	// Publish the gateway/health port on loopback so host-side checks and
 	// status can reach it, and bind the gateway to 0.0.0.0 INSIDE the
 	// container — a process on the container's lo interface is unreachable
@@ -108,10 +110,13 @@ func preflight(cmd *cobra.Command) (*serveContext, error) {
 	// localhost bind is already reachable from the host, and publishing is
 	// a no-op).
 	if m.Container.Network != "host" {
-		if !hasContainerPort(ports, gwPort) {
-			ports = append(ports, fmt.Sprintf("127.0.0.1:%d:%d", gwPort, gwPort))
-		}
 		env = withGatewayHost(env)
+	}
+
+	volumes := []string(nil)
+	if runtimeimage.IsLocalRuntimeImage(m.Container.Image) {
+		volumes = append(volumes, runtimeimage.DevboxGlobalMount, runtimeimage.NixCacheMount, runtimeimage.MediaTempMount)
+		volumes = append(volumes, agentMediaMirrorMounts(cfg)...)
 	}
 
 	spec := docker.Spec{
@@ -121,20 +126,38 @@ func preflight(cmd *cobra.Command) (*serveContext, error) {
 		Source:  dir,
 		Ports:   ports,
 		Env:     env,
+		Volumes: volumes,
 		Labels:  map[string]string{docker.LabelWorkspace: dir},
 	}
 
 	webURL := webConsoleURL(m)
 
 	return &serveContext{
-		runner: runner,
-		spec:   spec,
-		health: fmt.Sprintf("http://127.0.0.1:%d/health", gwPort),
-		gwPort: gwPort,
-		webURL: webURL,
-		dir:    dir,
-		stdout: out,
+		runner:    runner,
+		spec:      spec,
+		health:    fmt.Sprintf("http://127.0.0.1:%d/health", gwPort),
+		gwPort:    gwPort,
+		webURL:    webURL,
+		dir:       dir,
+		stdout:    out,
+		toolchain: effectiveToolchain(m),
 	}, nil
+}
+
+// composePorts returns the published port bindings for the container: the
+// manifest's own ports (which include the web console's :18800 binding only
+// when the console is enabled) plus the auto-published gateway/health port.
+// Publishing is skipped for host networking, where the container's localhost
+// bind is already reachable from the host.
+func composePorts(m *manifest.Manifest, gwPort int) []string {
+	ports := append([]string(nil), m.Container.Ports...)
+	if m.Container.Network == "host" {
+		return ports
+	}
+	if !hasContainerPort(ports, gwPort) {
+		ports = append(ports, fmt.Sprintf("127.0.0.1:%d:%d", gwPort, gwPort))
+	}
+	return ports
 }
 
 // withGatewayHost appends PICOCLAW_GATEWAY_HOST=0.0.0.0 unless the user
@@ -151,6 +174,55 @@ func withGatewayHost(env []string) []string {
 
 // hasContainerPort reports whether any published binding already maps the
 // given container port.
+func agentMediaMirrorMounts(cfg picoclaw.Config) []string {
+	seen := map[string]bool{}
+	var mounts []string
+	defaultWS := cfg.Agents.Defaults.Workspace
+	for _, agent := range cfg.Agents.List {
+		ws := agent.Workspace
+		if ws == "" {
+			ws = defaultWS
+		}
+		containerWS, ok := containerWorkspacePath(ws)
+		if !ok {
+			continue
+		}
+		target := strings.TrimRight(containerWS, "/") + "/media"
+		if seen[target] {
+			continue
+		}
+		seen[target] = true
+		mounts = append(mounts, runtimeimage.MediaVolume+":"+target+":rw")
+	}
+	return mounts
+}
+
+func containerWorkspacePath(path string) (string, bool) {
+	p := strings.TrimSpace(path)
+	if rest, ok := strings.CutPrefix(p, "~/.picoclaw/"); ok {
+		return "/root/.picoclaw/" + rest, true
+	}
+	if strings.HasPrefix(p, "/root/.picoclaw/") {
+		return p, true
+	}
+	return "", false
+}
+
+func effectiveToolchain(m *manifest.Manifest) manifest.Toolchain {
+	tc := m.Runtime.Toolchain
+	if len(tc.Packages) == 0 {
+		tc.Packages = append([]string(nil), runtimeimage.DefaultPackages...)
+	} else {
+		tc.Packages = append([]string(nil), tc.Packages...)
+	}
+	if len(tc.Commands) == 0 {
+		tc.Commands = append([]string(nil), runtimeimage.DefaultCommands...)
+	} else {
+		tc.Commands = append([]string(nil), tc.Commands...)
+	}
+	return tc
+}
+
 func hasContainerPort(ports []string, containerPort int) bool {
 	want := fmt.Sprintf(":%d", containerPort)
 	for _, p := range ports {
@@ -209,9 +281,10 @@ func runServeDetached(cmd *cobra.Command) error {
 
 	fmt.Fprintf(sc.stdout, "\n\u2713 piccolo-gateway is running (%s)\n", sc.spec.Name)
 	fmt.Fprintf(sc.stdout, "  health: %s\n", sc.health)
+	ensureDevboxTools(ctx, sc)
 	if sc.webURL != "" {
-		fmt.Fprintf(sc.stdout, "  web:    %s\n", sc.webURL)
-		fmt.Fprintf(sc.stdout, "          first run: open %s/launcher-setup to create the dashboard password\n", sc.webURL)
+		fmt.Fprintf(sc.stdout, "  web console: %s\n", sc.webURL)
+		fmt.Fprintf(sc.stdout, "               first run: open %s/launcher-setup to create the dashboard password\n", sc.webURL)
 	}
 	fmt.Fprintf(sc.stdout, "\nNext:\n")
 	fmt.Fprintf(sc.stdout, "  piccolo chat        interactive terminal chat\n")
@@ -269,6 +342,43 @@ func healthSummary(body []byte) string {
 		return "health: " + payload.Status
 	}
 	return ""
+}
+
+// devboxInstallTimeout bounds the one-shot tool setup. The first run downloads
+// the Nix toolchain plus packages (can be ~1GB), far beyond the agent's own exec
+// timeout, so serve does it once here. The Devbox global dir and /nix are
+// volumes, so later runs are near-instant no-ops.
+const devboxInstallTimeout = 30 * time.Minute
+
+// ensureDevboxTools installs the file-handling toolset and symlinks the tools
+// onto PATH after the gateway is healthy, by running the image's setup script.
+// Best-effort: failures warn but never fail serve.
+func ensureDevboxTools(ctx context.Context, sc *serveContext) {
+	if !runtimeimage.IsLocalRuntimeImage(sc.spec.Image) {
+		return
+	}
+	installCtx, cancel := context.WithTimeout(ctx, devboxInstallTimeout)
+	defer cancel()
+	fmt.Fprintf(sc.stdout, "\nEnsuring Devbox file-handling tools are installed (first run may download packages)...\n")
+	cmd := []string{runtimeimage.SetupScriptPath, strings.Join(sc.toolchain.Packages, " "), strings.Join(sc.toolchain.Commands, " ")}
+	session, err := sc.runner.Exec(installCtx, sc.spec.Name, cmd, false)
+	if err != nil {
+		fmt.Fprintf(sc.stdout, "  [WARN] could not start tool setup: %v\n", err)
+		return
+	}
+	defer session.Close()
+	// Discard the verbose Nix download output; report only the outcome.
+	_ = docker.Demux(session.Reader, io.Discard, io.Discard)
+	code, err := session.Wait(installCtx)
+	if err != nil {
+		fmt.Fprintf(sc.stdout, "  [WARN] tool setup interrupted: %v\n", err)
+		return
+	}
+	if code != 0 {
+		fmt.Fprintf(sc.stdout, "  [WARN] tool setup exited %d \u2014 some tools may be unavailable\n", code)
+		return
+	}
+	fmt.Fprintf(sc.stdout, "  \u2713 devbox tools ready\n")
 }
 
 // dumpLogs prints the last N log lines of the container to stderr.

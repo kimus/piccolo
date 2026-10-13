@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/kimus/piccolo/internal/picoclaw"
+	"github.com/kimus/piccolo/internal/runtimeimage"
 )
 
 func testInputs() Inputs {
@@ -16,7 +17,7 @@ func testInputs() Inputs {
 		OwnerName:     "Kimus",
 		Purpose:       "personal",
 		Specialists:   []string{"planner", "research"},
-		Mode:          ModeTerminal,
+		Dashboard:     false,
 		Model: ModelInput{
 			Alias:    "gpt-5.4",
 			Provider: "openai",
@@ -59,6 +60,7 @@ func TestBuildPlanFiles(t *testing.T) {
 	want := []string{
 		"piccolo.yaml",
 		"config.json",
+		"skills/file-handling/SKILL.md",
 		"agents/main/AGENT.md",
 		"agents/main/SOUL.md",
 		"agents/main/USER.md",
@@ -100,14 +102,26 @@ func TestGeneratedPicoclawConfig(t *testing.T) {
 	if main.Subagents == nil || len(main.Subagents.AllowAgents) != 2 {
 		t.Errorf("subagents = %+v", main.Subagents)
 	}
-	if len(cfg.ModelList) != 1 || cfg.ModelList[0].Model != "openai/gpt-5.4" {
-		t.Errorf("model_list = %+v", cfg.ModelList)
+	if len(cfg.ModelList) != 1 {
+		t.Fatalf("model_list = %+v", cfg.ModelList)
+	}
+	if cfg.ModelList[0].Provider != "openai" || cfg.ModelList[0].Model != "gpt-5.4" {
+		t.Errorf("model entry = %+v, want explicit provider openai + bare model gpt-5.4", cfg.ModelList[0])
+	}
+	if cfg.Agents.Defaults.ImageModel != "gpt-5.4" {
+		t.Errorf("image_model = %q, want selected model alias", cfg.Agents.Defaults.ImageModel)
 	}
 	if !cfg.Tools.Web.Enabled || cfg.Tools.Exec.Enabled {
 		t.Errorf("tools = %+v", cfg.Tools)
 	}
-	if !cfg.Tools.Spawn.Enabled || !cfg.Tools.Subagent.Enabled {
-		t.Errorf("spawn/subagent must be enabled: %+v", cfg.Tools)
+	if !cfg.Tools.Spawn.Enabled || !cfg.Tools.Subagent.Enabled || !cfg.Tools.LoadImage.Enabled {
+		t.Errorf("spawn/subagent/load_image must be enabled: %+v", cfg.Tools)
+	}
+	if !cfg.Agents.Defaults.AllowReadOutsideWorkspace {
+		t.Error("allow_read_outside_workspace must be enabled for media handling")
+	}
+	if !cfg.Agents.Defaults.ToolFeedback.Enabled || cfg.Agents.Defaults.ToolFeedback.MaxArgsLength != 300 {
+		t.Errorf("tool_feedback = %+v", cfg.Agents.Defaults.ToolFeedback)
 	}
 
 	// Round-trips as valid JSON.
@@ -115,28 +129,105 @@ func TestGeneratedPicoclawConfig(t *testing.T) {
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
 	}
+	if strings.Contains(string(data), "allow_remote") || strings.Contains(string(data), "allow_read_paths") || strings.Contains(string(data), "custom_allow_patterns") {
+		t.Fatalf("generated defaults should not emit allow_remote unless explicitly set: %s", data)
+	}
 	var back picoclaw.Config
 	if err := json.Unmarshal(data, &back); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
 }
 
-func TestManifestTerminalVsWeb(t *testing.T) {
+func TestManifestDashboardOffVsOn(t *testing.T) {
 	in := testInputs()
+	in.Dashboard = false
 	m := in.Manifest()
 	if m.Container.Image != DefaultImage || len(m.Container.Ports) != 0 || m.Container.Env != nil {
-		t.Errorf("terminal manifest = %+v", m.Container)
+		t.Errorf("dashboard-off manifest = %+v", m.Container)
 	}
-	in.Mode = ModeWeb
+	for _, want := range []string{"libreoffice", "imagemagick", "poppler-utils"} {
+		if !containsString(m.Runtime.Toolchain.Packages, want) {
+			t.Errorf("default packages missing %q: %v", want, m.Runtime.Toolchain.Packages)
+		}
+	}
+	for _, want := range []string{"pdfinfo", "pdftoppm", "pdftocairo", "soffice", "magick", "convert", "identify"} {
+		if !containsString(m.Runtime.Toolchain.Commands, want) {
+			t.Errorf("default commands missing %q: %v", want, m.Runtime.Toolchain.Commands)
+		}
+	}
+	if containsString(m.Runtime.Toolchain.Packages, "opencv") || containsString(m.Runtime.Toolchain.Commands, "cv2") {
+		t.Errorf("OpenCV must not be a default toolchain entry: %+v", m.Runtime.Toolchain)
+	}
+	if len(m.Runtime.Toolchain.Packages) != len(runtimeimage.DefaultPackages) || len(m.Runtime.Toolchain.Commands) != len(runtimeimage.DefaultCommands) {
+		t.Errorf("manifest defaults drifted from runtimeimage defaults")
+	}
+	in.Dashboard = true
 	m = in.Manifest()
 	if m.Container.Image != LauncherImage {
-		t.Errorf("web image = %q", m.Container.Image)
+		t.Errorf("dashboard-on image = %q", m.Container.Image)
 	}
 	if len(m.Container.Ports) != 1 || m.Container.Ports[0] != LauncherPort {
-		t.Errorf("web ports = %v", m.Container.Ports)
+		t.Errorf("dashboard-on ports = %v", m.Container.Ports)
 	}
 	if m.Container.Env["PICOCLAW_GATEWAY_HOST"] != "0.0.0.0" {
-		t.Errorf("web env = %v", m.Container.Env)
+		t.Errorf("dashboard-on env = %v", m.Container.Env)
+	}
+}
+
+// TestWebSearchIndependentOfDashboard asserts the two axes are unrelated:
+// web search on + dashboard off yields tools.web.enabled true and no :18800
+// binding (and the lean gateway image).
+func TestWebSearchIndependentOfDashboard(t *testing.T) {
+	in := testInputs()
+	in.WebSearch = true
+	in.Dashboard = false
+
+	cfg := in.PicoclawConfig()
+	if !cfg.Tools.Web.Enabled {
+		t.Errorf("tools.web.enabled = false, want true (web search on)")
+	}
+	m := in.Manifest()
+	if len(m.Container.Ports) != 0 {
+		t.Errorf("dashboard-off must not publish ports, got %v", m.Container.Ports)
+	}
+	if m.Container.Image != DefaultImage {
+		t.Errorf("dashboard-off image = %q, want %q", m.Container.Image, DefaultImage)
+	}
+
+	// And the reverse: dashboard on does not force web search on.
+	in.WebSearch = false
+	in.Dashboard = true
+	cfg = in.PicoclawConfig()
+	if cfg.Tools.Web.Enabled {
+		t.Errorf("tools.web.enabled = true, want false (web search off)")
+	}
+	m = in.Manifest()
+	if len(m.Container.Ports) != 1 || m.Container.Ports[0] != LauncherPort {
+		t.Errorf("dashboard-on ports = %v, want [%s]", m.Container.Ports, LauncherPort)
+	}
+}
+
+func TestNormalizeModelRef(t *testing.T) {
+	cases := []struct {
+		provider, model string
+		wantP, wantM    string
+	}{
+		{"openrouter", "qwen/qwen3.7-flash", "openrouter", "qwen/qwen3.7-flash"},
+		// Redundant prefix is stripped so PicoClaw never gets a double prefix.
+		{"openrouter", "openrouter/qwen/qwen3.7-flash", "openrouter", "qwen/qwen3.7-flash"},
+		{"openai", "openai/gpt-5.4", "openai", "gpt-5.4"},
+		// No provider: model left as-is (PicoClaw infers from first segment).
+		{"", "openai/gpt-5.4", "", "openai/gpt-5.4"},
+		{"", "gpt-5.4", "", "gpt-5.4"},
+		// Whitespace tolerated.
+		{" openrouter ", " qwen/qwen3.7-flash ", "openrouter", "qwen/qwen3.7-flash"},
+	}
+	for _, c := range cases {
+		gotP, gotM := normalizeModelRef(c.provider, c.model)
+		if gotP != c.wantP || gotM != c.wantM {
+			t.Errorf("normalizeModelRef(%q, %q) = (%q, %q), want (%q, %q)",
+				c.provider, c.model, gotP, gotM, c.wantP, c.wantM)
+		}
 	}
 }
 
@@ -154,10 +245,50 @@ func TestAgentMDFrontmatter(t *testing.T) {
 	if !strings.HasPrefix(mainMD, "---\n") {
 		t.Fatal("AGENT.md must start with frontmatter")
 	}
-	for _, want := range []string{"name: Piccolo", "web_search", "spawn", "subagent"} {
+	for _, want := range []string{"name: Piccolo", "web_search", "load_image", "spawn", "subagent", "skills: [file-handling]"} {
 		if !strings.Contains(mainMD, want) {
 			t.Errorf("main AGENT.md missing %q", want)
 		}
+	}
+}
+
+func TestFileHandlingSkillGenerated(t *testing.T) {
+	p, err := BuildPlan(testInputs())
+	if err != nil {
+		t.Fatalf("BuildPlan: %v", err)
+	}
+	var skillMD string
+	for _, f := range p.Files {
+		if f.Rel == "skills/file-handling/SKILL.md" {
+			skillMD = string(f.Content)
+		}
+	}
+	for _, want := range []string{
+		"name: file-handling",
+		"deterministic tools for exact payloads",
+		"available directly on PATH",
+		"piccolo-setup-tools",
+		"zbarimg --quiet --raw <image-path>",
+		"Do not use `apt-get`",
+		"Do not import `cv2`",
+		"/tmp/picoclaw_media",
+		"workspace-relative output directories",
+		"pdfinfo <file.pdf>",
+		"pdftoppm",
+		"pdftocairo",
+		"soffice --headless --convert-to",
+		"magick",
+		"tesseract <image-path> stdout",
+		"pdftotext <file.pdf> -",
+		"pandoc <file> -t plain",
+		"file <path>",
+	} {
+		if !strings.Contains(skillMD, want) {
+			t.Errorf("file-handling skill missing guidance %q", want)
+		}
+	}
+	if strings.Contains(skillMD, "cd /opt/piccolo/devbox") || strings.Contains(skillMD, "devbox run --") {
+		t.Error("skill must not tell agents to cd to /opt or wrap tools in devbox run")
 	}
 }
 
@@ -273,11 +404,6 @@ func TestValidateInputs(t *testing.T) {
 		t.Error("expected purpose error")
 	}
 	in = testInputs()
-	in.Mode = ""
-	if err := in.Validate(); err == nil {
-		t.Error("expected mode error")
-	}
-	in = testInputs()
 	in.Specialists = []string{"lawyer"}
 	if err := in.Validate(); err == nil {
 		t.Error("expected specialist error")
@@ -287,4 +413,13 @@ func TestValidateInputs(t *testing.T) {
 	if err := in.Validate(); err == nil {
 		t.Error("expected name error")
 	}
+}
+
+func containsString(values []string, want string) bool {
+	for _, v := range values {
+		if v == want {
+			return true
+		}
+	}
+	return false
 }

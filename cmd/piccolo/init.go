@@ -20,7 +20,7 @@ type initFlags struct {
 	owner     string
 	purpose   string
 	agents    string
-	mode      string
+	dashboard bool
 	provider  string
 	model     string
 	modelAlia string
@@ -47,13 +47,13 @@ func newInitCmd() *cobra.Command {
 	cmd.Flags().StringVar(&f.owner, "owner", "", "owner name")
 	cmd.Flags().StringVar(&f.purpose, "purpose", "", "personal|research|coding|operations|blank")
 	cmd.Flags().StringVar(&f.agents, "agents", "", "comma-separated specialists: research,planner,coder,ops")
-	cmd.Flags().StringVar(&f.mode, "mode", "", "terminal|web")
+	cmd.Flags().BoolVar(&f.dashboard, "dashboard", false, "expose the optional web console (browser dashboard on :18800)")
 	cmd.Flags().StringVar(&f.provider, "provider", "", "model provider (e.g. openai)")
 	cmd.Flags().StringVar(&f.model, "model", "", "model id (e.g. gpt-5.4)")
 	cmd.Flags().StringVar(&f.modelAlia, "model-alias", "", "model_name alias in config.json")
 	cmd.Flags().StringVar(&f.apiKey, "api-key", "", "model API key")
 	cmd.Flags().StringVar(&f.apiBase, "api-base", "", "optional API base URL")
-	cmd.Flags().BoolVar(&f.web, "web", true, "enable web search tools")
+	cmd.Flags().BoolVar(&f.web, "web-search", true, "enable web search tools")
 	cmd.Flags().BoolVar(&f.shell, "shell", false, "enable shell execution")
 	cmd.Flags().BoolVar(&f.yes, "yes", false, "non-interactive: use flags/defaults, skip prompts, never overwrite")
 	return cmd
@@ -67,7 +67,6 @@ func runInit(cmd *cobra.Command, f initFlags) error {
 		AssistantName: f.name,
 		OwnerName:     f.owner,
 		Purpose:       f.purpose,
-		Mode:          f.mode,
 		Provider:      f.provider,
 		Model:         f.model,
 		ModelAlias:    f.modelAlia,
@@ -76,6 +75,11 @@ func runInit(cmd *cobra.Command, f initFlags) error {
 		WebSearch:     boolPtr(f.web),
 		ShellExec:     boolPtr(f.shell),
 		Workspace:     dirFlag,
+	}
+	// Only pin the web-console choice when the flag was set explicitly; otherwise
+	// leave it nil so the interactive wizard asks (and --yes defaults to false).
+	if cmd.Flags().Changed("dashboard") {
+		pre.Dashboard = boolPtr(f.dashboard)
 	}
 	if f.agents != "" {
 		for _, a := range strings.Split(f.agents, ",") {
@@ -92,8 +96,8 @@ func runInit(cmd *cobra.Command, f initFlags) error {
 		if pre.Purpose == "" {
 			pre.Purpose = "personal"
 		}
-		if pre.Mode == "" {
-			pre.Mode = string(generate.ModeTerminal)
+		if pre.Dashboard == nil {
+			pre.Dashboard = boolPtr(false)
 		}
 		if pre.Model == "" {
 			return fmt.Errorf("--model is required with --yes")
@@ -146,7 +150,11 @@ func runInit(cmd *cobra.Command, f initFlags) error {
 	}
 
 	// Preview the generation plan.
-	fmt.Fprintf(stdout, "\nWorkspace: %s\nImage:     %s\n", dir, inputs.Manifest().Container.Image)
+	console := "off"
+	if inputs.Dashboard {
+		console = "on"
+	}
+	fmt.Fprintf(stdout, "\nWorkspace:   %s\nImage:       %s\nWeb console: %s\n", dir, inputs.Manifest().Container.Image, console)
 	fmt.Fprintln(stdout, "Files to create:")
 	for _, file := range plan.Files {
 		fmt.Fprintf(stdout, "  %s\n", file.Rel)
@@ -227,7 +235,6 @@ func inputsFromPrefill(pre wizard.Prefill) (generate.Inputs, error) {
 		OwnerName:     pre.OwnerName,
 		Purpose:       pre.Purpose,
 		Specialists:   pre.Specialists,
-		Mode:          generate.Mode(pre.Mode),
 		Model: generate.ModelInput{
 			Alias:    pre.ModelAlias,
 			Provider: pre.Provider,
@@ -235,6 +242,9 @@ func inputsFromPrefill(pre wizard.Prefill) (generate.Inputs, error) {
 			APIKey:   pre.APIKey,
 			APIBase:  pre.APIBase,
 		},
+	}
+	if pre.Dashboard != nil {
+		in.Dashboard = *pre.Dashboard
 	}
 	if pre.WebSearch != nil {
 		in.WebSearch = *pre.WebSearch

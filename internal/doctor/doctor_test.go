@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/kimus/piccolo/internal/generate"
+	"github.com/kimus/piccolo/internal/manifest"
 )
 
 // fakeEngine is a daemon-free doctor.Engine for tests.
@@ -36,7 +37,7 @@ func initWorkspace(t *testing.T) string {
 		OwnerName:     "Kimus",
 		Purpose:       "personal",
 		Specialists:   []string{"research"},
-		Mode:          generate.ModeTerminal,
+		Dashboard:     false,
 		Model: generate.ModelInput{
 			Alias: "gpt-5.4", Provider: "openai", Model: "gpt-5.4", APIKey: "sk-real-key",
 		},
@@ -246,6 +247,129 @@ func TestDoctorStaleContainerWarns(t *testing.T) {
 	r := find(results, "stale container")
 	if r == nil || r.Status != WARN {
 		t.Fatalf("expected stale WARN, got %v", results)
+	}
+}
+
+// TestDoctorConsoleOffNoWarning asserts a disabled web console produces no
+// warning or failure attributable to its absence.
+func TestDoctorConsoleOffNoWarning(t *testing.T) {
+	// Unit-level: a gateway-image manifest with no :18800 yields no results.
+	m := &manifest.Manifest{Container: manifest.Container{
+		Image: generate.DefaultImage, Name: "piccolo-gateway", Network: "bridge",
+	}}
+	if res := checkWebConsole(m); len(res) != 0 {
+		t.Fatalf("console-off checkWebConsole = %v, want no results", res)
+	}
+
+	// Full run over a console-off workspace stays warning-free.
+	dir := initWorkspace(t)
+	results := Run(context.Background(), Options{
+		Workspace: dir,
+		Engine:    fakeEngine{imageExists: true},
+		LookupEnv: func(string) (string, bool) { return "", false },
+	})
+	if Failed(results) {
+		t.Fatalf("console-off must not fail: %v", results)
+	}
+	if statuses(results)[WARN] != 0 {
+		t.Errorf("console-off must not warn: %v", results)
+	}
+}
+
+// TestDoctorConsoleBindingImageMismatchWarns asserts a :18800 binding paired
+// with a non-launcher image is flagged as an inconsistency (dead port).
+func TestDoctorConsoleBindingImageMismatchWarns(t *testing.T) {
+	m := &manifest.Manifest{Container: manifest.Container{
+		Image: generate.DefaultImage, Name: "piccolo-gateway", Network: "bridge",
+		Ports: []string{"127.0.0.1:18800:18800"},
+	}}
+	res := checkWebConsole(m)
+	if len(res) != 1 || res[0].Status != WARN {
+		t.Fatalf("mismatch checkWebConsole = %v, want one WARN", res)
+	}
+	if !strings.Contains(res[0].Message, "not the launcher image") {
+		t.Errorf("unexpected message: %q", res[0].Message)
+	}
+}
+
+// TestDoctorConsoleEnabledOK asserts a launcher image with :18800 is OK.
+func TestDoctorConsoleEnabledOK(t *testing.T) {
+	m := &manifest.Manifest{Container: manifest.Container{
+		Image: generate.LauncherImage, Name: "piccolo-gateway", Network: "bridge",
+		Ports: []string{"127.0.0.1:18800:18800"},
+	}}
+	res := checkWebConsole(m)
+	if len(res) != 1 || res[0].Status != OK {
+		t.Fatalf("console-on checkWebConsole = %v, want one OK", res)
+	}
+}
+
+func TestDoctorImageUnderstandingWarnings(t *testing.T) {
+	dir := initWorkspace(t)
+	patchConfig(t, dir, func(cfg map[string]any) {
+		defaults := cfg["agents"].(map[string]any)["defaults"].(map[string]any)
+		delete(defaults, "image_model")
+	})
+	results := Run(context.Background(), Options{Workspace: dir, Engine: fakeEngine{imageExists: true}})
+	if Failed(results) {
+		t.Fatalf("missing image_model must warn, not fail: %v", results)
+	}
+	if r := find(results, "image_model is not configured"); r == nil || r.Status != WARN {
+		t.Fatalf("expected image_model WARN, got %v", results)
+	}
+
+	dir = initWorkspace(t)
+	patchConfig(t, dir, func(cfg map[string]any) {
+		tools := cfg["tools"].(map[string]any)
+		tools["load_image"] = map[string]any{"enabled": false}
+	})
+	results = Run(context.Background(), Options{Workspace: dir, Engine: fakeEngine{imageExists: true}})
+	if r := find(results, "tools.load_image.enabled is false"); r == nil || r.Status != WARN {
+		t.Fatalf("expected load_image disabled WARN, got %v", results)
+	}
+
+	dir = initWorkspace(t)
+	agentPath := filepath.Join(dir, "agents", "main", "AGENT.md")
+	data, err := os.ReadFile(agentPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	content := strings.Replace(string(data), ", load_image", "", 1)
+	if err := os.WriteFile(agentPath, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	results = Run(context.Background(), Options{Workspace: dir, Engine: fakeEngine{imageExists: true}})
+	if r := find(results, `agent "main" AGENT.md does not allow load_image`); r == nil || r.Status != WARN {
+		t.Fatalf("expected agent load_image WARN, got %v", results)
+	}
+}
+
+func TestDoctorWarnsOnRemoteExec(t *testing.T) {
+	dir := initWorkspace(t)
+	patchConfig(t, dir, func(cfg map[string]any) {
+		tools := cfg["tools"].(map[string]any)
+		exec := tools["exec"].(map[string]any)
+		exec["enabled"] = true
+		exec["allow_remote"] = true
+	})
+	results := Run(context.Background(), Options{Workspace: dir, Engine: fakeEngine{imageExists: true}})
+	if r := find(results, "tools.exec.allow_remote is true"); r == nil || r.Status != WARN {
+		t.Fatalf("expected remote exec WARN, got %v", results)
+	}
+}
+
+func TestDoctorImageModelReferenceMustExist(t *testing.T) {
+	dir := initWorkspace(t)
+	patchConfig(t, dir, func(cfg map[string]any) {
+		defaults := cfg["agents"].(map[string]any)["defaults"].(map[string]any)
+		defaults["image_model"] = "vision-missing"
+	})
+	results := Run(context.Background(), Options{Workspace: dir, Engine: fakeEngine{imageExists: true}})
+	if !Failed(results) {
+		t.Fatal("expected failure for missing image_model reference")
+	}
+	if find(results, `model_name "vision-missing" is referenced but missing`) == nil {
+		t.Fatalf("expected missing image model FAIL, got %v", results)
 	}
 }
 

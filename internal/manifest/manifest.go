@@ -1,6 +1,7 @@
-// Package manifest loads and validates piccolo.yaml, Piccolo's own launch
-// configuration. It intentionally knows nothing about PicoClaw-domain config
-// (models, tools, agents): those live in config.json, which is user-owned.
+// Package manifest loads and validates piccolo.yaml, Piccolo's own
+// configuration. Runtime PicoClaw-domain config (models, tools, agents,
+// channel tokens) lives in config.json, which is user-owned; piccolo.yaml may
+// also hold non-secret Piccolo setup metadata used by setup flows.
 package manifest
 
 import (
@@ -20,6 +21,39 @@ const CurrentVersion = 1
 type Manifest struct {
 	Version   int       `yaml:"version"`
 	Container Container `yaml:"container"`
+	Runtime   Runtime   `yaml:"runtime,omitempty"`
+	Setup     Setup     `yaml:"setup,omitempty"`
+}
+
+// Runtime holds Piccolo-owned container runtime configuration. This is distinct
+// from PicoClaw's config.json runtime/agent settings.
+type Runtime struct {
+	Toolchain Toolchain `yaml:"toolchain,omitempty"`
+}
+
+// Toolchain describes Devbox/Nix packages to install and command names to
+// expose on PATH inside the container.
+type Toolchain struct {
+	Packages []string `yaml:"packages,omitempty"`
+	Commands []string `yaml:"commands,omitempty"`
+}
+
+// Setup holds non-secret Piccolo setup metadata that is useful across setup
+// runs but is not consumed by PicoClaw at runtime.
+type Setup struct {
+	Channels SetupChannels `yaml:"channels,omitempty"`
+}
+
+// SetupChannels stores provider-specific setup metadata.
+type SetupChannels struct {
+	Discord DiscordSetup `yaml:"discord,omitempty"`
+}
+
+// DiscordSetup stores non-secret Discord setup metadata. The bot token remains
+// in config.json because PicoClaw needs it; ApplicationID is used by Piccolo to
+// print direct links and the server invite URL.
+type DiscordSetup struct {
+	ApplicationID string `yaml:"application_id,omitempty"`
 }
 
 // Container describes how serve launches the PicoClaw gateway container.
@@ -73,6 +107,20 @@ func Parse(r io.Reader) (*Manifest, error) {
 	return &m, nil
 }
 
+// Write renders m to path with deterministic 2-space YAML.
+func (m *Manifest) Write(path string) error {
+	var out strings.Builder
+	enc := yaml.NewEncoder(&out)
+	enc.SetIndent(2)
+	if err := enc.Encode(m); err != nil {
+		return err
+	}
+	if err := enc.Close(); err != nil {
+		return err
+	}
+	return os.WriteFile(path, []byte(out.String()), 0o644)
+}
+
 // Validate checks schema version and container fields.
 func (m *Manifest) Validate() error {
 	if m.Version != CurrentVersion {
@@ -94,6 +142,12 @@ func (m *Manifest) Validate() error {
 		if err := validatePort(p); err != nil {
 			return err
 		}
+	}
+	if err := validateStringList("runtime.toolchain.packages", m.Runtime.Toolchain.Packages); err != nil {
+		return err
+	}
+	if err := validateStringList("runtime.toolchain.commands", m.Runtime.Toolchain.Commands); err != nil {
+		return err
 	}
 	return nil
 }
@@ -117,6 +171,24 @@ func IsPinnedImage(ref string) bool {
 	}
 	tag := ref[lastColon+1:]
 	return tag != "latest"
+}
+
+func validateStringList(name string, values []string) error {
+	seen := map[string]bool{}
+	for _, v := range values {
+		trimmed := strings.TrimSpace(v)
+		if trimmed == "" {
+			return fmt.Errorf("%s contains an empty entry", name)
+		}
+		if strings.ContainsAny(trimmed, " \t\n\r") {
+			return fmt.Errorf("%s entry %q must not contain whitespace", name, v)
+		}
+		if seen[trimmed] {
+			return fmt.Errorf("%s contains duplicate entry %q", name, trimmed)
+		}
+		seen[trimmed] = true
+	}
+	return nil
 }
 
 func validatePort(spec string) error {

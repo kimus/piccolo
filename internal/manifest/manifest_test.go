@@ -33,8 +33,60 @@ func TestParseRejectsUnknownFields(t *testing.T) {
 	}
 }
 
+func TestParseAcceptsRuntimeToolchain(t *testing.T) {
+	m, err := Parse(strings.NewReader(validYAML + `runtime:
+  toolchain:
+    packages:
+      - poppler-utils
+      - imagemagick
+    commands:
+      - pdfinfo
+      - magick
+`))
+	if err != nil {
+		t.Fatalf("Parse runtime toolchain: %v", err)
+	}
+	if strings.Join(m.Runtime.Toolchain.Packages, ",") != "poppler-utils,imagemagick" {
+		t.Fatalf("packages = %#v", m.Runtime.Toolchain.Packages)
+	}
+	if strings.Join(m.Runtime.Toolchain.Commands, ",") != "pdfinfo,magick" {
+		t.Fatalf("commands = %#v", m.Runtime.Toolchain.Commands)
+	}
+}
+
+func TestParseRejectsBadRuntimeToolchain(t *testing.T) {
+	_, err := Parse(strings.NewReader(validYAML + `runtime:
+  toolchain:
+    packages: [file, file]
+`))
+	if err == nil {
+		t.Fatal("expected duplicate package error")
+	}
+	_, err = Parse(strings.NewReader(validYAML + `runtime:
+  toolchain:
+    commands: ["bad command"]
+`))
+	if err == nil {
+		t.Fatal("expected whitespace command error")
+	}
+}
+
+func TestParseAcceptsSetupMetadata(t *testing.T) {
+	m, err := Parse(strings.NewReader(validYAML + `setup:
+  channels:
+    discord:
+      application_id: "123456789012345678"
+`))
+	if err != nil {
+		t.Fatalf("Parse setup metadata: %v", err)
+	}
+	if m.Setup.Channels.Discord.ApplicationID != "123456789012345678" {
+		t.Fatalf("application id = %q", m.Setup.Channels.Discord.ApplicationID)
+	}
+}
+
 func TestParseRejectsPicoclawDomainConfig(t *testing.T) {
-	// piccolo.yaml must stay launch-only; PicoClaw-domain keys are unknown.
+	// PicoClaw-domain runtime keys are still unknown in piccolo.yaml.
 	_, err := Parse(strings.NewReader(validYAML + "  model: gpt-5.4\n"))
 	if err == nil {
 		t.Fatal("expected error for PicoClaw-domain key in piccolo.yaml")

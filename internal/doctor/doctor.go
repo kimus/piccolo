@@ -15,8 +15,10 @@ import (
 
 	"gopkg.in/yaml.v3"
 
+	"github.com/kimus/piccolo/internal/generate"
 	"github.com/kimus/piccolo/internal/manifest"
 	"github.com/kimus/piccolo/internal/picoclaw"
+	"github.com/kimus/piccolo/internal/runtimeimage"
 )
 
 // Engine is the narrow Docker surface doctor needs.
@@ -114,11 +116,24 @@ func Run(ctx context.Context, opts Options) []Result {
 		case err != nil:
 			add(WARN, "image check failed for %s: %v", m.Container.Image, err)
 		case !present:
-			add(WARN, "image not present locally: %s (serve will pull it once)", m.Container.Image)
+			if isPiccoloLocalRuntimeImage(m.Container.Image) {
+				add(WARN, "local Piccolo runtime image not present: %s (run 'piccolo image build --set')", m.Container.Image)
+			} else {
+				add(WARN, "image not present locally: %s (serve will pull it once)", m.Container.Image)
+			}
 		default:
 			add(OK, "image present: %s", m.Container.Image)
 		}
 	}
+
+	// 3b. Web console consistency: a published :18800 binding only makes sense
+	// with the launcher image (which serves the dashboard). A plain gateway
+	// image would publish a dead port with nothing listening behind it.
+	results = append(results, checkWebConsole(m)...)
+
+	// 3c. Runtime toolchain configuration (live command availability is reported
+	// by `piccolo runtime status/apply`; doctor remains daemon-free here).
+	results = append(results, checkRuntimeToolchain(m)...)
 
 	// 4. Env references.
 	lookup := opts.LookupEnv
@@ -162,10 +177,71 @@ func Run(ctx context.Context, opts Options) []Result {
 	// 8. Models.
 	results = append(results, checkModels(cfg)...)
 
-	// 9. Channels (raw parse — setup manages channel_list; unknown fields
+	// 9. Image understanding. PicoClaw can receive channel attachments; Piccolo
+	// recommends routing them through a vision-capable image_model and the
+	// load_image tool.
+	results = append(results, checkImageUnderstanding(opts.Workspace, cfg, data)...)
+
+	// 10. Exec safety.
+	results = append(results, checkExecSafety(data)...)
+
+	// 11. Channels (raw parse — setup manages channel_list; unknown fields
 	// are user-owned and ignored here).
 	results = append(results, checkChannels(data)...)
 
+	return results
+}
+
+func checkRuntimeToolchain(m *manifest.Manifest) []Result {
+	tc := m.Runtime.Toolchain
+	packages := tc.Packages
+	commands := tc.Commands
+	if len(packages) == 0 {
+		packages = runtimeimage.DefaultPackages
+	}
+	if len(commands) == 0 {
+		commands = runtimeimage.DefaultCommands
+	}
+	var results []Result
+	results = append(results, Result{Status: OK, Message: fmt.Sprintf("runtime toolchain: %d packages, %d commands configured", len(packages), len(commands))})
+	for _, want := range []string{"poppler-utils", "libreoffice", "imagemagick"} {
+		if !hasString(packages, want) {
+			results = append(results, Result{Status: WARN, Message: fmt.Sprintf("runtime toolchain: default media/office package %q is not configured", want)})
+		}
+	}
+	for _, want := range []string{"pdfinfo", "pdftoppm", "pdftocairo", "soffice", "magick", "convert", "identify"} {
+		if !hasString(commands, want) {
+			results = append(results, Result{Status: WARN, Message: fmt.Sprintf("runtime toolchain: useful media/office command %q is not exposed", want)})
+		}
+	}
+	return results
+}
+
+func hasString(values []string, want string) bool {
+	for _, v := range values {
+		if v == want {
+			return true
+		}
+	}
+	return false
+}
+
+func checkExecSafety(configData []byte) []Result {
+	var results []Result
+	var raw struct {
+		Tools struct {
+			Exec struct {
+				Enabled     *bool `json:"enabled"`
+				AllowRemote *bool `json:"allow_remote"`
+			} `json:"exec"`
+		} `json:"tools"`
+	}
+	if err := json.Unmarshal(configData, &raw); err != nil {
+		return results
+	}
+	if raw.Tools.Exec.AllowRemote != nil && *raw.Tools.Exec.AllowRemote {
+		results = append(results, Result{Status: WARN, Message: "exec: tools.exec.allow_remote is true — remote chats can request shell commands inside the container subject to PicoClaw safety checks; enable only for trusted channels/users"})
+	}
 	return results
 }
 
@@ -225,6 +301,58 @@ func checkChannels(configData []byte) []Result {
 		add(OK, "channel: %s", name)
 	}
 	return results
+}
+
+// checkWebConsole verifies the optional web console is configured
+// consistently. The console is enabled solely by a published :18800 binding;
+// that binding only works with the launcher image, which serves the dashboard.
+// A disabled console (no :18800) is perfectly valid and produces no result.
+func checkWebConsole(m *manifest.Manifest) []Result {
+	var results []Result
+	if !publishesContainerPort(m.Container.Ports, 18800) {
+		return results // console disabled — nothing to report
+	}
+	if !isLauncherImage(m.Container.Image) {
+		results = append(results, Result{Status: WARN, Message: fmt.Sprintf(
+			"piccolo.yaml publishes :18800 (web console) but image %q is not the launcher image — the port would have nothing listening", m.Container.Image)})
+		return results
+	}
+	results = append(results, Result{Status: OK, Message: "web console: enabled (:18800, launcher image)"})
+	return results
+}
+
+// isLauncherImage reports whether ref points at the PicoClaw launcher image
+// (the flavor that serves the web dashboard).
+func isPiccoloLocalRuntimeImage(ref string) bool {
+	return runtimeimage.IsLocalRuntimeImage(ref) || strings.HasPrefix(ref, "piccolo-picoclaw:")
+}
+
+func isLauncherImage(ref string) bool {
+	ref = strings.TrimSpace(ref)
+	if ref == generate.LauncherImage {
+		return true
+	}
+	// Allow registry/path variants pinned to the "launcher" tag.
+	if i := strings.LastIndex(ref, ":"); i >= 0 && i > strings.LastIndex(ref, "/") {
+		return ref[i+1:] == "launcher"
+	}
+	return false
+}
+
+// publishesContainerPort reports whether any binding maps the given container
+// port. Bindings look like [host_ip:]host_port:container_port[/proto].
+func publishesContainerPort(ports []string, containerPort int) bool {
+	want := fmt.Sprintf(":%d", containerPort)
+	for _, p := range ports {
+		portion := strings.TrimSpace(p)
+		if i := strings.LastIndex(portion, "/"); i >= 0 {
+			portion = portion[:i]
+		}
+		if strings.HasSuffix(portion, want) {
+			return true
+		}
+	}
+	return false
 }
 
 func checkAgents(workspace string, cfg picoclaw.Config) []Result {
@@ -318,6 +446,9 @@ func checkModels(cfg picoclaw.Config) []Result {
 	}
 	// Every agent-referenced model must exist in model_list.
 	refs := map[string]bool{cfg.Agents.Defaults.ModelName: true}
+	if cfg.Agents.Defaults.ImageModel != "" {
+		refs[cfg.Agents.Defaults.ImageModel] = true
+	}
 	for _, a := range cfg.Agents.List {
 		if a.ModelName != "" {
 			refs[a.ModelName] = true
@@ -326,6 +457,52 @@ func checkModels(cfg picoclaw.Config) []Result {
 	for ref := range refs {
 		if ref != "" && !names[ref] {
 			add(FAIL, "model_name %q is referenced but missing from model_list", ref)
+		}
+	}
+	return results
+}
+
+func checkImageUnderstanding(workspace string, cfg picoclaw.Config, configData []byte) []Result {
+	var results []Result
+	add := func(s Status, format string, args ...any) {
+		results = append(results, Result{Status: s, Message: fmt.Sprintf(format, args...)})
+	}
+
+	if strings.TrimSpace(cfg.Agents.Defaults.ImageModel) == "" {
+		add(WARN, "image understanding: agents.defaults.image_model is not configured — image attachments may be received but not visually interpreted")
+	} else {
+		add(OK, "image understanding: image_model %s", cfg.Agents.Defaults.ImageModel)
+	}
+
+	var raw struct {
+		Tools map[string]json.RawMessage `json:"tools"`
+	}
+	if err := json.Unmarshal(configData, &raw); err == nil {
+		if msg, ok := raw.Tools["load_image"]; ok {
+			var tool struct {
+				Enabled *bool `json:"enabled"`
+			}
+			if err := json.Unmarshal(msg, &tool); err == nil && tool.Enabled != nil && !*tool.Enabled {
+				add(WARN, "image understanding: tools.load_image.enabled is false — agents cannot visually inspect local image attachments")
+			}
+		}
+	}
+
+	for _, a := range cfg.Agents.List {
+		ws := a.Workspace
+		if ws == "" {
+			ws = cfg.Agents.Defaults.Workspace
+		}
+		hostPath, ok := translateWorkspacePath(workspace, ws)
+		if !ok {
+			continue // checkAgents reports this precisely.
+		}
+		fm, err := parseFrontmatter(filepath.Join(hostPath, "AGENT.md"))
+		if err != nil {
+			continue // checkAgents reports this precisely.
+		}
+		if len(fm.Tools) > 0 && !hasTool(fm.Tools, "load_image") {
+			add(WARN, "image understanding: agent %q AGENT.md does not allow load_image", a.ID)
 		}
 	}
 	return results
@@ -340,6 +517,15 @@ func isPlaceholderKey(key string) bool {
 		return true
 	case strings.Contains(k, "placeholder"), strings.Contains(k, "changeme"), strings.Contains(k, "xxx"):
 		return true
+	}
+	return false
+}
+
+func hasTool(tools []string, want string) bool {
+	for _, t := range tools {
+		if strings.TrimSpace(t) == want {
+			return true
+		}
 	}
 	return false
 }

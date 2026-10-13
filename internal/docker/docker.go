@@ -9,8 +9,10 @@
 package docker
 
 import (
+	"bufio"
 	"context"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -50,6 +52,7 @@ type Spec struct {
 	Source  string // host workspace dir (absolute), mounted to MountTarget
 	Ports   []string
 	Env     []string // KEY=value pairs, already resolved
+	Volumes []string // docker-style named volume binds, e.g. name:/path:rw
 	Labels  map[string]string
 	// Detach runs the container in the background without stdio attachment
 	// (logs remain available through the daemon).
@@ -124,6 +127,89 @@ func (r *Runner) ImageExists(ctx context.Context, image string) (bool, error) {
 		return false, nil
 	}
 	return false, err
+}
+
+// ImageBuildOptions describes a daemon-side image build without exposing SDK
+// types to callers.
+type ImageBuildOptions struct {
+	Tag        string
+	Dockerfile string
+	Pull       bool
+	Remove     bool
+}
+
+// BuildImage sends a tar build context to the daemon and streams the daemon's
+// build output to out. Callers own the context reader and may generate it in
+// memory or from a temporary directory.
+func (r *Runner) BuildImage(ctx context.Context, buildContext io.Reader, opts ImageBuildOptions, out io.Writer) error {
+	if strings.TrimSpace(opts.Tag) == "" {
+		return errors.New("image tag is required")
+	}
+	if strings.TrimSpace(opts.Dockerfile) == "" {
+		opts.Dockerfile = "Dockerfile"
+	}
+	cli, err := r.newClient(ctx)
+	if err != nil {
+		return err
+	}
+	res, err := cli.ImageBuild(ctx, buildContext, mobyclient.ImageBuildOptions{
+		Tags:       []string{opts.Tag},
+		Dockerfile: opts.Dockerfile,
+		PullParent: opts.Pull,
+		Remove:     opts.Remove,
+	})
+	if err != nil {
+		return err
+	}
+	defer res.Body.Close()
+	if out == nil {
+		_, err = io.Copy(io.Discard, res.Body)
+		return err
+	}
+	return writeBuildOutput(res.Body, out)
+}
+
+func writeBuildOutput(r io.Reader, out io.Writer) error {
+	s := bufio.NewScanner(r)
+	// Build lines can include long progress entries; allow more than Scanner's
+	// default 64 KiB token limit while keeping memory bounded.
+	s.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	for s.Scan() {
+		line := s.Bytes()
+		var msg struct {
+			Stream      string `json:"stream"`
+			Status      string `json:"status"`
+			ID          string `json:"id"`
+			Error       string `json:"error"`
+			ErrorDetail struct {
+				Message string `json:"message"`
+			} `json:"errorDetail"`
+		}
+		if err := json.Unmarshal(line, &msg); err != nil {
+			fmt.Fprintln(out, string(line))
+			continue
+		}
+		if msg.Error != "" || msg.ErrorDetail.Message != "" {
+			if msg.ErrorDetail.Message != "" {
+				fmt.Fprintln(out, msg.ErrorDetail.Message)
+			} else {
+				fmt.Fprintln(out, msg.Error)
+			}
+			continue
+		}
+		if msg.Stream != "" {
+			fmt.Fprint(out, msg.Stream)
+			continue
+		}
+		if msg.Status != "" {
+			if msg.ID != "" {
+				fmt.Fprintf(out, "%s: %s\n", msg.ID, msg.Status)
+			} else {
+				fmt.Fprintln(out, msg.Status)
+			}
+		}
+	}
+	return s.Err()
 }
 
 // ContainerExists reports whether a container with the given name exists
@@ -205,8 +291,10 @@ func (r *Runner) Prepare(spec Spec) (*preparedContainer, error) {
 		Tty:          false,
 		ExposedPorts: exposedPorts,
 	}
+	binds := []string{fmt.Sprintf("%s:%s:rw", spec.Source, MountTarget)}
+	binds = append(binds, spec.Volumes...)
 	hostConfig := &mobycontainer.HostConfig{
-		Binds:        []string{fmt.Sprintf("%s:%s:rw", spec.Source, MountTarget)},
+		Binds:        binds,
 		NetworkMode:  networkMode,
 		PortBindings: portBindings,
 		Init:         &init,
@@ -428,6 +516,16 @@ func (s *ExecSession) Wait(ctx context.Context) (int, error) {
 }
 
 // Exec runs a command inside the named container and attaches its streams.
+// RemoveVolume removes a named Docker volume.
+func (r *Runner) RemoveVolume(ctx context.Context, name string, force bool) error {
+	cli, err := r.newClient(ctx)
+	if err != nil {
+		return err
+	}
+	_, err = cli.VolumeRemove(ctx, name, mobyclient.VolumeRemoveOptions{Force: force})
+	return err
+}
+
 func (r *Runner) Exec(ctx context.Context, name string, cmd []string, tty bool) (*ExecSession, error) {
 	cli, err := r.newClient(ctx)
 	if err != nil {

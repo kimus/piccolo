@@ -164,25 +164,32 @@ func TestSetChannelEnabled(t *testing.T) {
 
 func TestPatchModel(t *testing.T) {
 	d := parse(t)
-	PatchModel(d, "gpt-5.4", "openai/gpt-5.4", "sk-new", "")
-	PatchModel(d, "llama", "ollama/llama3", "", "http://192.168.1.5:11434/v1")
+	PatchModel(d, "gpt-5.4", "openai", "gpt-5.4", "sk-new", "")
+	// A redundant "<provider>/" prefix on model is stripped (explicit-provider form).
+	PatchModel(d, "llama", "ollama", "ollama/llama3", "", "http://192.168.1.5:11434/v1")
 
 	models := Models(d)
 	if len(models) != 2 {
 		t.Fatalf("models = %+v", models)
 	}
-	if models[0].Alias != "gpt-5.4" || models[0].APIBase != "" {
+	if models[0].Alias != "gpt-5.4" || models[0].Provider != "openai" || models[0].Model != "gpt-5.4" || models[0].APIBase != "" {
 		t.Errorf("update: %+v", models[0])
 	}
 	if !models[0].KeySet {
 		t.Error("key not set")
 	}
-	if models[1].Alias != "llama" || models[1].APIBase == "" {
-		t.Errorf("add: %+v", models[1])
+	if models[1].Alias != "llama" || models[1].Provider != "ollama" || models[1].Model != "llama3" || models[1].APIBase == "" {
+		t.Errorf("add (want provider ollama + stripped model llama3): %+v", models[1])
 	}
 	out := string(d.Marshal())
 	if !strings.Contains(out, `"sk-new"`) {
 		t.Error("api key not written")
+	}
+	if !strings.Contains(out, `"provider": "openai"`) {
+		t.Error("explicit provider not written")
+	}
+	if strings.Contains(out, `"ollama/llama3"`) {
+		t.Error("provider prefix was not stripped from model")
 	}
 	// Existing entry position preserved (still before tools key etc).
 	if strings.Index(out, `"gpt-5.4"`) > strings.Index(out, `"llama"`) {
@@ -202,13 +209,78 @@ func TestTools(t *testing.T) {
 	SetTool(d, "exec", true)
 	SetTool(d, "spawn", true)
 	SetTool(d, "subagent", true)
+	SetTool(d, "load_image", true)
 	st = GetTools(d)
-	if st.Exec == nil || !*st.Exec || st.Spawn == nil || !*st.Spawn {
+	if st.Exec == nil || !*st.Exec || st.Spawn == nil || !*st.Spawn || st.LoadImage == nil || !*st.LoadImage {
 		t.Errorf("after set: %+v", st)
 	}
 	out := string(d.Marshal())
 	if !strings.Contains(out, `"provider": "auto"`) {
 		t.Error("tools.web extra fields must survive toggle of exec")
+	}
+}
+
+func TestExecAllowRemote(t *testing.T) {
+	d := parse(t)
+	st := GetTools(d)
+	if st.ExecAllowRemote != nil {
+		t.Fatalf("initial ExecAllowRemote = %v, want nil", *st.ExecAllowRemote)
+	}
+	SetExecAllowRemote(d, true)
+	st = GetTools(d)
+	if st.ExecAllowRemote == nil || !*st.ExecAllowRemote {
+		t.Fatalf("ExecAllowRemote after set = %+v", st.ExecAllowRemote)
+	}
+	out := string(d.Marshal())
+	if !strings.Contains(out, `"allow_remote": true`) {
+		t.Fatalf("allow_remote not written: %s", out)
+	}
+	if !strings.Contains(out, `"enabled": false`) {
+		t.Fatal("setting allow_remote must not drop existing exec.enabled")
+	}
+	if !strings.Contains(out, `"provider": "auto"`) {
+		t.Error("tools.web extra fields must survive allow_remote change")
+	}
+}
+
+func TestToolFeedback(t *testing.T) {
+	d := parse(t)
+	if got := ToolFeedbackEnabled(d); got != nil {
+		t.Fatalf("initial tool_feedback = %v, want nil", *got)
+	}
+	SetToolFeedback(d, true)
+	if got := ToolFeedbackEnabled(d); got == nil || !*got {
+		t.Fatalf("tool_feedback not enabled")
+	}
+	out := string(d.Marshal())
+	if !strings.Contains(out, `"tool_feedback"`) || !strings.Contains(out, `"max_args_length": 300`) {
+		t.Fatalf("tool_feedback shape not written: %s", out)
+	}
+	SetToolFeedback(d, false)
+	if got := ToolFeedbackEnabled(d); got == nil || *got {
+		t.Fatalf("tool_feedback not disabled")
+	}
+	out = string(d.Marshal())
+	if !strings.Contains(out, `"enabled": false`) || !strings.Contains(out, `"model_name": "gpt-5.4"`) {
+		t.Fatalf("tool_feedback disabled shape wrong or defaults lost: %s", out)
+	}
+}
+
+func TestDefaultImageModel(t *testing.T) {
+	d := parse(t)
+	if got := DefaultImageModel(d); got != "" {
+		t.Fatalf("initial image_model = %q, want empty", got)
+	}
+	SetDefaultImageModel(d, "gpt-5.4")
+	if got := DefaultImageModel(d); got != "gpt-5.4" {
+		t.Fatalf("image_model = %q", got)
+	}
+	out := string(d.Marshal())
+	if !strings.Contains(out, `"image_model": "gpt-5.4"`) {
+		t.Fatalf("image_model not written: %s", out)
+	}
+	if !strings.Contains(out, `"model_name": "gpt-5.4"`) {
+		t.Fatal("existing defaults fields should survive")
 	}
 }
 

@@ -47,7 +47,7 @@ func newStatusCmd() *cobra.Command {
 		Short: "Show container and gateway health state",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			out := cmd.OutOrStdout()
-			name, _, runner, ctx, err := containerContext(cmd)
+			name, dir, runner, ctx, err := containerContext(cmd)
 			if err != nil {
 				return err
 			}
@@ -77,6 +77,12 @@ func newStatusCmd() *cobra.Command {
 			fmt.Fprintf(out, "health:    %s → %s\n", healthURL, status)
 			if body != "" {
 				fmt.Fprintf(out, "           %s\n", body)
+			}
+			// Report the web console only when it is enabled (a :18800 binding).
+			if m, merr := manifest.Load(filepath.Join(dir, workspace.ManifestName)); merr == nil {
+				if webURL := webConsoleURL(m); webURL != "" {
+					fmt.Fprintf(out, "web:       %s\n", webURL)
+				}
 			}
 			return nil
 		},

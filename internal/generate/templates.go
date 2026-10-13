@@ -35,23 +35,32 @@ func toolsFor(role string, in Inputs) []string {
 			tools = append(tools, "web_search", "web_fetch")
 		}
 	}
+	addImage := func() {
+		tools = append(tools, "load_image")
+	}
 	switch role {
 	case "main":
 		addWeb()
-		tools = append(tools, "message", "read_file", "list_dir", "spawn", "subagent")
+		tools = append(tools, "message", "read_file", "list_dir")
+		addImage()
+		tools = append(tools, "spawn", "subagent")
 	case "research":
 		addWeb()
 		tools = append(tools, "message", "read_file")
+		addImage()
 	case "planner":
 		addWeb()
 		tools = append(tools, "message", "read_file")
+		addImage()
 	case "coder":
 		tools = append(tools, "message", "read_file", "write_file", "edit_file", "list_dir")
+		addImage()
 		if in.ShellExec {
 			tools = append(tools, "exec")
 		}
 	case "ops":
 		tools = append(tools, "message", "read_file", "list_dir")
+		addImage()
 		if in.ShellExec {
 			tools = append(tools, "exec")
 		}
@@ -121,6 +130,7 @@ live in memory/MEMORY.md inside your workspace, managed by PicoClaw.
 - %[5]s
 - Verify before asserting; use tools when action is required.
 - Keep personal context up to date in memory/MEMORY.md when something seems memorable.
+- For exact file decoding, extraction, parsing, and metadata tasks, use the active file-handling skill instead of guessing from vision or prose inspection.
 `, in.AssistantName, in.OwnerName, purposeBlurb(in.Purpose), specialistList(in.Specialists), toneLine(in.Purpose))
 	default:
 		desc = specialistDesc(role)
@@ -135,11 +145,62 @@ live in memory/MEMORY.md inside your workspace, managed by PicoClaw.
 - %[4]s
 - You are invoked by the coordinator agent; return focused, actionable results.
 - Stay inside your specialty; hand other work back to the coordinator.
+- For exact file decoding, extraction, parsing, and metadata tasks, use the active file-handling skill instead of guessing from vision or prose inspection.
 `, role, in.AssistantName, specialistMission(role, in), toneLine(in.Purpose))
 	}
 
-	return fmt.Sprintf("---\nname: %s\ndescription: %s\ntools: [%s]\n---\n\n%s",
-		name, desc, strings.Join(tools, ", "), body)
+	return fmt.Sprintf("---\nname: %s\ndescription: %s\ntools: [%s]\nskills: [%s]\n---\n\n%s",
+		name, desc, strings.Join(tools, ", "), FileHandlingSkillName, body)
+}
+
+// FileHandlingSkillName is the generated PicoClaw skill that teaches agents how
+// to perform exact extraction/decoding/parsing for common file types.
+const FileHandlingSkillName = "file-handling"
+
+// FileHandlingSkillMD renders the workspace skill loaded by PicoClaw when an
+// agent declares skills: [file-handling] in AGENT.md frontmatter.
+func FileHandlingSkillMD() string {
+	return `---
+name: file-handling
+description: Read, decode, extract, parse, and inspect common file types using deterministic tools instead of guessing from vision.
+---
+
+# File Handling
+
+Use this skill when the user asks to read, decode, extract, parse, inspect, or interpret a file or image and exact contents matter.
+
+## Principles
+
+- Use image understanding for visual descriptions.
+- Use deterministic tools for exact payloads, URLs, identifiers, numbers, tables, metadata, or structured data.
+- Do not guess exact hidden or machine-readable contents from vision alone.
+- In the Piccolo custom runtime, file-handling tools are installed at container startup and available directly on PATH from any working directory: ` + "`zbarimg`" + `, ` + "`file`" + `, ` + "`identify`" + `, ` + "`magick`" + `, ` + "`convert`" + `, ` + "`python3`" + `, ` + "`pdftotext`" + `, ` + "`pdfinfo`" + `, ` + "`pdftoppm`" + `, ` + "`pdftocairo`" + `, ` + "`tesseract`" + `, ` + "`soffice`" + `, ` + "`libreoffice`" + `, ` + "`pandoc`" + `, ` + "`jq`" + `, ` + "`yq`" + `, ` + "`xmllint`" + `, ` + "`exiftool`" + `, ` + "`ffprobe`" + `, ` + "`ffmpeg`" + `, ` + "`sqlite3`" + `, ` + "`unzip`" + `, ` + "`7z`" + `. Call them directly with relative or absolute paths; they behave like ordinary commands.
+- Do not use ` + "`apt-get`" + ` (the base image is Alpine) and do not guess exact contents from vision.
+- Prefer the deterministic CLI tools above over Python image libraries. Do not import ` + "`cv2`" + ` for QR/barcode/OCR/image normalization unless the user explicitly asks for OpenCV-style processing or the simpler tools fail.
+- If a tool is unexpectedly missing, run ` + "`piccolo-setup-tools`" + ` once to (re)install and relink the toolset, then retry. Do not attempt other package managers.
+- Do not ask the user before using routine file-handling utilities needed for the requested task. Ask only if exec is unavailable, the setup fails, the package is unusually invasive/heavy, the operation could alter user data, or the request is ambiguous.
+- Uploaded media arrives under ` + "`/tmp/picoclaw_media/<name>`" + ` and is readable; use the real path shown in the message's ` + "`[image:/path]`" + ` or ` + "`[file:/path]`" + ` tag directly as an input path.
+- Write derived outputs/intermediates under the current workspace, for example ` + "`./work`" + `, ` + "`./converted`" + `, or ` + "`./ocr`" + `. Do not write outputs to generic ` + "`/tmp`" + ` paths and do not use ` + "`../`" + ` traversal. If a command is blocked by the safety guard, retry with media paths only as inputs and workspace-relative output directories.
+- Report installation, extraction, parsing, or decoding failures clearly.
+
+## Common mappings
+
+- QR/barcode image: run ` + "`zbarimg --quiet --raw <image-path>`" + ` (package ` + "`zbar`" + `); return the decoded text exactly. If quality is poor, preprocess into ` + "`./work`" + ` with ` + "`magick`" + ` or ` + "`convert`" + `, then retry ` + "`zbarimg`" + `.
+- Screenshot/image text: inspect with ` + "`file`" + `/` + "`identify`" + `, optionally normalize with ` + "`magick`" + `, then OCR with ` + "`tesseract <image-path> stdout`" + `.
+- Text PDF: inspect with ` + "`pdfinfo <file.pdf>`" + `, then extract with ` + "`pdftotext <file.pdf> -`" + `.
+- Scanned/image PDF: render pages into a workspace directory with ` + "`pdftoppm`" + ` or ` + "`pdftocairo`" + `, then OCR with ` + "`tesseract`" + `.
+- DOCX/ODT/EPUB/office documents: use ` + "`pandoc <file> -t plain`" + ` or unzip/XML inspection for text-only extraction; use ` + "`soffice --headless --convert-to ... --outdir ./converted <file>`" + ` / ` + "`libreoffice`" + ` when rendered conversion is needed.
+- CSV/TSV: parse with Python or another structured parser, not visual guessing.
+- JSON: parse with ` + "`jq`" + ` or Python.
+- YAML: parse with ` + "`yq`" + ` or Python YAML tooling.
+- XML/SVG: parse with ` + "`xmllint`" + ` or Python; inspect SVG as XML unless visual rendering is needed.
+- Archives: list contents first and do not blindly extract unsafe or untrusted paths.
+- Image metadata: inspect with ` + "`exiftool`" + ` when exact EXIF/GPS/camera data matters.
+- Audio/video/media: inspect with ` + "`ffprobe`" + ` or extract frames/audio with ` + "`ffmpeg`" + ` before OCR, vision, or transcription.
+- SQLite databases: query with ` + "`sqlite3`" + `.
+- Logs/source code: search and parse with text tools or code.
+- Unknown files: identify first with ` + "`file <path>`" + `.
+`
 }
 
 func specialistList(specs []string) string {

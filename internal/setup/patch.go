@@ -1,17 +1,21 @@
 package setup
 
 import (
+	"encoding/json"
+	"fmt"
+	"strings"
+
 	"github.com/kimus/piccolo/internal/configdoc"
 )
 
 // ChannelInfo is the summarized state of one channel_list entry.
 type ChannelInfo struct {
-	Name      string
-	Type      string
-	Enabled   bool
-	TokenSet  bool // best-effort: any settings key holding a non-empty string secret
-	Unknown   bool // type not recognized by piccolo's registry
-	Mentions  bool // group_trigger.mention_only
+	Name     string
+	Type     string
+	Enabled  bool
+	TokenSet bool // best-effort: any settings key holding a non-empty string secret
+	Unknown  bool // type not recognized by piccolo's registry
+	Mentions bool // group_trigger.mention_only
 }
 
 // Channels lists channel_list entries in document order.
@@ -134,6 +138,7 @@ func SetChannelEnabled(doc *configdoc.Doc, name string, enabled bool) {
 // ModelInfo summarizes one model_list entry for menus.
 type ModelInfo struct {
 	Alias    string
+	Provider string
 	Model    string
 	KeySet   bool
 	APIBase  string
@@ -158,6 +163,7 @@ func Models(doc *configdoc.Doc) []ModelInfo {
 		}
 		info := ModelInfo{Index: i}
 		info.Alias, _ = m.GetString("model_name")
+		info.Provider, _ = m.GetString("provider")
 		info.Model, _ = m.GetString("model")
 		info.APIBase, _ = m.GetString("api_base")
 		if keys, ok := m.Get("api_keys"); ok {
@@ -172,9 +178,12 @@ func Models(doc *configdoc.Doc) []ModelInfo {
 	return out
 }
 
-// PatchModel adds or updates a model_list entry (matched by alias).
-// Empty optional values clear the corresponding field on update.
-func PatchModel(doc *configdoc.Doc, alias, model, apiKey, apiBase string) {
+// PatchModel adds or updates a model_list entry (matched by alias). Provider
+// and model are stored as separate fields (PicoClaw's preferred explicit
+// form); a redundant "<provider>/" prefix on model is stripped so it is never
+// double-prefixed. Empty optional values clear the corresponding field on
+// update.
+func PatchModel(doc *configdoc.Doc, alias, provider, model, apiKey, apiBase string) {
 	entry := configdoc.NewDoc()
 	idx := -1
 	if v, ok := doc.Get("model_list"); ok {
@@ -190,6 +199,14 @@ func PatchModel(doc *configdoc.Doc, alias, model, apiKey, apiBase string) {
 		}
 	}
 	entry.Set("model_name", alias)
+	provider = strings.TrimSpace(provider)
+	model = strings.TrimSpace(model)
+	if provider != "" {
+		model = strings.TrimSpace(strings.TrimPrefix(model, provider+"/"))
+		entry.Set("provider", provider)
+	} else {
+		entry.Delete("provider")
+	}
 	if model != "" {
 		entry.Set("model", model)
 	}
@@ -212,9 +229,10 @@ func PatchModel(doc *configdoc.Doc, alias, model, apiKey, apiBase string) {
 	}
 }
 
-// ToolsState is the enabled/unknown state of the four piccolo tool toggles.
+// ToolsState is the enabled/unknown state of the piccolo tool toggles.
 type ToolsState struct {
-	Web, Exec, Spawn, Subagent *bool
+	Web, Exec, Spawn, Subagent, LoadImage *bool
+	ExecAllowRemote                       *bool
 }
 
 func toolToggle(doc *configdoc.Doc, name string) *bool {
@@ -233,14 +251,32 @@ func toolToggle(doc *configdoc.Doc, name string) *bool {
 	return &b
 }
 
-// GetTools reads the four toggles (nil = absent/unknown).
+// GetTools reads the tool toggles (nil = absent/unknown).
 func GetTools(doc *configdoc.Doc) ToolsState {
 	return ToolsState{
-		Web:      toolToggle(doc, "web"),
-		Exec:     toolToggle(doc, "exec"),
-		Spawn:    toolToggle(doc, "spawn"),
-		Subagent: toolToggle(doc, "subagent"),
+		Web:             toolToggle(doc, "web"),
+		Exec:            toolToggle(doc, "exec"),
+		Spawn:           toolToggle(doc, "spawn"),
+		Subagent:        toolToggle(doc, "subagent"),
+		LoadImage:       toolToggle(doc, "load_image"),
+		ExecAllowRemote: execAllowRemote(doc),
 	}
+}
+
+func execAllowRemote(doc *configdoc.Doc) *bool {
+	tools, ok := doc.GetObject("tools")
+	if !ok {
+		return nil
+	}
+	exec, ok := tools.GetObject("exec")
+	if !ok {
+		return nil
+	}
+	b, ok := exec.GetBool("allow_remote")
+	if !ok {
+		return nil
+	}
+	return &b
 }
 
 // SetTool writes one toggle, creating tools.<name>.enabled if missing.
@@ -259,12 +295,162 @@ func SetTool(doc *configdoc.Doc, name string, enabled bool) {
 	tg.Set("enabled", enabled)
 }
 
-// ToolNames is the editable toggle set (matches piccolo init questions).
+// SetExecAllowRemote writes tools.exec.allow_remote, creating parents. It does
+// not imply tools.exec.enabled; callers that enable remote exec should also
+// enable the exec tool explicitly.
+func EnsureMediaReadConfig(doc *configdoc.Doc) bool {
+	changed := ensureAllowReadOutsideWorkspace(doc)
+	if EnsureToolFeedback(doc) {
+		changed = true
+	}
+	return changed
+}
+
+func ensureAllowReadOutsideWorkspace(doc *configdoc.Doc) bool {
+	agents, ok := doc.GetObject("agents")
+	if !ok {
+		agents = configdoc.NewDoc()
+		doc.Set("agents", agents)
+	}
+	defaults, ok := agents.GetObject("defaults")
+	if !ok {
+		defaults = configdoc.NewDoc()
+		agents.Set("defaults", defaults)
+	}
+	if v, ok := defaults.GetBool("allow_read_outside_workspace"); ok && v {
+		return false
+	}
+	defaults.Set("allow_read_outside_workspace", true)
+	return true
+}
+
+func jsonNumber(n int) json.Number {
+	return json.Number(fmt.Sprint(n))
+}
+
+func ToolFeedbackEnabled(doc *configdoc.Doc) *bool {
+	agents, ok := doc.GetObject("agents")
+	if !ok {
+		return nil
+	}
+	defaults, ok := agents.GetObject("defaults")
+	if !ok {
+		return nil
+	}
+	feedback, ok := defaults.GetObject("tool_feedback")
+	if !ok {
+		return nil
+	}
+	b, ok := feedback.GetBool("enabled")
+	if !ok {
+		return nil
+	}
+	return &b
+}
+
+func SetToolFeedback(doc *configdoc.Doc, enabled bool) {
+	agents, ok := doc.GetObject("agents")
+	if !ok {
+		agents = configdoc.NewDoc()
+		doc.Set("agents", agents)
+	}
+	defaults, ok := agents.GetObject("defaults")
+	if !ok {
+		defaults = configdoc.NewDoc()
+		agents.Set("defaults", defaults)
+	}
+	feedback, ok := defaults.GetObject("tool_feedback")
+	if !ok {
+		feedback = configdoc.NewDoc()
+		defaults.Set("tool_feedback", feedback)
+	}
+	feedback.Set("enabled", enabled)
+	if _, ok := feedback.Get("max_args_length"); !ok {
+		feedback.Set("max_args_length", jsonNumber(300))
+	}
+}
+
+func EnsureToolFeedback(doc *configdoc.Doc) bool {
+	agents, ok := doc.GetObject("agents")
+	if !ok {
+		agents = configdoc.NewDoc()
+		doc.Set("agents", agents)
+	}
+	defaults, ok := agents.GetObject("defaults")
+	if !ok {
+		defaults = configdoc.NewDoc()
+		agents.Set("defaults", defaults)
+	}
+	feedback, ok := defaults.GetObject("tool_feedback")
+	if !ok {
+		feedback = configdoc.NewDoc()
+		defaults.Set("tool_feedback", feedback)
+	}
+	changed := false
+	if v, _ := feedback.GetBool("enabled"); !v {
+		feedback.Set("enabled", true)
+		changed = true
+	}
+	if v, ok := feedback.Get("max_args_length"); !ok {
+		feedback.Set("max_args_length", jsonNumber(300))
+		changed = true
+	} else if n, ok := v.(json.Number); ok && n.String() != "300" {
+		feedback.Set("max_args_length", jsonNumber(300))
+		changed = true
+	}
+	return changed
+}
+
+func SetExecAllowRemote(doc *configdoc.Doc, enabled bool) {
+	tools, ok := doc.GetObject("tools")
+	if !ok {
+		tools = configdoc.NewDoc()
+		doc.Set("tools", tools)
+	}
+	exec, ok := tools.GetObject("exec")
+	if !ok {
+		exec = configdoc.NewDoc()
+		tools.Set("exec", exec)
+	}
+	exec.Set("allow_remote", enabled)
+}
+
+// DefaultImageModel returns agents.defaults.image_model.
+func DefaultImageModel(doc *configdoc.Doc) string {
+	agents, ok := doc.GetObject("agents")
+	if !ok {
+		return ""
+	}
+	defaults, ok := agents.GetObject("defaults")
+	if !ok {
+		return ""
+	}
+	model, _ := defaults.GetString("image_model")
+	return model
+}
+
+// SetDefaultImageModel writes agents.defaults.image_model, creating parents.
+func SetDefaultImageModel(doc *configdoc.Doc, alias string) {
+	agents, ok := doc.GetObject("agents")
+	if !ok {
+		agents = configdoc.NewDoc()
+		doc.Set("agents", agents)
+	}
+	defaults, ok := agents.GetObject("defaults")
+	if !ok {
+		defaults = configdoc.NewDoc()
+		agents.Set("defaults", defaults)
+	}
+	defaults.Set("image_model", alias)
+}
+
+// ToolNames is the editable toggle set exposed by piccolo setup.
 var ToolNames = []struct{ Key, Label, Help string }{
 	{"web", "Web search tools", "web_search / web_fetch"},
 	{"exec", "Shell execution", "runs commands in the container — default OFF"},
 	{"spawn", "Spawn sub-runners", "background task spawning"},
 	{"subagent", "Subagent delegation", "main agent delegating to specialists"},
+	{"load_image", "Image understanding", "load_image lets agents visually inspect local image attachments with a vision model — recommended ON"},
 }
 
 // ReadChannel extracts current values for pre-filling an edit form.
@@ -296,7 +482,7 @@ func ReadChannel(doc *configdoc.Doc, name string) (ChannelValues, bool) {
 }
 
 // ReadModel extracts a model_list entry by alias for pre-fill.
-func ReadModel(doc *configdoc.Doc, alias string) (model, apiKey, apiBase string, ok bool) {
+func ReadModel(doc *configdoc.Doc, alias string) (provider, model, apiKey, apiBase string, ok bool) {
 	for _, m := range Models(doc) {
 		if m.Alias != alias {
 			continue
@@ -304,6 +490,7 @@ func ReadModel(doc *configdoc.Doc, alias string) (model, apiKey, apiBase string,
 		v, _ := doc.Get("model_list")
 		arr, _ := v.([]configdoc.Value)
 		entry, _ := arr[m.Index].(*configdoc.Doc)
+		provider, _ = entry.GetString("provider")
 		model, _ = entry.GetString("model")
 		apiBase, _ = entry.GetString("api_base")
 		if keys, ok := entry.Get("api_keys"); ok {
@@ -311,7 +498,7 @@ func ReadModel(doc *configdoc.Doc, alias string) (model, apiKey, apiBase string,
 				apiKey, _ = kl[0].(string)
 			}
 		}
-		return model, apiKey, apiBase, true
+		return provider, model, apiKey, apiBase, true
 	}
-	return "", "", "", false
+	return "", "", "", "", false
 }
