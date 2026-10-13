@@ -75,7 +75,16 @@ type Process interface {
 	// Shutdown gracefully stops and removes the container, returning only
 	// after cleanup. ExitCode is valid afterwards.
 	Shutdown(grace time.Duration) error
+	// ExitCode is valid after Shutdown.
 	ExitCode() int
+}
+
+// Resizable is implemented by attached processes backed by a container PTY.
+// Interactive programs inside the container (integration setup wizards) need
+// the host window size, otherwise they render at the PTY default and miscount
+// rows.
+type Resizable interface {
+	Resize(ctx context.Context, height, width uint) error
 }
 
 // Runner manages container lifecycle through the container engine API.
@@ -666,6 +675,16 @@ type containerProcess struct {
 
 	mu       sync.Mutex
 	exitCode int
+}
+
+// Resize sets the container PTY size. Only meaningful for TTY-attached
+// containers; non-TTY processes ignore it.
+func (p *containerProcess) Resize(ctx context.Context, height, width uint) error {
+	if p.conn == nil || height == 0 || width == 0 {
+		return nil
+	}
+	_, err := p.cli.ContainerResize(ctx, p.id, mobyclient.ContainerResizeOptions{Height: height, Width: width})
+	return err
 }
 
 func newContainerProcess(cli client.SDKClient, id string, attach mobyclient.ContainerAttachResult, tty bool) *containerProcess {

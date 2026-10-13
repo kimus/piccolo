@@ -775,14 +775,26 @@ func runIntegrationSetup(cmd *cobra.Command, name string) error {
 		TTY:        found.SetupRequiresTTY,
 		Labels:     map[string]string{docker.LabelWorkspace: dir},
 	}
+	tty, err := enterInteractiveTerminal(spec.TTY)
+	if err != nil {
+		return fmt.Errorf("prepare terminal for interactive setup: %w", err)
+	}
+	defer tty.Restore()
+
 	proc, err := runner.Run(ctx, spec)
 	if err != nil {
 		return err
 	}
+	stopSync := syncPTYSize(ctx, proc, tty)
+	defer stopSync()
 	go func() { _, _ = io.Copy(proc.Stdin(), cmd.InOrStdin()); _ = proc.Stdin().Close() }()
 	go func() { _, _ = io.Copy(out, proc.Stdout()) }()
 	go func() { _, _ = io.Copy(cmd.ErrOrStderr(), proc.Stderr()) }()
 	code, waitErr := proc.Wait(ctx)
+	// Restore the host terminal before printing anything else, so the
+	// follow-up hints render through the normal line discipline.
+	tty.Restore()
+	stopSync()
 	shutdownErr := proc.Shutdown(0)
 	if waitErr != nil {
 		return waitErr
