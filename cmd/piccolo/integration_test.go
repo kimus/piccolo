@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -238,6 +239,24 @@ func makeBundleDir(t *testing.T, commands []string) string {
 	}
 	return root
 }
+
+func TestGithubReleaseFetcherAcceptHeaders(t *testing.T) {
+	var seen []string
+	client := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		seen = append(seen, req.Header.Get("Accept"))
+		return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader("{}")), Header: make(http.Header)}, nil
+	})}
+	g := githubReleaseFetcher{client: client}
+	_, _ = g.githubJSON(context.Background(), "https://api.github.test/json")
+	_, _ = g.httpGet(context.Background(), "https://api.github.test/bin")
+	if len(seen) != 2 || seen[0] != "application/vnd.github+json" || seen[1] != "application/octet-stream" {
+		t.Fatalf("Accept headers = %#v", seen)
+	}
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) { return f(req) }
 
 func makeBundleArchive(t *testing.T) []byte {
 	t.Helper()

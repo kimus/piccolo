@@ -87,10 +87,14 @@ func (g githubReleaseFetcher) Fetch(ctx context.Context, ref picintegration.Pack
 }
 
 func (g githubReleaseFetcher) githubJSON(ctx context.Context, url string) ([]byte, error) {
-	return g.httpGet(ctx, url)
+	return g.httpGetWithAccept(ctx, url, "application/vnd.github+json")
 }
 
 func (g githubReleaseFetcher) httpGet(ctx context.Context, url string) ([]byte, error) {
+	return g.httpGetWithAccept(ctx, url, "application/octet-stream")
+}
+
+func (g githubReleaseFetcher) httpGetWithAccept(ctx context.Context, url, accept string) ([]byte, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, err
@@ -98,7 +102,7 @@ func (g githubReleaseFetcher) httpGet(ctx context.Context, url string) ([]byte, 
 	if tok := strings.TrimSpace(os.Getenv("GITHUB_TOKEN")); tok != "" {
 		req.Header.Set("Authorization", "Bearer "+tok)
 	}
-	req.Header.Set("Accept", "application/octet-stream")
+	req.Header.Set("Accept", accept)
 	res, err := g.client.Do(req)
 	if err != nil {
 		return nil, err
