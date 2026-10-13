@@ -24,16 +24,16 @@ Verified against `github.com/sipeed/picoclaw@v0.3.1` source (present in the Go m
 - Agent workspaces: `AGENT.md` (YAML frontmatter: `name, description, tools, model, maxTurns, skills, mcpServers` — `pkg/agent/definition.go`), `SOUL.md`, `USER.md`, `memory/MEMORY.md`. Legacy `AGENTS.md` is a fallback; use `AGENT.md`.
 - Official images: `docker.io/sipeed/picoclaw:<version>` (gateway/agent) and `docker.io/sipeed/picoclaw:launcher` (web console + gateway, ports `18800`/`18790`, needs `PICOCLAW_GATEWAY_HOST=0.0.0.0`).
 - Image `/entrypoint.sh`: skips onboarding when `config.json` exists in home, removes stale `.picoclaw.pid`, then `exec picoclaw gateway "$@"`. Rely on this default entrypoint.
-- PicoClaw home also holds `auth.json`, default `workspace/`, global `skills/`, channel state — runtime writes back, so mount the WHOLE workspace dir, not just `config.json`.
+- PicoClaw home also holds `auth.json`, `.security.yml`, `.picoclaw.pid`, `logs/`, `launcher-auth.db`, default `workspace/`, global `skills/`, channel state — runtime writes back, so mount the WHOLE `picoclaw/` dir, not just `config.json`.
 - Health API: `/health` and `/ready` are **unauthenticated**; only `POST /reload` requires a bearer token (`pkg/health/server.go`). Served on `gateway.port` (default **18790**, config key `gateway.port`, env `PICOCLAW_GATEWAY_PORT`).
 - The gateway binds `localhost` by default. A process on the container's loopback is **unreachable through published ports** — when publishing, piccolo injects `PICOCLAW_GATEWAY_HOST=0.0.0.0` into the container env (unless the manifest already sets it, or network mode is `host`). Verified by smoke test.
 - Clients: the ONLY terminal client is `picoclaw agent` (readline REPL; `-m` for one-shot). There is no `picoclaw-launcher-tui` — the launcher is web-only (`picoclaw-launcher`, React dashboard :18800, proxies chat to the gateway via `/pico/ws`, spawns `picoclaw gateway -E` as its own child in the launcher image). First run: `:18800` redirects to `/launcher-setup` (create dashboard password), afterwards `/launcher-login`. Verified live: launcher image works with a pre-mounted `config.json`, the gateway health port (:18790) is served by the launcher's gateway child.
 
 ## Workspace & Mounting
 
-- Workspace = the target directory itself (default: cwd; `-D/--dir` flag overrides). NO `.piccolo/` subfolder — `piccolo.yaml`, `config.json`, `.gitignore`, `agents/` live directly inside it.
+- Workspace = the target directory itself (default: cwd; `-D/--dir` flag overrides). `piccolo.yaml` lives at the root; PicoClaw-owned files live under `picoclaw/`; integration state under `integrations/`; runtime caches under `runtime/`.
 - Workspace resolution rule is shared by ALL commands: `-D/--dir` flag, else cwd. `serve`/`doctor` fail with `no piccolo workspace found — run 'piccolo init' first` when `piccolo.yaml` is absent.
-- ONE bind mount: `<abs workspace path>` → `/root/.picoclaw`.
+- Mounts: `<workspace>/picoclaw` → `/root/.picoclaw`, `<workspace>/integrations` → `/root/.piccolo/integrations`, and local runtime cache binds from `<workspace>/runtime/{devbox,nix,media}`.
 - All `workspace` paths in `config.json` SHALL be container-side paths, e.g. `~/.picoclaw/agents/main` (image runs with `HOME=/root`; upstream defaults use `~`, tilde expansion supported).
 
 ### `piccolo.yaml` schema
@@ -99,7 +99,7 @@ Generated from wizard answers, PicoClaw schema v3. Minimum shape:
 2. Ask wizard questions: assistant name; owner name; purpose template (personal/research/coding/operations/blank); specialist agents (research, planner, coder, ops); expose the optional **web console** (`--dashboard`; gateway always runs, this only adds the launcher image + `127.0.0.1:18800` + `PICOCLAW_GATEWAY_HOST=0.0.0.0` env); model provider + model + API key (placeholder allowed with warning); web search (`--web-search`, default yes); shell exec (default no); workspace path (default cwd).
 3. Preview the generation plan (files, image, ports), then final confirmation.
 4. Write files. **Create-only**: if files exist, list them and require explicit per-file confirmation before any overwrite.
-5. Ensure `config.json` is git-ignored: create `.gitignore` or append if the entry is missing.
+5. Ensure `picoclaw/config.json`, `picoclaw/.security.yml`, `picoclaw/.picoclaw.pid`, `picoclaw/launcher-auth.db`, `picoclaw/logs/`, integration auth state, and runtime caches are git-ignored: create `.gitignore` or append if entries are missing.
 
 - Preferred prompt library: `github.com/charmbracelet/huh`. Keep wizard logic separated from file generation (upgrade path to full Bubble Tea).
 - Support non-interactive flags (`--name`, `--owner`, `--purpose`, `--yes`, ...) for scripting.
@@ -108,7 +108,7 @@ Generated from wizard answers, PicoClaw schema v3. Minimum shape:
 
 ### `piccolo doctor`
 
-Checks: Docker daemon reachable (SDK ping); image present locally (warn + pull hint if missing, not a failure); `piccolo.yaml` exists/parses strictly/pinned tag; `config.json` exists/parses/`version == 3`; `agents.list` non-empty with exactly one `default: true`; every referenced agent workspace exists **on the host** (translate `~/.picoclaw/...` → `<workspace>/...`) with parseable `AGENT.md` frontmatter; `model_list` non-empty (warn on placeholder/empty keys); every `env:VAR` ref resolves (warn); stale container with configured name (warn — `serve` will replace it); web-console consistency (a `:18800` binding paired with a non-launcher image → warn about the dead port; a disabled console is clean, never warned).
+Checks: Docker daemon reachable (SDK ping); image present locally (warn + pull hint if missing, not a failure); `piccolo.yaml` exists/parses strictly/pinned tag; structured workspace layout exists (or legacy flat-layout migration guidance is reported); `picoclaw/config.json` exists/parses/`version == 3`; `agents.list` non-empty with exactly one `default: true`; every referenced agent workspace exists **on the host** (translate `~/.picoclaw/...` → `<workspace>/picoclaw/...`) with parseable `AGENT.md` frontmatter; `model_list` non-empty (warn on placeholder/empty keys); every `env:VAR` ref resolves (warn); stale container with configured name (warn — `serve` will replace it); web-console consistency (a `:18800` binding paired with a non-launcher image → warn about the dead port; a disabled console is clean, never warned).
 
 Output: `[OK]`/`[WARN]`/`[FAIL]` status lines (see README for the exact format). Exit `0` unless any `[FAIL]`; warnings never fail.
 
@@ -197,7 +197,7 @@ Reduced tool allowlists (research: `web_search`, `web_fetch`, `read_file`; coder
 - Docker deps pinned exactly (go-sdk is pre-1.0, never float): `github.com/docker/go-sdk/client v0.1.0-alpha013`, `github.com/moby/moby/api v1.52.0`, `github.com/moby/moby/client v0.1.0`, `github.com/containerd/errdefs v1.0.0`.
 - Reuse from `../piccolo-full`: `internal/isolation/dockerapi` pattern (prepare/start split, attach-before-start, stale removal by name, pull-once, ownership labels, demuxed stdio) and the `Runner`/`Process` interfaces.
 - Deterministic generation everywhere: sorted keys, stable templates — workspace diffs must be readable.
-- Package layout: `cmd/piccolo` (CLI: root/init/doctor/serve/lifecycle/chat), `internal/manifest` (piccolo.yaml), `internal/picoclaw` (config.json schema v3), `internal/generate` (plan/render/write), `internal/doctor` (checks), `internal/docker` (SDK runner), `internal/wizard` (huh prompts), `internal/workspace` (dir resolution).
+- Package layout: `cmd/piccolo` (CLI: root/init/doctor/serve/lifecycle/chat/workspace), `internal/manifest` (piccolo.yaml), `internal/picoclaw` (config.json schema v3), `internal/generate` (plan/render/write), `internal/doctor` (checks), `internal/docker` (SDK runner), `internal/wizard` (huh prompts), `internal/workspace` (dir/layout resolution).
 
 ## Acceptance Criteria
 
@@ -219,7 +219,7 @@ Reduced tool allowlists (research: `web_search`, `web_fetch`, `read_file`; coder
 
 - **Runtime delivery**: Docker container via Go SDK — no `picoclaw` on `$PATH`.
 - **Config split**: `piccolo.yaml` = Piccolo-owned launch settings + non-secret setup metadata; `config.json` = PicoClaw runtime behavior, generated once, user-owned forever. No duplicated runtime configuration.
-- **Workspace = picoclaw home via default mount**: init writes everything directly into the workspace dir (default cwd, user-chosen); serve mounts it onto `/root/.picoclaw`. `PICOCLAW_HOME` never set. No `.piccolo/` subfolder, no `home:` key.
+- **Structured workspace + split mounts**: init writes PicoClaw-owned files under `picoclaw/`, integration state under `integrations/`, and runtime caches under `runtime/`; serve mounts `picoclaw/` onto `/root/.picoclaw` and integrations onto `/root/.piccolo/integrations`. `PICOCLAW_HOME` never set. No `home:` key.
 - **Config format**: PicoClaw reads JSON (schema v3); YAML only for `piccolo.yaml` and `AGENT.md` frontmatter.
 - **API keys**: plaintext in `config.json`; mitigated by generated `.gitignore` + doctor placeholder warnings.
 - **Serve lifecycle**: detached + health-gated (`/health` on published 127.0.0.1 port) is the default; `--foreground` for attached stdio. Gateway gets `PICOCLAW_GATEWAY_HOST=0.0.0.0` injected when ports are published (container-loopback unreachable otherwise — verified by smoke test).

@@ -49,6 +49,7 @@ type Integration struct {
 	Commands          []string `yaml:"commands,omitempty"`
 	DescriptorCommand []string `yaml:"descriptor_command,omitempty"`
 	SetupCommand      []string `yaml:"setup_command,omitempty"`
+	StatusCommand     []string `yaml:"status_command,omitempty"`
 	SetupRequiresTTY  bool     `yaml:"setup_requires_tty,omitempty"`
 	SetupPorts        []string `yaml:"setup_ports,omitempty"`
 }

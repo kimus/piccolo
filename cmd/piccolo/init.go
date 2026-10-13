@@ -13,6 +13,7 @@ import (
 	"github.com/kimus/piccolo/internal/docker"
 	"github.com/kimus/piccolo/internal/generate"
 	"github.com/kimus/piccolo/internal/wizard"
+	workspacepkg "github.com/kimus/piccolo/internal/workspace"
 )
 
 type initFlags struct {
@@ -199,6 +200,9 @@ func runInit(cmd *cobra.Command, f initFlags) error {
 	}
 
 	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	if err := workspacepkg.NewLayout(dir).EnsureDirs(); err != nil {
 		return err
 	}
 	written, skipped, err := plan.Write(dir, overwrite)

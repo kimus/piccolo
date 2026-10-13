@@ -218,8 +218,8 @@ func BuildPlan(in Inputs) (*Plan, error) {
 	if err != nil {
 		return nil, fmt.Errorf("render config.json: %w", err)
 	}
-	p.add("config.json", append(jsonBytes, '\n'))
-	p.add(filepath.Join("skills", FileHandlingSkillName, "SKILL.md"), []byte(FileHandlingSkillMD()))
+	p.add(filepath.Join("picoclaw", "config.json"), append(jsonBytes, '\n'))
+	p.add(filepath.Join("picoclaw", "skills", FileHandlingSkillName, "SKILL.md"), []byte(FileHandlingSkillMD()))
 
 	agents := append([]string{"main"}, sortedSpecialists(in.Specialists)...)
 	for _, id := range agents {
@@ -228,7 +228,7 @@ func BuildPlan(in Inputs) (*Plan, error) {
 			role = id
 		}
 		for _, f := range agentFiles(role, in) {
-			p.add(filepath.Join("agents", id, f.Rel), f.Content)
+			p.add(filepath.Join("picoclaw", "agents", id, f.Rel), f.Content)
 		}
 	}
 	return p, nil
@@ -288,7 +288,7 @@ func (p *Plan) Write(dir string, overwrite map[string]bool) (written, skipped []
 // reload token) are never committed. It reports whether a change was made.
 func EnsureGitignore(dir string) (bool, error) {
 	path := filepath.Join(dir, ".gitignore")
-	entries := []string{"config.json", ".picoclaw.pid"}
+	entries := []string{"picoclaw/config.json", "picoclaw/.security.yml", "picoclaw/.picoclaw.pid", "picoclaw/launcher-auth.db", "picoclaw/logs/", "integrations/*/auth/", "runtime/"}
 	data, err := os.ReadFile(path)
 	if err != nil && !os.IsNotExist(err) {
 		return false, err

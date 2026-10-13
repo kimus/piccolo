@@ -49,10 +49,10 @@ type Spec struct {
 	Name    string
 	Image   string
 	Network string // none | bridge | host ("" = bridge)
-	Source  string // host workspace dir (absolute), mounted to MountTarget
+	Source  string // host PicoClaw home dir (absolute), mounted to MountTarget
 	Ports   []string
 	Env     []string // KEY=value pairs, already resolved
-	Volumes []string // docker-style named volume binds, e.g. name:/path:rw
+	Volumes []string // docker-style bind mounts, e.g. /host:/path:rw or name:/path:rw
 	Labels  map[string]string
 	// Entrypoint and Command override the image defaults for one-shot helper
 	// containers. Leave empty for the PicoClaw gateway's default entrypoint.

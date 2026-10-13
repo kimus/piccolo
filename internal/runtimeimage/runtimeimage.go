@@ -31,22 +31,12 @@ const (
 	// (the PicoClaw image runs with HOME=/root). `devbox global install`
 	// populates it; DevboxGlobalBin is then added to PATH so tools resolve
 	// from any cwd.
-	DevboxGlobalDir    = "/root/.local/share/devbox/global/default"
-	DevboxGlobalBin    = DevboxGlobalDir + "/.devbox/nix/profile/default/bin"
-	DevboxGlobalVolume = "piccolo-devbox-global"
-	DevboxGlobalMount  = DevboxGlobalVolume + ":" + DevboxGlobalDir + ":rw"
+	DevboxGlobalDir = "/root/.local/share/devbox/global/default"
+	DevboxGlobalBin = DevboxGlobalDir + "/.devbox/nix/profile/default/bin"
 
-	// NixCacheVolume persists the Nix store that the global profile symlinks
-	// point into. Without it the installed tools' store paths would vanish on
-	// container recreation.
-	NixCacheVolume = "piccolo-devbox-nix-cache"
-	NixCacheMount  = NixCacheVolume + ":/nix:rw"
-
-	// MediaVolume mirrors PicoClaw's ephemeral upload dir into each agent
-	// workspace so deterministic tools can read channel attachments.
-	MediaVolume    = "piccolo-media"
-	MediaTempDir   = "/tmp/picoclaw_media"
-	MediaTempMount = MediaVolume + ":" + MediaTempDir + ":rw"
+	// MediaTempDir is mirrored from workspace runtime/media so deterministic
+	// tools can read channel attachments.
+	MediaTempDir = "/tmp/picoclaw_media"
 
 	// SetupScriptPath is baked into the image and run by `piccolo serve` after
 	// the gateway is healthy. It installs the Devbox packages and symlinks each
@@ -336,9 +326,11 @@ func renderIntegrationInstallBlock(integrations []Integration) string {
 	}
 	return fmt.Sprintf(`COPY piccolo-integrations-devbox.json /opt/piccolo/integrations/devbox.json
 RUN cd /opt/piccolo/integrations \
+ && echo "Installing integration packages with Devbox/Nix; this can take several minutes on first run..." \
  && devbox install \
+ && echo "Finalizing integration commands; this may take a moment..." \
  && eval "$(devbox shellenv)" \
- && for tool in %s; do bin="$(command -v "$tool")"; ln -sf "$(readlink -f "$bin")" /usr/local/bin/"$tool"; done
+ && for tool in %s; do bin="$(command -v "$tool")"; install -m 0755 "$(readlink -f "$bin")" /usr/local/bin/"$tool"; done
 %s`, strings.Join(shellQuoteList(commands), " "), verify.String())
 }
 

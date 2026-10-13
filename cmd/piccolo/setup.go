@@ -75,7 +75,8 @@ func runSetup(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	path := filepath.Join(dir, "config.json")
+	layout := workspace.NewLayout(dir)
+	path := layout.Config()
 	doc, err := configdoc.Load(path)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -215,7 +216,7 @@ func (st *setupState) homeMenu() (string, error) {
 				huh.NewOption(fmt.Sprintf("Tools      (%s)", toolSummary), "tools"),
 				huh.NewOption(fmt.Sprintf("Container  (web console: %s)", yesNo(st.webConsoleEnabled())), "container"),
 				huh.NewOption("Agents       (not editable yet — edit config.json manually)", "__agents__"),
-				huh.NewOption("Identity     (not editable yet — edit agents/*/SOUL.md manually)", "__identity__"),
+				huh.NewOption("Identity     (not editable yet — edit picoclaw/agents/*/SOUL.md manually)", "__identity__"),
 				huh.NewOption("Quit", "__quit__"),
 			).
 			Value(&choice),
@@ -225,7 +226,7 @@ func (st *setupState) homeMenu() (string, error) {
 	}
 	switch choice {
 	case "__agents__", "__identity__":
-		fmt.Fprintln(st.out, "Agents/Identity editing is not implemented yet — edit config.json / piccolo.yaml directly; piccolo doctor validates your changes.")
+		fmt.Fprintln(st.out, "Agents/Identity editing is not implemented yet — edit picoclaw/config.json / piccolo.yaml directly; piccolo doctor validates your changes.")
 		return "__back__", nil
 	}
 	return choice, nil
@@ -1247,11 +1248,12 @@ func (st *setupState) agentWorkspaceDirs() []string {
 	return dirs
 }
 
-func setupWorkspacePath(workspace, containerPath string) (string, bool) {
+func setupWorkspacePath(workspaceRoot, containerPath string) (string, bool) {
 	p := strings.TrimSpace(containerPath)
+	layout := workspace.NewLayout(workspaceRoot)
 	for _, prefix := range []string{"~/.picoclaw/", "/root/.picoclaw/"} {
 		if rest, ok := strings.CutPrefix(p, prefix); ok {
-			return filepath.Join(workspace, filepath.FromSlash(rest)), true
+			return filepath.Join(layout.PicoclawHome(), filepath.FromSlash(rest)), true
 		}
 	}
 	return "", false

@@ -28,7 +28,7 @@ func TestUpdateAgentSkillsFrontmatter(t *testing.T) {
 
 func TestSyncEnabledToolWorkspaceChangesAddsDevboxJSON(t *testing.T) {
 	dir := t.TempDir()
-	agentDir := filepath.Join(dir, "agents", "main")
+	agentDir := filepath.Join(dir, "picoclaw", "agents", "main")
 	if err := os.MkdirAll(agentDir, 0o755); err != nil {
 		t.Fatal(err)
 	}

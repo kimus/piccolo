@@ -59,16 +59,16 @@ func TestBuildPlanFiles(t *testing.T) {
 	}
 	want := []string{
 		"piccolo.yaml",
-		"config.json",
-		"skills/file-handling/SKILL.md",
-		"agents/main/AGENT.md",
-		"agents/main/SOUL.md",
-		"agents/main/USER.md",
-		"agents/main/memory/MEMORY.md",
-		"agents/planner/AGENT.md",
-		"agents/planner/SOUL.md",
-		"agents/research/AGENT.md",
-		"agents/research/SOUL.md",
+		"picoclaw/config.json",
+		"picoclaw/skills/file-handling/SKILL.md",
+		"picoclaw/agents/main/AGENT.md",
+		"picoclaw/agents/main/SOUL.md",
+		"picoclaw/agents/main/USER.md",
+		"picoclaw/agents/main/memory/MEMORY.md",
+		"picoclaw/agents/planner/AGENT.md",
+		"picoclaw/agents/planner/SOUL.md",
+		"picoclaw/agents/research/AGENT.md",
+		"picoclaw/agents/research/SOUL.md",
 	}
 	rels := map[string]bool{}
 	for _, f := range p.Files {
@@ -238,7 +238,7 @@ func TestAgentMDFrontmatter(t *testing.T) {
 	}
 	var mainMD string
 	for _, f := range p.Files {
-		if f.Rel == "agents/main/AGENT.md" {
+		if f.Rel == "picoclaw/agents/main/AGENT.md" {
 			mainMD = string(f.Content)
 		}
 	}
@@ -259,7 +259,7 @@ func TestFileHandlingSkillGenerated(t *testing.T) {
 	}
 	var skillMD string
 	for _, f := range p.Files {
-		if f.Rel == "skills/file-handling/SKILL.md" {
+		if f.Rel == "picoclaw/skills/file-handling/SKILL.md" {
 			skillMD = string(f.Content)
 		}
 	}
@@ -330,7 +330,7 @@ func TestWriteIsCreateOnly(t *testing.T) {
 	}
 
 	// Modify one file; a second write without overwrite must keep it.
-	target := filepath.Join(dir, "config.json")
+	target := filepath.Join(dir, "picoclaw", "config.json")
 	if err := os.WriteFile(target, []byte(`{"user":"edited"}`), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -347,11 +347,11 @@ func TestWriteIsCreateOnly(t *testing.T) {
 	}
 
 	// Explicit overwrite replaces it.
-	written, skipped, err = p.Write(dir, map[string]bool{"config.json": true})
+	written, skipped, err = p.Write(dir, map[string]bool{"picoclaw/config.json": true})
 	if err != nil {
 		t.Fatalf("third Write: %v", err)
 	}
-	if len(written) != 1 || written[0] != "config.json" || len(skipped) != len(p.Files)-1 {
+	if len(written) != 1 || written[0] != "picoclaw/config.json" || len(skipped) != len(p.Files)-1 {
 		t.Fatalf("third write: written=%v skipped=%v", written, skipped)
 	}
 }
@@ -364,7 +364,7 @@ func TestEnsureGitignore(t *testing.T) {
 		t.Fatalf("create: changed=%v err=%v", changed, err)
 	}
 	data, _ := os.ReadFile(filepath.Join(dir, ".gitignore"))
-	if strings.TrimSpace(string(data)) != "config.json\n.picoclaw.pid" {
+	if strings.TrimSpace(string(data)) != "picoclaw/config.json\npicoclaw/.security.yml\npicoclaw/.picoclaw.pid\npicoclaw/launcher-auth.db\npicoclaw/logs/\nintegrations/*/auth/\nruntime/" {
 		t.Fatalf("gitignore = %q", data)
 	}
 
@@ -381,18 +381,18 @@ func TestEnsureGitignore(t *testing.T) {
 		t.Fatalf("append: changed=%v err=%v", changed, err)
 	}
 	data, _ = os.ReadFile(filepath.Join(dir2, ".gitignore"))
-	if string(data) != "*.log\nconfig.json\n.picoclaw.pid\n" {
+	if string(data) != "*.log\npicoclaw/config.json\npicoclaw/.security.yml\npicoclaw/.picoclaw.pid\npicoclaw/launcher-auth.db\npicoclaw/logs/\nintegrations/*/auth/\nruntime/\n" {
 		t.Fatalf("appended gitignore = %q", data)
 	}
 
 	// Partially covered file: only the missing entry is appended.
-	os.WriteFile(filepath.Join(dir2, ".gitignore"), []byte("config.json\n"), 0o644)
+	os.WriteFile(filepath.Join(dir2, ".gitignore"), []byte("picoclaw/config.json\n"), 0o644)
 	changed, err = EnsureGitignore(dir2)
 	if err != nil || !changed {
 		t.Fatalf("partial append: changed=%v err=%v", changed, err)
 	}
 	data, _ = os.ReadFile(filepath.Join(dir2, ".gitignore"))
-	if string(data) != "config.json\n.picoclaw.pid\n" {
+	if string(data) != "picoclaw/config.json\npicoclaw/.security.yml\npicoclaw/.picoclaw.pid\npicoclaw/launcher-auth.db\npicoclaw/logs/\nintegrations/*/auth/\nruntime/\n" {
 		t.Fatalf("partial appended gitignore = %q", data)
 	}
 }

@@ -50,6 +50,14 @@ func initWorkspace(t *testing.T) string {
 	if _, _, err := plan.Write(dir, nil); err != nil {
 		t.Fatalf("Write: %v", err)
 	}
+	if err := os.MkdirAll(filepath.Join(dir, "integrations"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, rel := range []string{filepath.Join("runtime", "devbox"), filepath.Join("runtime", "nix"), filepath.Join("runtime", "media")} {
+		if err := os.MkdirAll(filepath.Join(dir, rel), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
 	return dir
 }
 
@@ -165,7 +173,7 @@ func TestDoctorMissingManifest(t *testing.T) {
 
 func TestDoctorMissingAgentFile(t *testing.T) {
 	dir := initWorkspace(t)
-	os.Remove(filepath.Join(dir, "agents", "research", "AGENT.md"))
+	os.Remove(filepath.Join(dir, "picoclaw", "agents", "research", "AGENT.md"))
 	results := Run(context.Background(), Options{Workspace: dir, Engine: fakeEngine{imageExists: true}})
 	if !Failed(results) {
 		t.Fatal("expected failure for missing AGENT.md")
@@ -346,7 +354,7 @@ func TestDoctorImageUnderstandingWarnings(t *testing.T) {
 	}
 
 	dir = initWorkspace(t)
-	agentPath := filepath.Join(dir, "agents", "main", "AGENT.md")
+	agentPath := filepath.Join(dir, "picoclaw", "agents", "main", "AGENT.md")
 	data, err := os.ReadFile(agentPath)
 	if err != nil {
 		t.Fatal(err)
@@ -393,7 +401,7 @@ func TestDoctorImageModelReferenceMustExist(t *testing.T) {
 func TestTranslateWorkspacePath(t *testing.T) {
 	for _, in := range []string{"~/.picoclaw/agents/main", "/root/.picoclaw/agents/main"} {
 		got, ok := translateWorkspacePath("/ws", in)
-		if !ok || got != filepath.Join("/ws", "agents", "main") {
+		if !ok || got != filepath.Join("/ws", "picoclaw", "agents", "main") {
 			t.Errorf("%s -> %s, %v", in, got, ok)
 		}
 	}
@@ -405,7 +413,7 @@ func TestTranslateWorkspacePath(t *testing.T) {
 // patchConfig rewrites config.json through a generic map mutation.
 func patchConfig(t *testing.T, dir string, mutate func(map[string]any)) {
 	t.Helper()
-	path := filepath.Join(dir, "config.json")
+	path := filepath.Join(dir, "picoclaw", "config.json")
 	data, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)

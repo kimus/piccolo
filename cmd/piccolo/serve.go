@@ -9,7 +9,6 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -76,11 +75,18 @@ func preflight(cmd *cobra.Command) (*serveContext, error) {
 		return nil, fmt.Errorf("docker daemon not reachable: %w", err)
 	}
 
-	m, err := manifest.Load(filepath.Join(dir, workspace.ManifestName))
+	layout := workspace.NewLayout(dir)
+	m, err := manifest.Load(layout.Manifest())
 	if err != nil {
 		return nil, err
 	}
-	cfgData, err := os.ReadFile(filepath.Join(dir, "config.json"))
+	if workspace.IsLegacyFlat(dir) {
+		return nil, fmt.Errorf("legacy flat workspace layout detected — run 'piccolo workspace migrate' first")
+	}
+	if err := layout.EnsureDirs(); err != nil {
+		return nil, err
+	}
+	cfgData, err := os.ReadFile(layout.Config())
 	if err != nil {
 		return nil, fmt.Errorf("read config.json: %w (run 'piccolo init' first?)", err)
 	}
@@ -113,17 +119,17 @@ func preflight(cmd *cobra.Command) (*serveContext, error) {
 		env = withGatewayHost(env)
 	}
 
-	volumes := []string(nil)
+	volumes := []string{layout.IntegrationBind()}
 	if runtimeimage.IsLocalRuntimeImage(m.Container.Image) {
-		volumes = append(volumes, runtimeimage.DevboxGlobalMount, runtimeimage.NixCacheMount, runtimeimage.MediaTempMount)
-		volumes = append(volumes, agentMediaMirrorMounts(cfg)...)
+		volumes = append(volumes, layout.RuntimeBinds()...)
+		volumes = append(volumes, agentMediaMirrorMounts(layout, cfg)...)
 	}
 
 	spec := docker.Spec{
 		Name:    m.Container.Name,
 		Image:   m.Container.Image,
 		Network: m.Container.Network,
-		Source:  dir,
+		Source:  layout.PicoclawHome(),
 		Ports:   ports,
 		Env:     env,
 		Volumes: volumes,
@@ -174,7 +180,7 @@ func withGatewayHost(env []string) []string {
 
 // hasContainerPort reports whether any published binding already maps the
 // given container port.
-func agentMediaMirrorMounts(cfg picoclaw.Config) []string {
+func agentMediaMirrorMounts(layout workspace.Layout, cfg picoclaw.Config) []string {
 	seen := map[string]bool{}
 	var mounts []string
 	defaultWS := cfg.Agents.Defaults.Workspace
@@ -192,7 +198,7 @@ func agentMediaMirrorMounts(cfg picoclaw.Config) []string {
 			continue
 		}
 		seen[target] = true
-		mounts = append(mounts, runtimeimage.MediaVolume+":"+target+":rw")
+		mounts = append(mounts, layout.RuntimeMedia()+":"+target+":rw")
 	}
 	return mounts
 }

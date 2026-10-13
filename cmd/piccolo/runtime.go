@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"path/filepath"
+	"os"
 	"strings"
 	"time"
 
@@ -77,7 +77,7 @@ func runtimeManifest() (string, *manifest.Manifest, manifest.Toolchain, error) {
 	if err != nil {
 		return "", nil, manifest.Toolchain{}, err
 	}
-	m, err := manifest.Load(filepath.Join(dir, workspace.ManifestName))
+	m, err := manifest.Load(workspace.NewLayout(dir).Manifest())
 	if err != nil {
 		return "", nil, manifest.Toolchain{}, err
 	}
@@ -191,17 +191,24 @@ func runRuntimePrune(cmd *cobra.Command) error {
 
 func runRuntimeResetCache(cmd *cobra.Command, f runtimeFlags) error {
 	out := cmd.OutOrStdout()
-	if !f.yes {
-		return fmt.Errorf("reset-cache is destructive; re-run with --yes to remove %s and %s", runtimeimage.DevboxGlobalVolume, runtimeimage.NixCacheVolume)
+	dir, err := workspace.Require(dirFlag)
+	if err != nil {
+		return err
 	}
-	r := docker.New()
-	ctx := cmd.Context()
-	for _, v := range []string{runtimeimage.DevboxGlobalVolume, runtimeimage.NixCacheVolume} {
-		if err := r.RemoveVolume(ctx, v, true); err != nil {
-			fmt.Fprintf(out, "  [WARN] remove volume %s: %v\n", v, err)
+	layout := workspace.NewLayout(dir)
+	if !f.yes {
+		return fmt.Errorf("reset-cache is destructive; re-run with --yes to remove %s", layout.Runtime())
+	}
+	for _, path := range []string{layout.RuntimeDevbox(), layout.RuntimeNix(), layout.RuntimeMedia()} {
+		if err := os.RemoveAll(path); err != nil {
+			fmt.Fprintf(out, "  [WARN] remove %s: %v\n", path, err)
 			continue
 		}
-		fmt.Fprintf(out, "  removed volume %s\n", v)
+		if err := os.MkdirAll(path, 0o755); err != nil {
+			fmt.Fprintf(out, "  [WARN] recreate %s: %v\n", path, err)
+			continue
+		}
+		fmt.Fprintf(out, "  reset %s\n", path)
 	}
 	fmt.Fprintln(out, "Runtime cache reset. Next 'piccolo serve' or 'piccolo restart' will reinstall the configured toolchain.")
 	return nil

@@ -26,7 +26,14 @@ func TestResolveExplicitGithub(t *testing.T) {
 }
 
 func TestParseDescriptorValidation(t *testing.T) {
-	_, err := ParseDescriptor([]byte(`{"schema":"piccolo.integration.v1","name":"gws","displayName":"Google Workspace","setup":{"command":["piccolo-gws","setup"],"requiresTty":true,"ports":["127.0.0.1:8000:8000"]},"commands":["piccolo-gws"]}`))
+	desc, err := ParseDescriptor([]byte(`{"schema":"piccolo.integration.v1","name":"gws","displayName":"Google Workspace","setup":{"command":["piccolo-gws","setup"],"requiresTty":true,"ports":["127.0.0.1:8000:8000"]},"commands":{"setup":{"command":"piccolo-gws","args":["setup"]},"status":{"command":"piccolo-gws","args":["status","--json"]}}}`))
+	if err != nil {
+		t.Fatalf("ParseDescriptor valid: %v", err)
+	}
+	if got := desc.StatusCommand; len(got) != 3 || got[0] != "piccolo-gws" || got[1] != "status" || got[2] != "--json" {
+		t.Fatalf("status command = %#v", got)
+	}
+	_, err = ParseDescriptor([]byte(`{"schema":"piccolo.integration.v1","name":"gws","displayName":"Google Workspace","setup":{"command":["piccolo-gws","setup"],"requiresTty":true,"ports":["127.0.0.1:8000:8000"]},"commands":["piccolo-gws"]}`))
 	if err != nil {
 		t.Fatalf("ParseDescriptor valid: %v", err)
 	}

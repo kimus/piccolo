@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"path/filepath"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -79,7 +78,7 @@ func newStatusCmd() *cobra.Command {
 				fmt.Fprintf(out, "           %s\n", body)
 			}
 			// Report the web console only when it is enabled (a :18800 binding).
-			if m, merr := manifest.Load(filepath.Join(dir, workspace.ManifestName)); merr == nil {
+			if m, merr := manifest.Load(workspace.NewLayout(dir).Manifest()); merr == nil {
 				if webURL := webConsoleURL(m); webURL != "" {
 					fmt.Fprintf(out, "web:       %s\n", webURL)
 				}
@@ -134,7 +133,7 @@ func containerContext(cmd *cobra.Command) (string, string, *docker.Runner, conte
 	if err != nil {
 		return "", "", nil, nil, err
 	}
-	m, err := manifest.Load(filepath.Join(dir, workspace.ManifestName))
+	m, err := manifest.Load(workspace.NewLayout(dir).Manifest())
 	if err != nil {
 		return "", "", nil, nil, err
 	}
@@ -147,7 +146,7 @@ func healthURLFor(cmd *cobra.Command) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	data, err := os.ReadFile(filepath.Join(dir, "config.json"))
+	data, err := os.ReadFile(workspace.NewLayout(dir).Config())
 	if err != nil {
 		return "", err
 	}

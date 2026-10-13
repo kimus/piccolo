@@ -6,6 +6,7 @@ import (
 
 	"github.com/kimus/piccolo/internal/manifest"
 	"github.com/kimus/piccolo/internal/picoclaw"
+	"github.com/kimus/piccolo/internal/workspace"
 )
 
 func TestAgentMediaMirrorMounts(t *testing.T) {
@@ -16,10 +17,11 @@ func TestAgentMediaMirrorMounts(t *testing.T) {
 			{ID: "research", Workspace: "~/.picoclaw/agents/research"},
 		},
 	}}
-	mounts := agentMediaMirrorMounts(cfg)
+	layout := workspace.NewLayout("/ws")
+	mounts := agentMediaMirrorMounts(layout, cfg)
 	want := []string{
-		"piccolo-media:/root/.picoclaw/agents/main/media:rw",
-		"piccolo-media:/root/.picoclaw/agents/research/media:rw",
+		"/ws/runtime/media:/root/.picoclaw/agents/main/media:rw",
+		"/ws/runtime/media:/root/.picoclaw/agents/research/media:rw",
 	}
 	if strings.Join(mounts, "\n") != strings.Join(want, "\n") {
 		t.Fatalf("mounts = %#v, want %#v", mounts, want)

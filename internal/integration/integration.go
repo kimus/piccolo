@@ -16,13 +16,14 @@ const SchemaV1 = "piccolo.integration.v1"
 
 // Descriptor is returned by an installed integration's `describe --json` command.
 type Descriptor struct {
-	Schema       string                 `json:"schema"`
-	Name         string                 `json:"name"`
-	DisplayName  string                 `json:"displayName,omitempty"`
-	Commands     CommandList            `json:"commands,omitempty"`
-	CommandSpecs map[string]CommandSpec `json:"-"`
-	Setup        SetupDescriptor        `json:"setup"`
-	Metadata     map[string]string      `json:"metadata,omitempty"`
+	Schema        string                 `json:"schema"`
+	Name          string                 `json:"name"`
+	DisplayName   string                 `json:"displayName,omitempty"`
+	Commands      CommandList            `json:"commands,omitempty"`
+	CommandSpecs  map[string]CommandSpec `json:"-"`
+	Setup         SetupDescriptor        `json:"setup"`
+	StatusCommand []string               `json:"-"`
+	Metadata      map[string]string      `json:"metadata,omitempty"`
 }
 
 type CommandSpec struct {
@@ -51,6 +52,9 @@ func ParseDescriptor(data []byte) (Descriptor, error) {
 		if setup, ok := d.CommandSpecs["setup"]; ok {
 			d.Setup.Command = setup.argv()
 		}
+	}
+	if status, ok := d.CommandSpecs["status"]; ok {
+		d.StatusCommand = status.argv()
 	}
 	if len(d.Commands) == 0 {
 		for _, spec := range d.CommandSpecs {

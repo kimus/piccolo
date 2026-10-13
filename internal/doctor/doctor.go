@@ -19,6 +19,7 @@ import (
 	"github.com/kimus/piccolo/internal/manifest"
 	"github.com/kimus/piccolo/internal/picoclaw"
 	"github.com/kimus/piccolo/internal/runtimeimage"
+	"github.com/kimus/piccolo/internal/workspace"
 )
 
 // Engine is the narrow Docker surface doctor needs.
@@ -108,6 +109,29 @@ func Run(ctx context.Context, opts Options) []Result {
 		return results
 	}
 	add(OK, "manifest: piccolo.yaml")
+	layout := workspace.NewLayout(opts.Workspace)
+	if workspace.IsLegacyFlat(opts.Workspace) {
+		add(FAIL, "workspace layout: legacy flat layout detected — run 'piccolo workspace migrate'")
+	} else if _, err := os.Stat(layout.PicoclawHome()); err != nil {
+		add(FAIL, "workspace layout: missing picoclaw/ directory — run 'piccolo init' or 'piccolo workspace migrate'")
+	} else {
+		missing := []string{}
+		for _, dir := range []struct{ label, path string }{
+			{"integrations/", layout.Integrations()},
+			{"runtime/devbox/", layout.RuntimeDevbox()},
+			{"runtime/nix/", layout.RuntimeNix()},
+			{"runtime/media/", layout.RuntimeMedia()},
+		} {
+			if st, err := os.Stat(dir.path); err != nil || !st.IsDir() {
+				missing = append(missing, dir.label)
+			}
+		}
+		if len(missing) > 0 {
+			add(WARN, "workspace layout: missing %s — run 'piccolo workspace migrate --yes' or 'piccolo serve' to create runtime dirs", strings.Join(missing, ", "))
+		} else {
+			add(OK, "workspace layout: structured")
+		}
+	}
 
 	// 3. Image presence (warning only).
 	if opts.Engine != nil {
@@ -155,7 +179,7 @@ func Run(ctx context.Context, opts Options) []Result {
 	}
 
 	// 6. PicoClaw config.
-	configPath := filepath.Join(opts.Workspace, "config.json")
+	configPath := layout.Config()
 	data, err := os.ReadFile(configPath)
 	if err != nil {
 		add(FAIL, "picoclaw config: %v", err)
@@ -554,12 +578,13 @@ func hasTool(tools []string, want string) bool {
 
 // translateWorkspacePath maps a container-side workspace path (e.g.
 // ~/.picoclaw/agents/main or /root/.picoclaw/agents/main) onto the host
-// workspace directory.
-func translateWorkspacePath(workspace, containerPath string) (string, bool) {
+// picoclaw/ directory.
+func translateWorkspacePath(workspaceRoot, containerPath string) (string, bool) {
 	p := strings.TrimSpace(containerPath)
+	layout := workspace.NewLayout(workspaceRoot)
 	for _, prefix := range []string{"~/.picoclaw/", "/root/.picoclaw/"} {
 		if rest, ok := strings.CutPrefix(p, prefix); ok {
-			return filepath.Join(workspace, filepath.FromSlash(rest)), true
+			return filepath.Join(layout.PicoclawHome(), filepath.FromSlash(rest)), true
 		}
 	}
 	return "", false

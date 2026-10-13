@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"path/filepath"
 	"strings"
 	"time"
 
@@ -79,7 +78,8 @@ func runImageBuild(cmd *cobra.Command, f imageBuildFlags) error {
 	if err != nil {
 		return err
 	}
-	manifestPath := filepath.Join(dir, workspace.ManifestName)
+	layout := workspace.NewLayout(dir)
+	manifestPath := layout.Manifest()
 	m, err := manifest.Load(manifestPath)
 	if err != nil {
 		return err

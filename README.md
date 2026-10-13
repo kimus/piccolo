@@ -36,13 +36,13 @@ piccolo stop      stop and remove the container
              │ writes once (init), then user-owned
              ▼
 ┌─────────────────────────────────────────┐
-│ workspace dir (default: current dir;    │
-│   mounted as picoclaw home in container)│
+│ workspace dir (default: current dir)    │
 │   piccolo.yaml       (piccolo-owned)    │
-│   config.json        (picoclaw config)  │
-│   agents/*/AGENT.md ...                 │
+│   picoclaw/          (PicoClaw home)    │
+│   integrations/      (integration state)│
+│   runtime/           (tool/cache data)  │
 └────────────┬────────────────────────────┘
-             │ bind-mounted → /root/.picoclaw
+             │ bind-mounted into container
              ▼
 ┌────────────────────────────┐
 │ Docker container           │
@@ -87,23 +87,35 @@ The gateway always runs. If you enabled the optional **web console** (launcher i
 
 ## Workspace layout
 
-`piccolo init` writes everything **directly into the workspace directory** (default: current directory; choose another with the wizard or `-D/--dir`):
+`piccolo init` creates a structured workspace (default: current directory; choose another with the wizard or `-D/--dir`):
 
 ```text
 <workspace>/
-  piccolo.yaml     # piccolo launch config (YAML, piccolo-owned)
-  config.json      # PicoClaw config (JSON schema v3, generated once, then yours)
-  .gitignore       # created/appended by init (ignores config.json — it holds API keys)
-  agents/
-    main/          # coordinator agent (always)
-      AGENT.md  SOUL.md  USER.md  memory/MEMORY.md
-    research/      # optional specialists
-    planner/
-    coder/
-    ops/
+  piccolo.yaml       # Piccolo-owned launch config and non-secret setup metadata
+  .gitignore         # ignores secrets and runtime caches
+  picoclaw/          # PicoClaw-owned home, mounted to /root/.picoclaw
+    config.json      # PicoClaw config (JSON schema v3, generated once, then yours)
+    .security.yml    # optional PicoClaw secret overlay (git-ignored)
+    launcher-auth.db # web launcher auth DB when dashboard is enabled (git-ignored)
+    logs/            # PicoClaw gateway/launcher logs (git-ignored)
+    agents/
+      main/          # coordinator agent (always)
+        AGENT.md  SOUL.md  USER.md  memory/MEMORY.md
+      research/      # optional specialists
+      planner/
+      coder/
+      ops/
+  integrations/      # integration-owned state, mounted to /root/.piccolo/integrations
+    gws/
+      auth/
+      backend.json
+  runtime/           # workspace-visible caches for the local runtime image
+    devbox/          # -> /root/.local/share/devbox/global/default
+    nix/             # -> /nix
+    media/           # -> /tmp/picoclaw_media and agent media mirrors
 ```
 
-The whole directory is bind-mounted to `/root/.picoclaw` in the container (PicoClaw's default home — `PICOCLAW_HOME` is never set). PicoClaw writes back into it at runtime (`auth.json`, memory updates, session/channel state), so everything persists across `serve` restarts.
+Mount ownership is intentionally split: `/root/.picoclaw` is PicoClaw's home only (including PicoClaw runtime files like `.security.yml`, `logs/`, and `launcher-auth.db`), while integration packages persist their state under `/root/.piccolo/integrations/<name>` (for Google Workspace, `<name>` is `gws`). Runtime cache directories can grow; use `piccolo runtime prune` for Nix garbage collection in a running container or `piccolo runtime reset-cache --yes` to delete/recreate the workspace `runtime/` caches.
 
 ## Configuration ownership
 
@@ -112,9 +124,9 @@ There is **no duplicated configuration** between the two files:
 | File | Owner | Contents |
 |---|---|---|
 | `piccolo.yaml` | Piccolo | Container launch config plus non-secret setup metadata |
-| `config.json` | You (after init) | PicoClaw runtime behavior: agents, models, tools, channels, tokens |
+| `picoclaw/config.json` | You (after init) | PicoClaw runtime behavior: agents, models, tools, channels, tokens |
 
-`config.json` and the agent files are generated **once** by `piccolo init` and are yours afterwards — edit them directly to change models, add agents, or tune tools. Piccolo never silently regenerates or overwrites them.
+`picoclaw/config.json` and the agent files are generated **once** by `piccolo init` and are yours afterwards — edit them directly to change models, add agents, or tune tools. Piccolo never silently regenerates or overwrites them.
 
 ### `piccolo.yaml`
 
@@ -154,11 +166,38 @@ Containerized integrations are self-describing packages baked into the gateway i
 piccolo integration add gws
 piccolo integration setup gws
 piccolo restart
+
+# later, rebuild the installed integration from its recorded ref
+piccolo integration upgrade gws
+piccolo restart
+
+# verify provider connectivity
+piccolo integration status gws
 ```
 
 `add` resolves aliases such as `gws` to an integration package reference, asks before building third-party code into the runtime image, runs the installed binary's `describe --json` in a container, and records Piccolo-owned integration metadata in `piccolo.yaml`. It does **not** patch provider-specific `config.json` entries.
 
-`setup` runs the integration-owned setup command in a one-shot container from the configured image with the workspace mounted at `/root/.picoclaw`. The integration owns provider prompts, auth, state files, and any `config.json` merge-patching. After setup, run `piccolo restart`.
+`setup` runs the integration-owned setup command in a one-shot container from the configured image with `picoclaw/` mounted at `/root/.picoclaw` and `integrations/` mounted at `/root/.piccolo/integrations`. The integration owns provider prompts, auth, state files, and any `config.json` merge-patching. After setup, run `piccolo restart`.
+
+`upgrade <name>` rebuilds a newly selected runtime image from the installed integration's recorded ref, validates the upgraded integration descriptor, and updates `piccolo.yaml` only after the build and descriptor check succeed. It preserves state under `integrations/<name>` and does **not** rerun setup automatically:
+
+```sh
+piccolo integration upgrade gws       # rebuild just gws, preserving other installed integrations in the image
+piccolo integration upgrade --all     # rebuild and refresh descriptors for every installed integration
+piccolo integration upgrade gws --to github:kimus/piccolo-gws?ref=v0.2.0
+```
+
+Unpinned refs such as `github:kimus/piccolo-gws` may resolve newer code on each upgrade, so Piccolo prints a warning before rebuilding. Rerun `piccolo integration setup <name>` only when the upgraded integration's release notes or setup output says reconfiguration is needed; otherwise `piccolo restart` is enough to use the new image.
+
+`status <name>` runs the integration-owned connectivity checks in a one-shot container and renders provider-specific results through a generic Piccolo status format. For Google Workspace, this is where Gmail, Calendar, and Drive connectivity is checked:
+
+```sh
+piccolo integration status gws
+piccolo integration status --all
+piccolo integration status gws --json
+```
+
+Piccolo itself stays provider-neutral: if a check fails, the integration supplies the service-specific message and remediation. Status uses the same structured mounts as setup (`picoclaw/` and `integrations/`) and can run even when the gateway is stopped.
 
 Integration authors provide an executable whose descriptor command returns JSON like:
 
@@ -169,7 +208,7 @@ Integration authors provide an executable whose descriptor command returns JSON 
   "displayName": "Google Workspace",
   "commands": ["piccolo-gws"],
   "setup": {
-    "command": ["piccolo-gws", "setup", "--config-dir", "/root/.picoclaw/integrations/google"],
+    "command": ["piccolo-gws", "setup", "--config-dir", "/root/.piccolo/integrations/gws"],
     "requiresTty": true,
     "ports": ["127.0.0.1:8000:8000"]
   }
@@ -246,7 +285,7 @@ piccolo restart
 
 The build uses the configured pinned PicoClaw image as its base, generates a temporary/in-memory Docker build context, and tags a local image such as `piccolo/picoclaw-runtime:<hash>`. It does not require a public Piccolo image registry. Omit `--set` to leave `piccolo.yaml` unchanged; Piccolo will print the `container.image` value to adopt manually.
 
-The image is intentionally **lean**: it installs only the Devbox binary, the `nixbld` build group/users Nix needs, and a `piccolo-setup-tools` script. The tools themselves are **not** baked into the image. On the first `piccolo serve`/`restart` after the gateway is healthy, Piccolo applies the `runtime.toolchain` section from `piccolo.yaml`; installed packages and the Nix store persist in two named volumes (`piccolo-devbox-global` and `piccolo-devbox-nix-cache`), so later restarts are near-instant.
+The image is intentionally **lean**: it installs only the Devbox binary, the `nixbld` build group/users Nix needs, and a `piccolo-setup-tools` script. The tools themselves are **not** baked into the image. On the first `piccolo serve`/`restart` after the gateway is healthy, Piccolo applies the `runtime.toolchain` section from `piccolo.yaml`; installed packages and the Nix store persist in workspace-visible directories (`runtime/devbox` and `runtime/nix`), so later restarts are near-instant and cache size is inspectable from the host.
 
 ```yaml
 runtime:
@@ -257,7 +296,7 @@ runtime:
 
 `piccolo-setup-tools` writes the configured package list to Devbox, runs `devbox install`, then resolves each configured command's real `/nix/store` binary via `devbox shellenv` and symlinks it into `/usr/local/bin`. The tools thus become ordinary PATH commands that work from **any** working directory with relative or absolute args, with no per-call Devbox overhead. This routes around two Devbox limitations verified in this daemon-less Nix container: `devbox global install` links only a subset of binaries into the profile `bin`, and `devbox run` always cds to the project root (breaking relative paths). The `nixbld` group is baked into the image because it lives in `/etc/group`, which is ephemeral and otherwise resets on container recreation (breaking Nix after a restart). A future Piccolo-maintained public image can replace this local image by editing `piccolo.yaml`.
 
-Use `piccolo runtime status` to inspect configured/live commands, `piccolo runtime apply` to reconcile a running container after editing `runtime.toolchain`, `piccolo runtime prune` to attempt Nix garbage collection, and `piccolo runtime reset-cache --yes` to remove the persisted Devbox/Nix volumes for a clean reinstall.
+Use `piccolo runtime status` to inspect configured/live commands, `piccolo runtime apply` to reconcile a running container after editing `runtime.toolchain`, `piccolo runtime prune` to attempt Nix garbage collection, and `piccolo runtime reset-cache --yes` to remove/recreate the persisted `runtime/{devbox,nix,media}` directories for a clean reinstall.
 
 For QR codes the Devbox package is `zbar`; other common mappings include image normalization with ImageMagick (`magick`, `convert`, `identify`), OCR with `tesseract`, PDF inspection/rendering with Poppler (`pdfinfo`, `pdftotext`, `pdftoppm`, `pdftocairo`), office conversion with LibreOffice (`soffice`/`libreoffice`), structured data parsing with Python/`jq`/`yq`/`xmllint`, archive listing before extraction, EXIF inspection with `exiftool`, and media inspection with `ffprobe`/`ffmpeg`. The skill tells agents to call these directly, avoid OpenCV/`cv2` unless explicitly needed, write intermediates under the workspace, and never use `apt-get` (the base image is Alpine).
 
@@ -288,7 +327,7 @@ Validates the setup and prints `[OK]` / `[WARN]` / `[FAIL]` lines:
 [OK]   picoclaw config: config.json (schema v3)
 [OK]   agent: main (default)
 [WARN] model "gpt-5.4" has placeholder API key
-[FAIL] missing agent file: agents/research/AGENT.md
+[FAIL] missing agent file: picoclaw/agents/research/AGENT.md
 ```
 
 Exit code is non-zero only on `[FAIL]`; warnings never fail.

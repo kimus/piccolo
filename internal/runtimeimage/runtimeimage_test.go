@@ -51,7 +51,7 @@ func TestBuildPlanWithIntegrationsInstallsAtBuildTime(t *testing.T) {
 	if err != nil {
 		t.Fatalf("BuildPlan: %v", err)
 	}
-	for _, want := range []string{"piccolo-integrations-devbox.json", "github:kimus/piccolo-gws", "devbox install", "command -v 'piccolo-gws'"} {
+	for _, want := range []string{"piccolo-integrations-devbox.json", "github:kimus/piccolo-gws", "Installing integration packages with Devbox/Nix", "devbox install", "Finalizing integration commands", "install -m 0755", "command -v 'piccolo-gws'"} {
 		if !strings.Contains(p.Dockerfile+p.IntegrationsJSON, want) {
 			t.Errorf("integration plan missing %q", want)
 		}

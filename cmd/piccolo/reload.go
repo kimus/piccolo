@@ -7,7 +7,6 @@ import (
 	"io"
 	"net/http"
 	"os"
-	"path/filepath"
 	"strings"
 	"time"
 
@@ -52,7 +51,7 @@ func runReload(cmd *cobra.Command) error {
 		return err
 	}
 
-	pf, err := readPidFile(filepath.Join(dir, pidFileRel))
+	pf, err := readPidFile(workspace.NewLayout(dir).PidFile())
 	if err != nil {
 		return err
 	}

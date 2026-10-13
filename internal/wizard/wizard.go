@@ -20,15 +20,15 @@ type Prefill struct {
 	Purpose       string
 	Specialists   []string
 	// Dashboard is the optional web-console choice; nil means "ask".
-	Dashboard     *bool
-	Provider      string
-	Model         string
-	ModelAlias    string
-	APIKey        string
-	APIBase       string
-	WebSearch     *bool
-	ShellExec     *bool
-	Workspace     string
+	Dashboard  *bool
+	Provider   string
+	Model      string
+	ModelAlias string
+	APIKey     string
+	APIBase    string
+	WebSearch  *bool
+	ShellExec  *bool
+	Workspace  string
 }
 
 // Run presents the wizard and returns validated generation inputs plus the
@@ -156,7 +156,7 @@ func Run(pre Prefill) (generate.Inputs, string, error) {
 		workspace = "."
 		groups = append(groups, huh.NewGroup(
 			huh.NewInput().Title("Workspace path").
-				Description("Where piccolo.yaml, config.json and agents/ are created").
+				Description("Where piccolo.yaml, picoclaw/, integrations/, and runtime/ are created").
 				Placeholder(".").
 				Value(&workspace),
 		))
