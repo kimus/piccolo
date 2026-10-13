@@ -372,8 +372,9 @@ func ensureDevboxTools(ctx context.Context, sc *serveContext) {
 		return
 	}
 	defer session.Close()
-	// Discard the verbose Nix download output; report only the outcome.
-	_ = docker.Demux(session.Reader, io.Discard, io.Discard)
+	progress := newSetupProgressWriter(sc.stdout)
+	_ = docker.Demux(session.Reader, progress, progress)
+	progress.Flush()
 	code, err := session.Wait(installCtx)
 	if err != nil {
 		fmt.Fprintf(sc.stdout, "  [WARN] tool setup interrupted: %v\n", err)
@@ -384,6 +385,47 @@ func ensureDevboxTools(ctx context.Context, sc *serveContext) {
 		return
 	}
 	fmt.Fprintf(sc.stdout, "  \u2713 devbox tools ready\n")
+}
+
+type setupProgressWriter struct {
+	out     io.Writer
+	buf     strings.Builder
+	lastLog time.Time
+}
+
+func newSetupProgressWriter(out io.Writer) *setupProgressWriter {
+	return &setupProgressWriter{out: out, lastLog: time.Now().Add(-10 * time.Second)}
+}
+
+func (w *setupProgressWriter) Write(p []byte) (int, error) {
+	for _, r := range string(p) {
+		if r == '\r' || r == '\n' {
+			w.emit(false)
+			continue
+		}
+		w.buf.WriteRune(r)
+	}
+	return len(p), nil
+}
+
+func (w *setupProgressWriter) Flush() { w.emit(true) }
+
+func (w *setupProgressWriter) emit(force bool) {
+	line := strings.TrimSpace(w.buf.String())
+	w.buf.Reset()
+	if line == "" {
+		return
+	}
+	lower := strings.ToLower(line)
+	interesting := strings.Contains(lower, "install") || strings.Contains(lower, "building") || strings.Contains(lower, "copying") || strings.Contains(lower, "downloading") || strings.Contains(lower, "finished") || strings.Contains(lower, "error") || strings.Contains(lower, "warning")
+	if !force && !interesting && time.Since(w.lastLog) < 5*time.Second {
+		return
+	}
+	if len(line) > 160 {
+		line = line[:157] + "..."
+	}
+	fmt.Fprintf(w.out, "  setup: %s\n", line)
+	w.lastLog = time.Now()
 }
 
 // dumpLogs prints the last N log lines of the container to stderr.
