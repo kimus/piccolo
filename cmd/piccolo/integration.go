@@ -143,7 +143,7 @@ func runIntegrationAdd(cmd *cobra.Command, input string, f integrationFlags) err
 		Name:              desc.Name,
 		DisplayName:       desc.DisplayName,
 		Ref:               resolved.Ref,
-		Commands:          desc.Commands,
+		Commands:          []string(desc.Commands),
 		DescriptorCommand: resolved.DescriptorCommand,
 		SetupCommand:      desc.Setup.Command,
 		SetupRequiresTTY:  desc.Setup.RequiresTTY,
