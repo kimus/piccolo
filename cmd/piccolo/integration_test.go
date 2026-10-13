@@ -237,6 +237,93 @@ func TestIntegrationBuildSourceWarnsAndBuilds(t *testing.T) {
 	}
 }
 
+func TestIntegrationStatusRendersReportOnNonZeroExit(t *testing.T) {
+	dir := t.TempDir()
+	writeIntegrationManifest(t, dir, []manifest.Integration{{Package: "github:kimus/piccolo-gws", Source: "release", Name: "gws", DisplayName: "Google Workspace", StatusCommand: []string{"piccolo-gws", "status", "--json"}}})
+	payload := `{"schema":"piccolo.integration.status.v1","name":"gws","status":"fail","summary":"checks failed","checks":[{"id":"gmail","label":"Gmail","status":"fail","message":"not authenticated","remediation":"run setup"}]}`
+	fake := &fakeIntegrationRunner{stdout: payload, code: 1}
+	old := newIntegrationRunner
+	newIntegrationRunner = func() integrationRunner { return fake }
+	defer func() { newIntegrationRunner = old }()
+	oldDir := dirFlag
+	dirFlag = dir
+	defer func() { dirFlag = oldDir }()
+
+	var out bytes.Buffer
+	err := runIntegrationStatus(testCommand(&out), "kimus/piccolo-gws", integrationStatusFlags{})
+	if err == nil || !strings.Contains(err.Error(), "checks failed") {
+		t.Fatalf("expected failed-checks error, got %v", err)
+	}
+	body := out.String()
+	if !strings.Contains(body, "Gmail") || !strings.Contains(body, "not authenticated") {
+		t.Fatalf("report not rendered: %q", body)
+	}
+	if strings.Contains(body, "command exited") {
+		t.Fatalf("opaque exit error leaked into output: %q", body)
+	}
+}
+
+func TestIntegrationStatusJSONOnNonZeroExit(t *testing.T) {
+	dir := t.TempDir()
+	writeIntegrationManifest(t, dir, []manifest.Integration{{Package: "github:kimus/piccolo-gws", Source: "release", Name: "gws", StatusCommand: []string{"piccolo-gws", "status", "--json"}}})
+	payload := `{"schema":"piccolo.integration.status.v1","name":"gws","status":"fail","summary":"checks failed","checks":[{"id":"drive","label":"Drive","status":"fail","message":"api disabled"}]}`
+	fake := &fakeIntegrationRunner{stdout: payload, code: 1, stderr: "noise"}
+	old := newIntegrationRunner
+	newIntegrationRunner = func() integrationRunner { return fake }
+	defer func() { newIntegrationRunner = old }()
+	oldDir := dirFlag
+	dirFlag = dir
+	defer func() { dirFlag = oldDir }()
+
+	var out bytes.Buffer
+	err := runIntegrationStatus(testCommand(&out), "kimus/piccolo-gws", integrationStatusFlags{json: true})
+	if err == nil {
+		t.Fatal("expected non-zero exit for failing checks")
+	}
+	if !strings.Contains(out.String(), "piccolo.integration.status.v1") || !strings.Contains(out.String(), "api disabled") {
+		t.Fatalf("json payload not emitted: %q", out.String())
+	}
+}
+
+func TestIntegrationStatusExitWithoutReportIsInvocationFailure(t *testing.T) {
+	dir := t.TempDir()
+	writeIntegrationManifest(t, dir, []manifest.Integration{{Package: "github:kimus/piccolo-gws", Source: "release", Name: "gws", StatusCommand: []string{"piccolo-gws", "status", "--json"}}})
+	fake := &fakeIntegrationRunner{stdout: "boom: unrecognized subcommand", stderr: "parse error", code: 2}
+	old := newIntegrationRunner
+	newIntegrationRunner = func() integrationRunner { return fake }
+	defer func() { newIntegrationRunner = old }()
+	oldDir := dirFlag
+	dirFlag = dir
+	defer func() { dirFlag = oldDir }()
+
+	var out bytes.Buffer
+	err := runIntegrationStatus(testCommand(&out), "kimus/piccolo-gws", integrationStatusFlags{})
+	if err == nil || !strings.Contains(err.Error(), "exited 2") {
+		t.Fatalf("expected invocation failure, got %v", err)
+	}
+}
+
+func TestIntegrationStatusHealthyExitRendersNormally(t *testing.T) {
+	dir := t.TempDir()
+	writeIntegrationManifest(t, dir, []manifest.Integration{{Package: "github:kimus/piccolo-gws", Source: "release", Name: "gws", StatusCommand: []string{"piccolo-gws", "status", "--json"}}})
+	payload := `{"schema":"piccolo.integration.status.v1","name":"gws","status":"ok","summary":"all good","checks":[{"id":"gmail","label":"Gmail","status":"ok","message":"connected"}]}`
+	fake := &fakeIntegrationRunner{stdout: payload, code: 0}
+	old := newIntegrationRunner
+	newIntegrationRunner = func() integrationRunner { return fake }
+	defer func() { newIntegrationRunner = old }()
+	oldDir := dirFlag
+	dirFlag = dir
+	defer func() { dirFlag = oldDir }()
+
+	var out bytes.Buffer
+	if err := runIntegrationStatus(testCommand(&out), "kimus/piccolo-gws", integrationStatusFlags{}); err != nil {
+		t.Fatalf("healthy status: %v", err)
+	}
+	if !strings.Contains(out.String(), "all good") {
+		t.Fatalf("output = %q", out.String())
+	}
+}
+
 func writeIntegrationManifest(t *testing.T, dir string, integrations []manifest.Integration) {
 	t.Helper()
 	m := manifest.Manifest{Version: 1, Container: manifest.Container{Image: "piccolo/picoclaw-runtime:old", Name: "piccolo-gateway", Network: "bridge"}, Runtime: manifest.Runtime{Integrations: integrations}}

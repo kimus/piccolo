@@ -224,6 +224,8 @@ piccolo integration status kimus/piccolo-gws --json
 
 Piccolo itself stays provider-neutral: if a check fails, the integration supplies the service-specific message and remediation. Status uses the same structured mounts as setup (`picoclaw/` and `integrations/`) and can run even when the gateway is stopped.
 
+A failing report is not a Piccolo error: integrations signal unhealthy checks by exiting non-zero while printing their status document, so Piccolo renders the full report (and emits JSON with `--json`) and then exits non-zero itself. Only unparseable or missing output is reported as an invocation failure.
+
 Integration authors publish release bundles plus provide an executable whose descriptor command returns JSON like:
 
 ```json

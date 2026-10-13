@@ -517,16 +517,33 @@ func integrationStatusResult(ctx context.Context, runner integrationRunner, layo
 		}, nil
 	}
 	entrypoint, command := splitEntrypointCommand(item.StatusCommand)
-	data, err := runContainerCapture(ctx, runner, docker.Spec{Image: image, Source: layout.PicoclawHome(), Volumes: integrationSetupBinds(layout), Entrypoint: entrypoint, Command: command, Env: nil, Labels: map[string]string{docker.LabelWorkspace: workspaceRoot}})
+	stdout, stderr, code, err := runContainerCaptureWithExitCode(ctx, runner, docker.Spec{Image: image, Source: layout.PicoclawHome(), Volumes: integrationSetupBinds(layout), Entrypoint: entrypoint, Command: command, Env: nil, Labels: map[string]string{docker.LabelWorkspace: workspaceRoot}})
 	if err != nil {
 		return picintegration.StatusResult{}, fmt.Errorf("status integration %s: %w", item.Name, err)
 	}
-	res, err := picintegration.ParseStatus(data)
-	if err != nil {
-		return picintegration.StatusResult{}, fmt.Errorf("parse integration status for %s: %w", item.Name, err)
+	// An integration signals unhealthy checks by exiting non-zero while printing
+	// a valid report. Prefer the report; only treat it as an invocation failure
+	// when stdout is not a parseable status payload.
+	res, parseErr := picintegration.ParseStatus(stdout)
+	if parseErr != nil {
+		if code != 0 {
+			return picintegration.StatusResult{}, fmt.Errorf("status integration %s: command exited %d: %s", item.Name, code, strings.TrimSpace(string(stderr)))
+		}
+		return picintegration.StatusResult{}, fmt.Errorf("parse integration status for %s: %w", item.Name, parseErr)
 	}
 	if res.Name != item.Name {
 		return picintegration.StatusResult{}, fmt.Errorf("integration %q status reported name %q", item.Name, res.Name)
+	}
+	if code != 0 && res.Status != "fail" {
+		// Keep the unhealthy exit visible in both human and JSON output.
+		res.Checks = append(res.Checks, picintegration.StatusCheck{
+			ID:          "exit-code",
+			Label:       "Status command",
+			Status:      "fail",
+			Message:     fmt.Sprintf("status command exited %d", code),
+			Remediation: "Inspect the failing checks above; the integration reported an unhealthy state.",
+		})
+		res.Status = "fail"
 	}
 	return res, nil
 }
@@ -781,9 +798,24 @@ func runIntegrationSetup(cmd *cobra.Command, name string) error {
 }
 
 func runContainerCapture(ctx context.Context, runner integrationRunner, spec docker.Spec) ([]byte, error) {
-	proc, err := runner.Run(ctx, spec)
+	stdout, stderr, code, err := runContainerCaptureWithExitCode(ctx, runner, spec)
 	if err != nil {
 		return nil, err
+	}
+	if code != 0 {
+		return nil, fmt.Errorf("command exited %d: %s", code, strings.TrimSpace(string(stderr)))
+	}
+	return stdout, nil
+}
+
+// runContainerCaptureWithExitCode captures a one-shot container's output and its
+// exit code. A non-zero exit is NOT an error here: integrations legitimately
+// exit non-zero to report failing checks (see 'piccolo integration status').
+// Only transport-level failures (run/wait/shutdown) return an error.
+func runContainerCaptureWithExitCode(ctx context.Context, runner integrationRunner, spec docker.Spec) ([]byte, []byte, int, error) {
+	proc, err := runner.Run(ctx, spec)
+	if err != nil {
+		return nil, nil, 0, err
 	}
 	var stdout, stderr bytes.Buffer
 	stdoutDone := make(chan struct{})
@@ -796,15 +828,12 @@ func runContainerCapture(ctx context.Context, runner integrationRunner, spec doc
 	<-stderrDone
 	shutdownErr := proc.Shutdown(0)
 	if waitErr != nil {
-		return nil, waitErr
+		return nil, nil, 0, waitErr
 	}
 	if shutdownErr != nil {
-		return nil, shutdownErr
+		return nil, nil, 0, shutdownErr
 	}
-	if code != 0 {
-		return nil, fmt.Errorf("command exited %d: %s", code, strings.TrimSpace(stderr.String()))
-	}
-	return stdout.Bytes(), nil
+	return stdout.Bytes(), stderr.Bytes(), code, nil
 }
 
 func integrationSetupBinds(layout workspace.Layout) []string {
