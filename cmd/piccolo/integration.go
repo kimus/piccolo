@@ -202,7 +202,11 @@ func runIntegrationAdd(cmd *cobra.Command, input string, f integrationFlags) err
 	fmt.Fprintf(out, "  base: %s\n", plan.BaseImage)
 	fmt.Fprintf(out, "  tag:  %s\n", plan.Tag)
 	fmt.Fprintf(out, "  integration: %s\n\n", resolved.Ref)
-	if err := runner.BuildImage(ctx, buildCtx, docker.ImageBuildOptions{Tag: plan.Tag, Dockerfile: "Dockerfile", Pull: f.pull, Remove: true}, out); err != nil {
+	noCache := buildHasUnpinnedIntegrations(integrations)
+	if noCache {
+		fmt.Fprintf(out, "[WARN] disabling Docker build cache for unpinned integration refs so latest code is resolved\n")
+	}
+	if err := runner.BuildImage(ctx, buildCtx, docker.ImageBuildOptions{Tag: plan.Tag, Dockerfile: "Dockerfile", Pull: f.pull, Remove: true, NoCache: noCache}, out); err != nil {
 		return fmt.Errorf("build image: %w", err)
 	}
 	if err := layout.EnsureDirs(); err != nil {
@@ -472,7 +476,12 @@ func runIntegrationUpgrade(cmd *cobra.Command, name string, f integrationUpgrade
 		fmt.Fprintf(out, "  integration: %s (%s)\n", item.Name, item.Ref)
 	}
 	fmt.Fprintln(out)
-	if err := runner.BuildImage(ctx, buildCtx, docker.ImageBuildOptions{Tag: plan.Tag, Dockerfile: "Dockerfile", Pull: f.pull, Remove: true}, out); err != nil {
+	buildIntegrations := manifestIntegrationsForBuild(planned)
+	noCache := buildHasUnpinnedIntegrations(buildIntegrations)
+	if noCache {
+		fmt.Fprintf(out, "[WARN] disabling Docker build cache for unpinned integration refs so latest code is resolved\n")
+	}
+	if err := runner.BuildImage(ctx, buildCtx, docker.ImageBuildOptions{Tag: plan.Tag, Dockerfile: "Dockerfile", Pull: f.pull, Remove: true, NoCache: noCache}, out); err != nil {
 		return fmt.Errorf("build image: %w", err)
 	}
 	if err := layout.EnsureDirs(); err != nil {
@@ -655,6 +664,15 @@ func splitEntrypointCommand(cmd []string) ([]string, []string) {
 		return nil, nil
 	}
 	return []string{cmd[0]}, append([]string(nil), cmd[1:]...)
+}
+
+func buildHasUnpinnedIntegrations(in []runtimeimage.Integration) bool {
+	for _, item := range in {
+		if picintegration.IsUnpinned(item.Ref) {
+			return true
+		}
+	}
+	return false
 }
 
 func integrationBuildBase(m *manifest.Manifest) string {

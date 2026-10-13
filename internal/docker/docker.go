@@ -141,6 +141,7 @@ type ImageBuildOptions struct {
 	Dockerfile string
 	Pull       bool
 	Remove     bool
+	NoCache    bool
 }
 
 // BuildImage sends a tar build context to the daemon and streams the daemon's
@@ -162,6 +163,7 @@ func (r *Runner) BuildImage(ctx context.Context, buildContext io.Reader, opts Im
 		Dockerfile: opts.Dockerfile,
 		PullParent: opts.Pull,
 		Remove:     opts.Remove,
+		NoCache:    opts.NoCache,
 	})
 	if err != nil {
 		return err
