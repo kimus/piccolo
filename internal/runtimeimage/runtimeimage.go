@@ -325,7 +325,9 @@ func renderIntegrationInstallBlock(integrations []Integration) string {
 		verify.WriteString(fmt.Sprintf("RUN command -v %s >/dev/null\n", shellQuote(cmd)))
 	}
 	return fmt.Sprintf(`COPY piccolo-integrations-devbox.json /opt/piccolo/integrations/devbox.json
-RUN cd /opt/piccolo/integrations \
+ARG PICCOLO_INTEGRATIONS_CACHE_BUST=static
+RUN echo "Integration cache key: ${PICCOLO_INTEGRATIONS_CACHE_BUST}" >/dev/null \
+ && cd /opt/piccolo/integrations \
  && echo "Installing integration packages with Devbox/Nix; this can take several minutes on first run..." \
  && devbox install \
  && echo "Finalizing integration commands; this may take a moment..." \

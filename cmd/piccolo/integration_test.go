@@ -20,7 +20,7 @@ type fakeIntegrationRunner struct {
 	buildErr     error
 	builds       int
 	tag          string
-	noCache      bool
+	buildArgs    map[string]string
 	buildContext string
 	runs         []docker.Spec
 	stdout       string
@@ -33,7 +33,7 @@ func (f *fakeIntegrationRunner) Ping(context.Context) error { return f.pingErr }
 func (f *fakeIntegrationRunner) BuildImage(_ context.Context, r io.Reader, opts docker.ImageBuildOptions, out io.Writer) error {
 	f.builds++
 	f.tag = opts.Tag
-	f.noCache = opts.NoCache
+	f.buildArgs = opts.BuildArgs
 	if r != nil {
 		data, _ := io.ReadAll(r)
 		f.buildContext = string(data)
@@ -88,8 +88,8 @@ func TestIntegrationAddBuildsDescribesAndUpdatesManifest(t *testing.T) {
 	if fake.builds != 1 || fake.tag != "piccolo/picoclaw-runtime:gws" {
 		t.Fatalf("builds=%d tag=%q", fake.builds, fake.tag)
 	}
-	if !fake.noCache {
-		t.Fatal("unpinned integration add should disable Docker build cache")
+	if fake.buildArgs["PICCOLO_INTEGRATIONS_CACHE_BUST"] == "" {
+		t.Fatal("unpinned integration add should refresh integration install layer")
 	}
 	if len(fake.runs) != 1 || fake.runs[0].Entrypoint[0] != "piccolo-gws" || strings.Join(fake.runs[0].Command, " ") != "describe --json" {
 		t.Fatalf("describe spec = %#v", fake.runs)
@@ -200,8 +200,8 @@ func TestIntegrationUpgradeSinglePreservesOtherIntegrations(t *testing.T) {
 	if fake.builds != 1 || len(fake.runs) != 1 {
 		t.Fatalf("builds=%d runs=%d", fake.builds, len(fake.runs))
 	}
-	if !fake.noCache {
-		t.Fatal("unpinned integration upgrade should disable Docker build cache")
+	if fake.buildArgs["PICCOLO_INTEGRATIONS_CACHE_BUST"] == "" {
+		t.Fatal("unpinned integration upgrade should refresh integration install layer")
 	}
 	if !strings.Contains(fake.buildContext, "github:kimus/piccolo-gws") || !strings.Contains(fake.buildContext, "github:example/other?ref=v1") {
 		t.Fatalf("build context missing integration refs")

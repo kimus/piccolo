@@ -202,11 +202,11 @@ func runIntegrationAdd(cmd *cobra.Command, input string, f integrationFlags) err
 	fmt.Fprintf(out, "  base: %s\n", plan.BaseImage)
 	fmt.Fprintf(out, "  tag:  %s\n", plan.Tag)
 	fmt.Fprintf(out, "  integration: %s\n\n", resolved.Ref)
-	noCache := buildHasUnpinnedIntegrations(integrations)
-	if noCache {
-		fmt.Fprintf(out, "[WARN] disabling Docker build cache for unpinned integration refs so latest code is resolved\n")
+	buildArgs := integrationBuildArgs(integrations)
+	if len(buildArgs) > 0 {
+		fmt.Fprintf(out, "[WARN] refreshing integration install layer for unpinned refs so latest code is resolved\n")
 	}
-	if err := runner.BuildImage(ctx, buildCtx, docker.ImageBuildOptions{Tag: plan.Tag, Dockerfile: "Dockerfile", Pull: f.pull, Remove: true, NoCache: noCache}, out); err != nil {
+	if err := runner.BuildImage(ctx, buildCtx, docker.ImageBuildOptions{Tag: plan.Tag, Dockerfile: "Dockerfile", Pull: f.pull, Remove: true, BuildArgs: buildArgs}, out); err != nil {
 		return fmt.Errorf("build image: %w", err)
 	}
 	if err := layout.EnsureDirs(); err != nil {
@@ -477,11 +477,11 @@ func runIntegrationUpgrade(cmd *cobra.Command, name string, f integrationUpgrade
 	}
 	fmt.Fprintln(out)
 	buildIntegrations := manifestIntegrationsForBuild(planned)
-	noCache := buildHasUnpinnedIntegrations(buildIntegrations)
-	if noCache {
-		fmt.Fprintf(out, "[WARN] disabling Docker build cache for unpinned integration refs so latest code is resolved\n")
+	buildArgs := integrationBuildArgs(buildIntegrations)
+	if len(buildArgs) > 0 {
+		fmt.Fprintf(out, "[WARN] refreshing integration install layer for unpinned refs so latest code is resolved\n")
 	}
-	if err := runner.BuildImage(ctx, buildCtx, docker.ImageBuildOptions{Tag: plan.Tag, Dockerfile: "Dockerfile", Pull: f.pull, Remove: true, NoCache: noCache}, out); err != nil {
+	if err := runner.BuildImage(ctx, buildCtx, docker.ImageBuildOptions{Tag: plan.Tag, Dockerfile: "Dockerfile", Pull: f.pull, Remove: true, BuildArgs: buildArgs}, out); err != nil {
 		return fmt.Errorf("build image: %w", err)
 	}
 	if err := layout.EnsureDirs(); err != nil {
@@ -666,13 +666,13 @@ func splitEntrypointCommand(cmd []string) ([]string, []string) {
 	return []string{cmd[0]}, append([]string(nil), cmd[1:]...)
 }
 
-func buildHasUnpinnedIntegrations(in []runtimeimage.Integration) bool {
+func integrationBuildArgs(in []runtimeimage.Integration) map[string]string {
 	for _, item := range in {
 		if picintegration.IsUnpinned(item.Ref) {
-			return true
+			return map[string]string{"PICCOLO_INTEGRATIONS_CACHE_BUST": fmt.Sprintf("%d", time.Now().UnixNano())}
 		}
 	}
-	return false
+	return nil
 }
 
 func integrationBuildBase(m *manifest.Manifest) string {

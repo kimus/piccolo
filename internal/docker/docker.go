@@ -142,6 +142,7 @@ type ImageBuildOptions struct {
 	Pull       bool
 	Remove     bool
 	NoCache    bool
+	BuildArgs  map[string]string
 }
 
 // BuildImage sends a tar build context to the daemon and streams the daemon's
@@ -158,12 +159,18 @@ func (r *Runner) BuildImage(ctx context.Context, buildContext io.Reader, opts Im
 	if err != nil {
 		return err
 	}
+	buildArgs := map[string]*string{}
+	for k, v := range opts.BuildArgs {
+		value := v
+		buildArgs[k] = &value
+	}
 	res, err := cli.ImageBuild(ctx, buildContext, mobyclient.ImageBuildOptions{
 		Tags:       []string{opts.Tag},
 		Dockerfile: opts.Dockerfile,
 		PullParent: opts.Pull,
 		Remove:     opts.Remove,
 		NoCache:    opts.NoCache,
+		BuildArgs:  buildArgs,
 	})
 	if err != nil {
 		return err
