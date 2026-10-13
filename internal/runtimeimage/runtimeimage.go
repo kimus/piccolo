@@ -332,7 +332,10 @@ RUN echo "Integration cache key: ${PICCOLO_INTEGRATIONS_CACHE_BUST}" >/dev/null 
  && devbox install \
  && echo "Finalizing integration commands; this may take a moment..." \
  && eval "$(devbox shellenv)" \
- && for tool in %s; do bin="$(command -v "$tool")"; install -m 0755 "$(readlink -f "$bin")" /usr/local/bin/"$tool"; done
+ && mkdir -p /nix/var/nix/gcroots/piccolo-integrations \
+ && for tool in %s; do bin="$(readlink -f "$(command -v "$tool")")"; install -m 0755 "$bin" /usr/local/bin/"$tool"; nix-store --add-root /nix/var/nix/gcroots/piccolo-integrations/"$tool" --indirect "$bin" >/dev/null; done \
+ && echo "Pruning integration build dependencies from the image layer..." \
+ && nix-collect-garbage -d >/dev/null
 %s`, strings.Join(shellQuoteList(commands), " "), verify.String())
 }
 
