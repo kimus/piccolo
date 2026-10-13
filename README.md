@@ -11,6 +11,12 @@ piccolo init      interactive wizard → creates the workspace in the current di
 piccolo setup     arrow-navigable editor for an existing workspace
                   (channels like Discord, models, tool toggles — merge-patched,
                   with provider setup steps, diff preview, and config.json.bak)
+piccolo integration add gws
+                  build/select a gateway image containing a self-describing
+                  integration package (does not patch config.json itself)
+piccolo integration setup gws
+                  run the integration-owned setup command in a temporary
+                  container from the configured image
 piccolo doctor    validates Docker, workspace, and generated files
 piccolo serve     starts the PicoClaw gateway container in the background,
                   waits until http://127.0.0.1:18790/health answers
@@ -139,6 +145,38 @@ The PicoClaw gateway always runs; the **web console** is an optional add-on. It 
 - Non-interactive flags (`--name`, `--owner`, `--purpose`, `--yes`, ...) are supported for scripting.
 - Ensures `config.json` is git-ignored.
 
+
+### `piccolo integration`
+
+Containerized integrations are self-describing packages baked into the gateway image before PicoClaw starts. For example:
+
+```sh
+piccolo integration add gws
+piccolo integration setup gws
+piccolo restart
+```
+
+`add` resolves aliases such as `gws` to an integration package reference, asks before building third-party code into the runtime image, runs the installed binary's `describe --json` in a container, and records Piccolo-owned integration metadata in `piccolo.yaml`. It does **not** patch provider-specific `config.json` entries.
+
+`setup` runs the integration-owned setup command in a one-shot container from the configured image with the workspace mounted at `/root/.picoclaw`. The integration owns provider prompts, auth, state files, and any `config.json` merge-patching. After setup, run `piccolo restart`.
+
+Integration authors provide an executable whose descriptor command returns JSON like:
+
+```json
+{
+  "schema": "piccolo.integration.v1",
+  "name": "gws",
+  "displayName": "Google Workspace",
+  "commands": ["piccolo-gws"],
+  "setup": {
+    "command": ["piccolo-gws", "setup", "--config-dir", "/root/.picoclaw/integrations/google"],
+    "requiresTty": true,
+    "ports": ["127.0.0.1:8000:8000"]
+  }
+}
+```
+
+Only use integrations you trust; integration refs install code into the assistant runtime image.
 
 ### `piccolo setup`
 

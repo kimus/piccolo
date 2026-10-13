@@ -54,6 +54,39 @@ func TestParseAcceptsRuntimeToolchain(t *testing.T) {
 	}
 }
 
+func TestParseAcceptsRuntimeIntegrations(t *testing.T) {
+	m, err := Parse(strings.NewReader(validYAML + `runtime:
+  integrations:
+    - name: gws
+      display_name: Google Workspace
+      ref: github:kimus/piccolo-gws
+      commands: [piccolo-gws]
+      descriptor_command: [piccolo-gws, describe, --json]
+      setup_command: [piccolo-gws, setup]
+      setup_requires_tty: true
+      setup_ports: [127.0.0.1:8000:8000]
+`))
+	if err != nil {
+		t.Fatalf("Parse runtime integrations: %v", err)
+	}
+	if len(m.Runtime.Integrations) != 1 || m.Runtime.Integrations[0].Name != "gws" || !m.Runtime.Integrations[0].SetupRequiresTTY {
+		t.Fatalf("integrations = %#v", m.Runtime.Integrations)
+	}
+}
+
+func TestParseRejectsBadRuntimeIntegrations(t *testing.T) {
+	_, err := Parse(strings.NewReader(validYAML + `runtime:
+  integrations:
+    - name: gws
+      ref: github:kimus/piccolo-gws
+    - name: gws
+      ref: github:kimus/other
+`))
+	if err == nil {
+		t.Fatal("expected duplicate integration error")
+	}
+}
+
 func TestParseRejectsBadRuntimeToolchain(t *testing.T) {
 	_, err := Parse(strings.NewReader(validYAML + `runtime:
   toolchain:

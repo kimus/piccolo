@@ -54,6 +54,11 @@ type Spec struct {
 	Env     []string // KEY=value pairs, already resolved
 	Volumes []string // docker-style named volume binds, e.g. name:/path:rw
 	Labels  map[string]string
+	// Entrypoint and Command override the image defaults for one-shot helper
+	// containers. Leave empty for the PicoClaw gateway's default entrypoint.
+	Entrypoint []string
+	Command    []string
+	TTY        bool
 	// Detach runs the container in the background without stdio attachment
 	// (logs remain available through the daemon).
 	Detach bool
@@ -283,12 +288,14 @@ func (r *Runner) Prepare(spec Spec) (*preparedContainer, error) {
 		Image:        spec.Image,
 		Env:          spec.Env,
 		Labels:       labels,
+		Entrypoint:   spec.Entrypoint,
+		Cmd:          spec.Command,
 		OpenStdin:    attach,
 		StdinOnce:    attach,
 		AttachStdin:  attach,
 		AttachStdout: attach,
 		AttachStderr: attach,
-		Tty:          false,
+		Tty:          spec.TTY,
 		ExposedPorts: exposedPorts,
 	}
 	binds := []string{fmt.Sprintf("%s:%s:rw", spec.Source, MountTarget)}
@@ -338,7 +345,7 @@ func (r *Runner) Start(ctx context.Context, prepared *preparedContainer) (Proces
 		stopRemove(ctx, cli, id)
 		return nil, fmt.Errorf("attach container stdio: %w", err)
 	}
-	proc := newContainerProcess(cli, id, attach)
+	proc := newContainerProcess(cli, id, attach, prepared.Config.Tty)
 	if _, err := cli.ContainerStart(ctx, id, mobyclient.ContainerStartOptions{}); err != nil {
 		_ = proc.Shutdown(0)
 		return nil, fmt.Errorf("start container: %w", err)
@@ -652,7 +659,7 @@ type containerProcess struct {
 	exitCode int
 }
 
-func newContainerProcess(cli client.SDKClient, id string, attach mobyclient.ContainerAttachResult) *containerProcess {
+func newContainerProcess(cli client.SDKClient, id string, attach mobyclient.ContainerAttachResult, tty bool) *containerProcess {
 	stdoutR, stdoutW := io.Pipe()
 	stderrR, stderrW := io.Pipe()
 	p := &containerProcess{
@@ -665,7 +672,7 @@ func newContainerProcess(cli client.SDKClient, id string, attach mobyclient.Cont
 		demuxDone: make(chan struct{}),
 		exitCode:  -1,
 	}
-	go p.pump(attach.Reader, stdoutW, stderrW)
+	go p.pump(attach.Reader, stdoutW, stderrW, tty)
 	return p
 }
 
@@ -681,12 +688,16 @@ func (s attachStdin) Close() error                { return s.hijack.CloseWrite()
 
 // pump demultiplexes the docker stream framing:
 // [8]byte{STREAM_TYPE, 0, 0, 0, SIZE1..SIZE4} followed by SIZE bytes.
-func (p *containerProcess) pump(r io.Reader, stdoutW, stderrW *io.PipeWriter) {
+func (p *containerProcess) pump(r io.Reader, stdoutW, stderrW *io.PipeWriter, tty bool) {
 	defer func() {
 		_ = stdoutW.Close()
 		_ = stderrW.Close()
 		close(p.demuxDone)
 	}()
+	if tty {
+		_, _ = io.Copy(stdoutW, r)
+		return
+	}
 	header := make([]byte, 8)
 	for {
 		if _, err := io.ReadFull(r, header); err != nil {

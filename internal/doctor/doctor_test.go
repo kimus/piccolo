@@ -70,6 +70,23 @@ func find(results []Result, substr string) *Result {
 	return nil
 }
 
+func TestDoctorReportsInstalledIntegrations(t *testing.T) {
+	dir := initWorkspace(t)
+	path := filepath.Join(dir, "piccolo.yaml")
+	m, err := manifest.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.Runtime.Integrations = []manifest.Integration{{Name: "gws", DisplayName: "Google Workspace", Ref: "github:kimus/piccolo-gws", SetupCommand: []string{"piccolo-gws", "setup"}}}
+	if err := m.Write(path); err != nil {
+		t.Fatal(err)
+	}
+	results := Run(context.Background(), Options{Workspace: dir, Engine: fakeEngine{imageExists: true}, LookupEnv: func(string) (string, bool) { return "", false }})
+	if r := find(results, "integration installed: Google Workspace"); r == nil || r.Status != OK {
+		t.Fatalf("integration result not found: %#v", results)
+	}
+}
+
 func TestDoctorFreshWorkspaceAllOK(t *testing.T) {
 	dir := initWorkspace(t)
 	results := Run(context.Background(), Options{

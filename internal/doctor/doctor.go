@@ -134,6 +134,7 @@ func Run(ctx context.Context, opts Options) []Result {
 	// 3c. Runtime toolchain configuration (live command availability is reported
 	// by `piccolo runtime status/apply`; doctor remains daemon-free here).
 	results = append(results, checkRuntimeToolchain(m)...)
+	results = append(results, checkIntegrations(m)...)
 
 	// 4. Env references.
 	lookup := opts.LookupEnv
@@ -212,6 +213,24 @@ func checkRuntimeToolchain(m *manifest.Manifest) []Result {
 	for _, want := range []string{"pdfinfo", "pdftoppm", "pdftocairo", "soffice", "magick", "convert", "identify"} {
 		if !hasString(commands, want) {
 			results = append(results, Result{Status: WARN, Message: fmt.Sprintf("runtime toolchain: useful media/office command %q is not exposed", want)})
+		}
+	}
+	return results
+}
+
+func checkIntegrations(m *manifest.Manifest) []Result {
+	if len(m.Runtime.Integrations) == 0 {
+		return nil
+	}
+	var results []Result
+	for _, in := range m.Runtime.Integrations {
+		label := in.DisplayName
+		if label == "" {
+			label = in.Name
+		}
+		results = append(results, Result{Status: OK, Message: fmt.Sprintf("integration installed: %s (%s)", label, in.Ref)})
+		if len(in.SetupCommand) == 0 {
+			results = append(results, Result{Status: WARN, Message: fmt.Sprintf("integration %s has no setup command", in.Name)})
 		}
 	}
 	return results

@@ -28,7 +28,8 @@ type Manifest struct {
 // Runtime holds Piccolo-owned container runtime configuration. This is distinct
 // from PicoClaw's config.json runtime/agent settings.
 type Runtime struct {
-	Toolchain Toolchain `yaml:"toolchain,omitempty"`
+	Toolchain    Toolchain     `yaml:"toolchain,omitempty"`
+	Integrations []Integration `yaml:"integrations,omitempty"`
 }
 
 // Toolchain describes Devbox/Nix packages to install and command names to
@@ -36,6 +37,20 @@ type Runtime struct {
 type Toolchain struct {
 	Packages []string `yaml:"packages,omitempty"`
 	Commands []string `yaml:"commands,omitempty"`
+}
+
+// Integration records Piccolo-owned metadata for an integration package baked
+// into the configured gateway image. Provider-specific runtime settings remain
+// in config.json or integration-owned state files.
+type Integration struct {
+	Name              string   `yaml:"name"`
+	DisplayName       string   `yaml:"display_name,omitempty"`
+	Ref               string   `yaml:"ref"`
+	Commands          []string `yaml:"commands,omitempty"`
+	DescriptorCommand []string `yaml:"descriptor_command,omitempty"`
+	SetupCommand      []string `yaml:"setup_command,omitempty"`
+	SetupRequiresTTY  bool     `yaml:"setup_requires_tty,omitempty"`
+	SetupPorts        []string `yaml:"setup_ports,omitempty"`
 }
 
 // Setup holds non-secret Piccolo setup metadata that is useful across setup
@@ -148,6 +163,35 @@ func (m *Manifest) Validate() error {
 	}
 	if err := validateStringList("runtime.toolchain.commands", m.Runtime.Toolchain.Commands); err != nil {
 		return err
+	}
+	seenIntegrations := map[string]bool{}
+	for i, in := range m.Runtime.Integrations {
+		prefix := fmt.Sprintf("runtime.integrations[%d]", i)
+		if strings.TrimSpace(in.Name) == "" {
+			return fmt.Errorf("%s.name is required", prefix)
+		}
+		if strings.ContainsAny(in.Name, " \t\n") {
+			return fmt.Errorf("%s.name %q invalid", prefix, in.Name)
+		}
+		if seenIntegrations[in.Name] {
+			return fmt.Errorf("%s.name %q is duplicated", prefix, in.Name)
+		}
+		seenIntegrations[in.Name] = true
+		if strings.TrimSpace(in.Ref) == "" {
+			return fmt.Errorf("%s.ref is required", prefix)
+		}
+		if err := validateStringList(prefix+".commands", in.Commands); err != nil {
+			return err
+		}
+		if err := validateStringList(prefix+".descriptor_command", in.DescriptorCommand); err != nil {
+			return err
+		}
+		if err := validateStringList(prefix+".setup_command", in.SetupCommand); err != nil {
+			return err
+		}
+		if err := validateStringList(prefix+".setup_ports", in.SetupPorts); err != nil {
+			return err
+		}
 	}
 	return nil
 }

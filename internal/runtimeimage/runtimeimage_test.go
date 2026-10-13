@@ -46,6 +46,25 @@ func TestBuildPlanDeterministic(t *testing.T) {
 	}
 }
 
+func TestBuildPlanWithIntegrationsInstallsAtBuildTime(t *testing.T) {
+	p, err := BuildPlan(Options{BaseImage: "docker.io/sipeed/picoclaw:v0.3.1", Integrations: []Integration{{Ref: "github:kimus/piccolo-gws", Commands: []string{"piccolo-gws"}}}})
+	if err != nil {
+		t.Fatalf("BuildPlan: %v", err)
+	}
+	for _, want := range []string{"piccolo-integrations-devbox.json", "github:kimus/piccolo-gws", "devbox install", "command -v 'piccolo-gws'"} {
+		if !strings.Contains(p.Dockerfile+p.IntegrationsJSON, want) {
+			t.Errorf("integration plan missing %q", want)
+		}
+	}
+	p2, err := BuildPlan(Options{BaseImage: "docker.io/sipeed/picoclaw:v0.3.1"})
+	if err != nil {
+		t.Fatalf("BuildPlan no integration: %v", err)
+	}
+	if p.Tag == p2.Tag {
+		t.Fatal("integration refs must affect deterministic tag")
+	}
+}
+
 func TestContextTarContainsBuildFiles(t *testing.T) {
 	p, err := BuildPlan(Options{Packages: []string{"file"}})
 	if err != nil {

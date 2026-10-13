@@ -57,6 +57,23 @@ func TestPrepareComposesSpec(t *testing.T) {
 	}
 }
 
+func TestPrepareCommandOverrideAndTTY(t *testing.T) {
+	r := New()
+	pc, err := r.Prepare(Spec{Name: "setup", Image: "img:1", Source: "/ws", Entrypoint: []string{"piccolo-gws"}, Command: []string{"setup"}, TTY: true})
+	if err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
+	if len(pc.Config.Entrypoint) != 1 || pc.Config.Entrypoint[0] != "piccolo-gws" {
+		t.Fatalf("entrypoint = %#v", pc.Config.Entrypoint)
+	}
+	if len(pc.Config.Cmd) != 1 || pc.Config.Cmd[0] != "setup" {
+		t.Fatalf("cmd = %#v", pc.Config.Cmd)
+	}
+	if !pc.Config.Tty {
+		t.Fatal("tty should be enabled")
+	}
+}
+
 func TestPrepareAddsNamedVolumes(t *testing.T) {
 	r := New()
 	pc, err := r.Prepare(Spec{Name: "n", Image: "img:1", Source: "/ws", Volumes: []string{"piccolo-devbox-nix-cache:/nix:rw"}})

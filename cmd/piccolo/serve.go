@@ -115,7 +115,12 @@ func preflight(cmd *cobra.Command) (*serveContext, error) {
 
 	volumes := []string(nil)
 	if runtimeimage.IsLocalRuntimeImage(m.Container.Image) {
-		volumes = append(volumes, runtimeimage.DevboxGlobalMount, runtimeimage.NixCacheMount, runtimeimage.MediaTempMount)
+		volumes = append(volumes, runtimeimage.DevboxGlobalMount, runtimeimage.MediaTempMount)
+		// Build-time integrations can depend on the image's /nix/store. Do not
+		// mask it with the runtime cache volume when integrations are baked in.
+		if len(m.Runtime.Integrations) == 0 {
+			volumes = append(volumes, runtimeimage.NixCacheMount)
+		}
 		volumes = append(volumes, agentMediaMirrorMounts(cfg)...)
 	}
 

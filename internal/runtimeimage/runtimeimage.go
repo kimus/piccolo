@@ -95,19 +95,29 @@ var DefaultPackages = []string{
 }
 
 type Options struct {
-	BaseImage string
-	Tag       string
-	Packages  []string
-	Commands  []string
+	BaseImage    string
+	Tag          string
+	Packages     []string
+	Commands     []string
+	Integrations []Integration
+}
+
+// Integration is a build-time package that must be available before the
+// gateway entrypoint starts (for example, a stdio MCP server binary).
+type Integration struct {
+	Ref      string
+	Commands []string
 }
 
 type Plan struct {
-	BaseImage  string
-	Tag        string
-	Dockerfile string
-	DevboxJSON string
-	Packages   []string
-	Commands   []string
+	BaseImage        string
+	Tag              string
+	Dockerfile       string
+	DevboxJSON       string
+	IntegrationsJSON string
+	Packages         []string
+	Commands         []string
+	Integrations     []Integration
 }
 
 func BuildPlan(opts Options) (Plan, error) {
@@ -129,12 +139,17 @@ func BuildPlan(opts Options) (Plan, error) {
 	if err != nil {
 		return Plan{}, err
 	}
-	dockerfile := renderDockerfile(base)
+	integrations := normalizeIntegrations(opts.Integrations)
+	integrationsJSON, err := renderIntegrationsDevbox(integrations)
+	if err != nil {
+		return Plan{}, err
+	}
+	dockerfile := renderDockerfile(base, integrations)
 	tag := strings.TrimSpace(opts.Tag)
 	if tag == "" {
-		tag = DefaultTag(base, dockerfile, devbox)
+		tag = DefaultTag(base, dockerfile, devbox, integrationsJSON)
 	}
-	return Plan{BaseImage: base, Tag: tag, Dockerfile: dockerfile, DevboxJSON: devbox, Packages: packages, Commands: commands}, nil
+	return Plan{BaseImage: base, Tag: tag, Dockerfile: dockerfile, DevboxJSON: devbox, IntegrationsJSON: integrationsJSON, Packages: packages, Commands: commands, Integrations: integrations}, nil
 }
 
 func IsLocalRuntimeImage(ref string) bool {
@@ -148,8 +163,8 @@ func DefaultDevboxJSON() (string, error) {
 	return renderDevbox(uniqueSorted(DefaultPackages))
 }
 
-func DefaultTag(base, dockerfile, devbox string) string {
-	sum := sha256.Sum256([]byte(base + "\n" + dockerfile + "\n" + devbox))
+func DefaultTag(parts ...string) string {
+	sum := sha256.Sum256([]byte(strings.Join(parts, "\n")))
 	return fmt.Sprintf("%s:%s", DefaultTagPrefix, hex.EncodeToString(sum[:])[:12])
 }
 
@@ -162,6 +177,7 @@ func (p Plan) ContextTar() (io.Reader, error) {
 	}{
 		{name: "Dockerfile", body: p.Dockerfile},
 		{name: "devbox.json", body: p.DevboxJSON},
+		{name: "piccolo-integrations-devbox.json", body: p.IntegrationsJSON},
 		{name: "piccolo-setup-tools", body: renderSetupScript()},
 	}
 	for _, f := range files {
@@ -184,7 +200,11 @@ func (p Plan) ContextTar() (io.Reader, error) {
 // installed after run (the setup script, triggered by `piccolo serve`) into the
 // persisted volumes and symlinked onto PATH. The default PicoClaw entrypoint is
 // left untouched.
-func renderDockerfile(base string) string {
+func renderDockerfile(base string, integrations []Integration) string {
+	integrationBlock := ""
+	if len(integrations) > 0 {
+		integrationBlock = renderIntegrationInstallBlock(integrations)
+	}
 	return fmt.Sprintf(`FROM %s
 USER root
 RUN apk add --no-cache bash curl ca-certificates xz tar git shadow coreutils
@@ -202,9 +222,9 @@ COPY piccolo-setup-tools %[3]s
 RUN chmod 0755 %[3]s
 ENV PATH="/root/.nix-profile/bin:/nix/var/nix/profiles/default/bin:${PATH}"
 RUN devbox version
-LABEL org.opencontainers.image.title="Piccolo PicoClaw Runtime"
+%sLABEL org.opencontainers.image.title="Piccolo PicoClaw Runtime"
 LABEL org.opencontainers.image.description="PicoClaw runtime with Devbox/Nix; file-handling tools install into persisted volumes after start"
-`, base, DevboxGlobalDir, SetupScriptPath)
+`, base, DevboxGlobalDir, SetupScriptPath, integrationBlock)
 }
 
 // renderSetupScript is run by `piccolo serve` after the gateway is healthy. It
@@ -270,6 +290,68 @@ func renderDevbox(packages []string) (string, error) {
 		return "", err
 	}
 	return string(b) + "\n", nil
+}
+
+func renderIntegrationsDevbox(integrations []Integration) (string, error) {
+	pkgs := make([]string, 0, len(integrations))
+	for _, in := range integrations {
+		pkgs = append(pkgs, in.Ref)
+	}
+	return renderDevbox(pkgs)
+}
+
+func normalizeIntegrations(in []Integration) []Integration {
+	byRef := map[string]Integration{}
+	for _, item := range in {
+		ref := strings.TrimSpace(item.Ref)
+		if ref == "" {
+			continue
+		}
+		cur := byRef[ref]
+		cur.Ref = ref
+		cur.Commands = uniqueSorted(append(cur.Commands, item.Commands...))
+		byRef[ref] = cur
+	}
+	refs := make([]string, 0, len(byRef))
+	for ref := range byRef {
+		refs = append(refs, ref)
+	}
+	sort.Strings(refs)
+	out := make([]Integration, 0, len(refs))
+	for _, ref := range refs {
+		out = append(out, byRef[ref])
+	}
+	return out
+}
+
+func renderIntegrationInstallBlock(integrations []Integration) string {
+	var commands []string
+	for _, in := range integrations {
+		commands = append(commands, in.Commands...)
+	}
+	commands = uniqueSorted(commands)
+	var verify strings.Builder
+	for _, cmd := range commands {
+		verify.WriteString(fmt.Sprintf("RUN command -v %s >/dev/null\n", shellQuote(cmd)))
+	}
+	return fmt.Sprintf(`COPY piccolo-integrations-devbox.json /opt/piccolo/integrations/devbox.json
+RUN cd /opt/piccolo/integrations \
+ && devbox install \
+ && eval "$(devbox shellenv)" \
+ && for tool in %s; do bin="$(command -v "$tool")"; ln -sf "$(readlink -f "$bin")" /usr/local/bin/"$tool"; done
+%s`, strings.Join(shellQuoteList(commands), " "), verify.String())
+}
+
+func shellQuoteList(values []string) []string {
+	out := make([]string, 0, len(values))
+	for _, v := range values {
+		out = append(out, shellQuote(v))
+	}
+	return out
+}
+
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", "'\\''") + "'"
 }
 
 func uniqueSorted(in []string) []string {
