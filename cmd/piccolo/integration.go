@@ -220,7 +220,7 @@ func runIntegrationAdd(cmd *cobra.Command, input string, f integrationFlags) err
 	}
 	base := integrationBuildBase(m)
 	bundles = upsertBundle(bundles, fetched.Bundle)
-	plan, err := runtimeimage.BuildPlan(runtimeimage.Options{BaseImage: base, Tag: f.tag, Packages: effectiveToolchain(m).Packages, Commands: effectiveToolchain(m).Commands, Bundles: bundles, Integrations: sourceManifestIntegrationsForBuild(m.Runtime.Integrations)})
+	plan, err := runtimeimage.BuildPlan(runtimeimage.Options{BaseImage: base, Tag: f.tag, Packages: effectiveToolchain(m).Packages, Commands: effectiveToolchain(m).Commands, Bundles: bundles, Integrations: sourceManifestIntegrationsForBuildExcept(m.Runtime.Integrations, pkg.Package())})
 	if err != nil {
 		return err
 	}
@@ -858,8 +858,16 @@ func descriptorCommandFor(item manifest.Integration) []string {
 }
 
 func sourceManifestIntegrationsForBuild(in []manifest.Integration) []runtimeimage.Integration {
+	return sourceManifestIntegrationsForBuildExcept(in, "")
+}
+
+func sourceManifestIntegrationsForBuildExcept(in []manifest.Integration, excludePackage string) []runtimeimage.Integration {
+	excludePackage = strings.TrimSpace(excludePackage)
 	out := make([]runtimeimage.Integration, 0, len(in))
 	for _, item := range in {
+		if excludePackage != "" && integrationPackageKey(item) == excludePackage {
+			continue
+		}
 		if item.Source != string(picintegration.SourceBuild) && item.Ref == "" {
 			continue
 		}
@@ -955,13 +963,34 @@ func upsertBundle(in []runtimeimage.IntegrationBundle, item runtimeimage.Integra
 }
 
 func upsertManifestIntegration(in []manifest.Integration, item manifest.Integration) []manifest.Integration {
+	itemKey := integrationPackageKey(item)
 	for i := range in {
-		if (item.Package != "" && in[i].Package == item.Package) || (item.Package == "" && in[i].Name == item.Name) {
+		if (itemKey != "" && integrationPackageKey(in[i]) == itemKey) || (itemKey == "" && item.Package == "" && in[i].Name == item.Name) {
 			in[i] = item
 			return in
 		}
 	}
 	return append(in, item)
+}
+
+func integrationPackageKey(in manifest.Integration) string {
+	if strings.TrimSpace(in.Package) != "" {
+		pkg := strings.TrimSpace(in.Package)
+		if i := strings.Index(pkg, "@"); i >= 0 {
+			pkg = pkg[:i]
+		}
+		return pkg
+	}
+	if strings.HasPrefix(in.Ref, "github:") {
+		ref := strings.TrimPrefix(in.Ref, "github:")
+		if i := strings.IndexAny(ref, "?#@"); i >= 0 {
+			ref = ref[:i]
+		}
+		if strings.Count(ref, "/") == 1 {
+			return "github:" + ref
+		}
+	}
+	return ""
 }
 
 func packageRefForManifest(in manifest.Integration) (picintegration.PackageRef, error) {

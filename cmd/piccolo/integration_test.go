@@ -118,6 +118,35 @@ func TestIntegrationAddReleaseBuildsDescribesAndUpdatesManifest(t *testing.T) {
 	}
 }
 
+func TestIntegrationAddReleaseReplacesLegacySourceBuild(t *testing.T) {
+	dir := t.TempDir()
+	writeIntegrationManifest(t, dir, []manifest.Integration{{Name: "gws", Ref: "github:kimus/piccolo-gws", Commands: []string{"piccolo-gws"}}})
+	bundleRoot := makeBundleDir(t, []string{"piccolo-gws", "gws"})
+	rel := fetchedRelease{Ref: mustPackageRef(t, "kimus/piccolo-gws"), Version: "0.1.0", Digest: "sha256:abc", Bundle: runtimeimage.IntegrationBundle{Package: "github:kimus/piccolo-gws", Version: "0.1.0", Root: bundleRoot, Commands: []string{"piccolo-gws", "gws"}}}
+	desc := `{"schema":"piccolo.integration.v1","name":"gws","displayName":"Google Workspace","commands":["piccolo-gws"],"setup":{"command":["piccolo-gws","setup"]}}`
+	fake := &fakeIntegrationRunner{stdout: desc}
+	oldRunner, oldFetcher := newIntegrationRunner, newReleaseFetcher
+	newIntegrationRunner = func() integrationRunner { return fake }
+	newReleaseFetcher = func() releaseFetcher { return fakeReleaseFetcher{release: rel} }
+	defer func() { newIntegrationRunner = oldRunner; newReleaseFetcher = oldFetcher }()
+	oldDir := dirFlag
+	dirFlag = dir
+	defer func() { dirFlag = oldDir }()
+	if err := runIntegrationAdd(testCommand(&bytes.Buffer{}), "kimus/piccolo-gws", integrationFlags{yes: true, tag: "piccolo/picoclaw-runtime:gws"}); err != nil {
+		t.Fatalf("add: %v", err)
+	}
+	if strings.Contains(fake.buildContext, "devbox add github:kimus/piccolo-gws") || strings.Contains(fake.buildContext, "nix-collect-garbage") {
+		t.Fatalf("release add preserved legacy source build context")
+	}
+	m, err := manifest.Load(filepath.Join(dir, "piccolo.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(m.Runtime.Integrations) != 1 || m.Runtime.Integrations[0].Ref != "" || m.Runtime.Integrations[0].Package != "github:kimus/piccolo-gws" {
+		t.Fatalf("integrations = %#v", m.Runtime.Integrations)
+	}
+}
+
 func TestIntegrationAddRejectsAlias(t *testing.T) {
 	dir := t.TempDir()
 	writeTestManifest(t, dir, "docker.io/sipeed/picoclaw:v0.3.1")
