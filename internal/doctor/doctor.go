@@ -348,6 +348,9 @@ func isPiccoloLocalRuntimeImage(ref string) bool {
 
 func isLauncherImage(ref string) bool {
 	ref = strings.TrimSpace(ref)
+	if runtimeimage.IsLocalRuntimeImage(ref) {
+		return true
+	}
 	if ref == generate.LauncherImage {
 		return true
 	}

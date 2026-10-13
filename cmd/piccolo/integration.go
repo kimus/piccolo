@@ -16,6 +16,7 @@ import (
 	"golang.org/x/term"
 
 	"github.com/kimus/piccolo/internal/docker"
+	"github.com/kimus/piccolo/internal/generate"
 	picintegration "github.com/kimus/piccolo/internal/integration"
 	"github.com/kimus/piccolo/internal/manifest"
 	"github.com/kimus/piccolo/internal/runtimeimage"
@@ -111,6 +112,12 @@ func runIntegrationAdd(cmd *cobra.Command, input string, f integrationFlags) err
 	base := m.Container.Image
 	if runtimeimage.IsLocalRuntimeImage(base) {
 		base = runtimeimage.DefaultBaseImage
+		for _, p := range m.Container.Ports {
+			if strings.Contains(p, ":18800") {
+				base = generate.LauncherImage
+				break
+			}
+		}
 	}
 	integrations := manifestIntegrationsForBuild(m.Runtime.Integrations)
 	integrations = upsertBuildIntegration(integrations, runtimeimage.Integration{Ref: resolved.Ref, Commands: []string{resolved.DescriptorCommand[0]}})
