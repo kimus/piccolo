@@ -109,3 +109,13 @@
 - [x] 12.3 Verify the test catches the original ordering bug (fails with "unexpected argument" when the flag precedes the subcommand)
 - [x] 12.4 Keep the default daemon-free `go test ./...` unaffected (build tag + skip without PICCOLO_CONTRACT_IMAGE)
 - [ ] 12.5 Follow-up: run it in CI (needs a job that builds a runtime image; deliberately not wired here to avoid introducing flaky CI)
+
+## 13. Interrupt-safe, bounded actions
+
+- [x] 13.1 Per-action `context.WithTimeout` shared by the container wait and the courier (was: deadline bound only the courier, so a hung action pinned Piccolo forever)
+- [x] 13.2 SIGINT/SIGTERM cancel the action, which stops AND removes the container (was: Ctrl-C killed Piccolo and leaked the container)
+- [x] 13.3 Interruptible stdout event loop: teardown no longer waits on a stream that never closes
+- [x] 13.4 Raise the human budget 5m → 15m with a 3-minute countdown warning
+- [x] 13.5 Distinguish "interrupted" from "timed out" in the reported error, and state that cleanup ran
+- [x] 13.6 Tests: cancel and deadline each assert the container was shut down and the call returned promptly
+- [x] 13.7 Verified live: a login container with ZERO published ports still receives the relayed callback via `docker exec` (gws loopback listener, HTTP 200, action ended)

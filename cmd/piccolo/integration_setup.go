@@ -3,16 +3,20 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/url"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"runtime"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 
 	"github.com/charmbracelet/huh"
@@ -211,9 +215,15 @@ func answersJSON(inputs []picintegration.ActionInput, values map[string]string) 
 	return data, nil
 }
 
-// actionWaitBudget bounds the human-in-the-loop wait for a browser callback.
-// Deliberately far longer than any machine timeout: a person has to click.
-const actionWaitBudget = 5 * time.Minute
+// actionWaitBudget bounds one interactive action end to end: a person has to
+// open a URL, sign in, choose an account and approve consent. Machine-scale
+// timeouts are the wrong unit here, but an unbounded wait is worse, because it
+// pins a container and a terminal. actionWarnBefore is how long before expiry the
+// user is told the clock is running out.
+const (
+	actionWaitBudget = 15 * time.Minute
+	actionWarnBefore = 3 * time.Minute
+)
 
 // integrationCallRequest is everything needed to run one action. It is a
 // struct so the interactive entrypoint and tests drive the same code path.
@@ -228,6 +238,11 @@ type integrationCallRequest struct {
 // runIntegrationAction starts the action container, streams events, and returns
 // the collected reader. onEvent fires per event so the caller can print
 // progress, surface links, or start the callback courier.
+// runIntegrationAction starts an action container, streams its stdout events
+// through onEvent, and returns once the container is gone. Every read is
+// interruptible: a hung action must never be able to pin this call, because the
+// whole point of the per-action budget is that Piccolo, not the integration,
+// decides when an attempt is abandoned.
 func runIntegrationAction(ctx context.Context, runner integrationRunner, req integrationCallRequest, out io.Writer, onEvent func(picintegration.Event)) (*picintegration.EventReader, error) {
 	proc, err := runner.Run(ctx, req.Spec)
 	if err != nil {
@@ -243,29 +258,58 @@ func runIntegrationAction(ctx context.Context, runner integrationRunner, req int
 	go func() { _, _ = io.Copy(out, proc.Stderr()) }()
 
 	er := picintegration.NewEventReader(proc.Stdout())
+	events := make(chan picintegration.Event, 16)
+	readDone := make(chan struct{})
+	go func() {
+		defer close(readDone)
+		for {
+			ev := er.Next()
+			if ev == nil {
+				return
+			}
+			select {
+			case events <- *ev:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+
+	lastExit := -1
 	for {
-		ev := er.Next()
-		if ev == nil {
-			break
+		select {
+		case ev := <-events:
+			if onEvent != nil {
+				onEvent(ev)
+			}
+		case <-readDone:
+			code, waitErr := proc.Wait(ctx)
+			if waitErr != nil {
+				return er, waitErr
+			}
+			lastExit = code
+			if e := er.ErrEvent(); e != nil {
+				return er, fmt.Errorf("integration action failed: %s (%s)", e.Message, e.Code)
+			}
+			if code != 0 {
+				return er, fmt.Errorf("integration action exited %d without reporting a result", code)
+			}
+			return er, nil
+		case <-ctx.Done():
+			// Force the reader goroutine to stop by tearing the container down.
+			_ = proc.Shutdown(0)
+			<-readDone
+			if lastExit == 0 {
+				return er, nil
+			}
+			if errors.Is(ctx.Err(), context.Canceled) {
+				// Cancelled by signal (or by the courier giving up): cleanup ran,
+				// so say so instead of implying a timeout.
+				return er, errors.New("action interrupted; the setup container was stopped and removed")
+			}
+			return er, fmt.Errorf("action did not finish within its time budget (%s); the setup container was stopped and removed", actionWaitBudget)
 		}
-		if onEvent != nil {
-			onEvent(*ev)
-		}
 	}
-	code, err := proc.Wait(ctx)
-	if err != nil {
-		return nil, err
-	}
-	if e := er.ErrEvent(); e != nil {
-		return er, fmt.Errorf("integration action failed: %s (%s)", e.Message, e.Code)
-	}
-	if code != 0 {
-		return er, fmt.Errorf("integration action exited %d without reporting a result", code)
-	}
-	if er.Result() == nil && len(er.Logs) > 0 {
-		fmt.Fprintf(out, "(unparsed output: %s)\n", strings.Join(er.Logs, " | "))
-	}
-	return er, nil
 }
 
 // relayCallbackIntoContainer delivers the captured query string into the still
@@ -756,6 +800,21 @@ func (s *setupSession) runAction(ctx context.Context, entry *menuEntry, state pi
 	if err != nil {
 		return nil, err
 	}
+	// One deadline AND an interrupt signal per action, shared by the container
+	// wait and the courier. Without the signal part, Ctrl-C killed Piccolo while
+	// the action container kept running — holding its courier port and the state
+	// mount, and only cleaned up by the next run's reclaim sweep.
+	sigCtx, stopSignals := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
+	defer stopSignals()
+	actCtx, cancelAct := context.WithTimeout(sigCtx, actionWaitBudget)
+	defer cancelAct()
+	warnOnce := sync.Once{}
+	warnDeadline := time.AfterFunc(actionWaitBudget-actionWarnBefore, func() {
+		warnOnce.Do(func() {
+			fmt.Fprintf(s.out, "\nWaiting for the browser authorization to finish; this attempt ends in %s.\n", actionWarnBefore)
+		})
+	})
+	defer warnDeadline.Stop()
 	callArgv, err := actionArgv(s.setupCommand, action.ID)
 	if err != nil {
 		return nil, err
@@ -772,7 +831,6 @@ func (s *setupSession) runAction(ctx context.Context, entry *menuEntry, state pi
 
 	host := detectHostSession(envMapFromList(s.env), s.tty)
 	var courierErr error
-	deadline := time.Now().Add(actionWaitBudget)
 	onEvent := func(ev picintegration.Event) {
 		switch ev.Type {
 		case picintegration.EventStep:
@@ -795,15 +853,16 @@ func (s *setupSession) runAction(ctx context.Context, entry *menuEntry, state pi
 				courierErr = err
 				return
 			}
-			remaining := time.Until(deadline)
-			if remaining < 0 {
-				remaining = time.Second
-			}
 			relay := func(rctx context.Context, q string) error {
 				return relayCallbackIntoContainer(rctx, s.runner, spec.Name, port, q)
 			}
-			if err := c.await(ctx, remaining, relay); err != nil {
+			// The courier shares the action deadline; on expiry or error it cancels
+			// the action so the container is torn down and reported, not hung.
+			if err := c.await(actCtx, time.Until(time.Now().Add(actionWaitBudget)), relay); err != nil {
 				courierErr = err
+				// Stop waiting on the container too: it can only be sitting on a
+				// browser interaction that is no longer going to arrive.
+				cancelAct()
 			}
 		case picintegration.EventError:
 			fmt.Fprintf(s.out, "  x %s\n", ev.Message)
@@ -816,7 +875,7 @@ func (s *setupSession) runAction(ctx context.Context, entry *menuEntry, state pi
 		}
 	}
 
-	reader, err := runIntegrationAction(ctx, s.runner, integrationCallRequest{
+	reader, err := runIntegrationAction(actCtx, s.runner, integrationCallRequest{
 		Answers:   answers,
 		Container: spec.Name,
 		Spec:      spec,

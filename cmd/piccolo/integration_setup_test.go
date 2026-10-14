@@ -3,10 +3,15 @@ package main
 import (
 	"bytes"
 	"context"
+	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/kimus/piccolo/internal/docker"
 
 	picintegration "github.com/kimus/piccolo/internal/integration"
 	"github.com/kimus/piccolo/internal/manifest"
@@ -509,5 +514,105 @@ func TestStateArgvAlsoPutsSubcommandFirst(t *testing.T) {
 	}
 	if len(got) > 2 && strings.HasPrefix(got[1], "-") {
 		t.Fatalf("flag before subcommand: %v", got)
+	}
+}
+
+// hangingProcess never produces stdout and never exits until Shutdown is called,
+// mimicking an action stuck on a browser interaction that never lands.
+type hangingProcess struct {
+	outR      *io.PipeReader
+	outW      *io.PipeWriter
+	errR      *io.PipeReader
+	pipeW     *io.PipeWriter
+	shutdowns int
+}
+
+func newHangingProcess() *hangingProcess {
+	or, ow := io.Pipe()
+	er, ew := io.Pipe()
+	return &hangingProcess{outR: or, outW: ow, errR: er, pipeW: ew}
+}
+
+func (h *hangingProcess) Stdin() io.WriteCloser { return nopWriteCloser{bytes.NewBuffer(nil)} }
+func (h *hangingProcess) Stdout() io.ReadCloser { return h.outR }
+func (h *hangingProcess) Stderr() io.ReadCloser { return h.errR }
+func (h *hangingProcess) Wait(ctx context.Context) (int, error) {
+	<-ctx.Done()
+	return -1, ctx.Err()
+}
+func (h *hangingProcess) Shutdown(time.Duration) error {
+	h.shutdowns++
+	_ = h.outW.CloseWithError(io.EOF)
+	_ = h.pipeW.CloseWithError(io.EOF)
+	return nil
+}
+func (h *hangingProcess) ExitCode() int { return -1 }
+
+type hangingRunner struct {
+	proc docker.Process
+	run  int
+}
+
+func (r *hangingRunner) Ping(context.Context) error { return nil }
+func (r *hangingRunner) BuildImage(context.Context, io.Reader, docker.ImageBuildOptions, io.Writer) error {
+	return nil
+}
+func (r *hangingRunner) Run(context.Context, docker.Spec) (docker.Process, error) {
+	r.run++
+	return r.proc, nil
+}
+func (r *hangingRunner) RemoveByPrefix(context.Context, string) ([]string, error) { return nil, nil }
+func (r *hangingRunner) Exec(context.Context, string, []string, bool) (*docker.ExecSession, error) {
+	return nil, fmt.Errorf("no live container")
+}
+
+// TestRunIntegrationActionTearsDownOnCancel is the Ctrl-C contract: cancelling
+// the action context must stop AND remove the container, not strand it.
+func TestRunIntegrationActionTearsDownOnCancel(t *testing.T) {
+	proc := newHangingProcess()
+	runner := &hangingRunner{proc: proc}
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(150 * time.Millisecond)
+		cancel()
+	}()
+
+	start := time.Now()
+	_, err := runIntegrationAction(ctx, runner, integrationCallRequest{
+		Answers:   []byte("{}"),
+		Container: "piccolo-setup-gws-login",
+		Spec:      docker.Spec{Name: "piccolo-setup-gws-login"},
+	}, io.Discard, nil)
+	if time.Since(start) > 10*time.Second {
+		t.Fatalf("cancel did not unblock the action (took %s)", time.Since(start))
+	}
+	if err == nil || !strings.Contains(err.Error(), "interrupted") {
+		t.Fatalf("expected an interrupt error, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "stopped and removed") {
+		t.Fatalf("error must state that cleanup ran: %v", err)
+	}
+	if proc.shutdowns == 0 {
+		t.Fatal("container was never shut down: Ctrl-C would leak it")
+	}
+}
+
+// TestRunIntegrationActionTearsDownOnDeadline covers the same contract for the
+// timeout path, with no signal involved.
+func TestRunIntegrationActionTearsDownOnDeadline(t *testing.T) {
+	proc := newHangingProcess()
+	runner := &hangingRunner{proc: proc}
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+
+	_, err := runIntegrationAction(ctx, runner, integrationCallRequest{
+		Answers: []byte("{}"),
+		Spec:    docker.Spec{},
+	}, io.Discard, nil)
+	if err == nil || !strings.Contains(err.Error(), "time budget") {
+		t.Fatalf("expected a budget error, got %v", err)
+	}
+	if proc.shutdowns == 0 {
+		t.Fatal("timed-out action must still be stopped and removed")
 	}
 }
