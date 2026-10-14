@@ -228,7 +228,15 @@ piccolo integration list
 piccolo integration list --json
 ```
 
-`setup` runs the integration-owned setup command in a one-shot container from the configured image with `picoclaw/` mounted at `/root/.picoclaw` and `integrations/` mounted at `/root/.piccolo/integrations`. Integration state is package-scoped under `integrations/<owner>/<repo>` on the host and `/root/.piccolo/integrations/<owner>/<repo>` in the container. The integration owns provider prompts, auth, state files, and any `config.json` merge-patching. After setup, run `piccolo restart`.
+`setup` drives the integration's declared actions in a one-shot container from the configured image, with `picoclaw/` mounted at `/root/.picoclaw` and `integrations/` mounted at `/root/.piccolo/integrations`. Integration state is package-scoped under `integrations/<owner>/<repo>` on the host and `/root/.piccolo/integrations/<owner>/<repo>` in the container.
+
+Ownership is split deliberately:
+
+- **The integration** decides what needs doing and reports state facts (`describe`, `state`, `call <action-id>`). It renders no terminal UI and never writes `config.json`.
+- **Piccolo** renders the menu and its inputs from that declaration, collects secrets on stdin rather than through argv or the environment, relays OAuth browser callbacks from the host into the container's loopback, and applies any `config.json` change an action proposes — to `tools.mcp.servers.<key>` for that integration and nowhere else, after showing the diff. One writer means one backup convention and one confirmation gate.
+- **Provider-side work stays yours**: creating the OAuth client in the provider console (a Desktop-app client, which registers no redirect URI), and installing any app or bot with the permissions you want.
+
+After setup, run `piccolo restart`.
 
 `upgrade [package]` advances latest-channel release installs. Fixed selector installs remain pinned; change versions by running `piccolo integration add <owner/repo@selector>` again. Setup is not rerun automatically.
 
