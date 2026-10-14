@@ -441,21 +441,118 @@ func TestStageHostFileConfirmsBeforeOverwritingExisting(t *testing.T) {
 	}
 }
 
-func TestInputsForSkipsSatisfiedFacts(t *testing.T) {
+// The reported defect: an action whose inputs were gated on a fact only that same
+// action can set became unfillable once it had been filled — the form lost the two
+// fields it existed for and Enter on the survivor was treated as a complete
+// submission. State facts gate which actions are selectable, never which render.
+func TestInputsForNeverSuppressesDeclaredFields(t *testing.T) {
 	inputs := []picintegration.ActionInput{
-		{Key: "client_id", Type: "text", Title: "id", WhenUnmet: "credentials"},
-		{Key: "client_secret", Type: "secret", Title: "secret", WhenUnmet: "credentials", Sensitive: true},
+		{Key: "client_id", Type: "text", Title: "id", WhenUnmet: "credentials", Required: true},
+		{Key: "client_secret", Type: "secret", Title: "secret", WhenUnmet: "credentials", Sensitive: true, Required: true},
 		{Key: "scope", Type: "select", Title: "scope"},
 	}
-	state := picintegration.State{Facts: map[string]bool{"credentials": false}}
-	if got := inputsFor(picintegration.Action{Inputs: inputs}, state); len(got) != 3 {
-		t.Fatalf("unmet facts must prompt for all inputs, got %d", len(got))
+	for _, credentialsSet := range []bool{false, true} {
+		state := picintegration.State{Facts: map[string]bool{"credentials": credentialsSet}}
+		got := inputsFor(picintegration.Action{Inputs: inputs}, state)
+		if len(got) != 3 {
+			t.Fatalf("credentials=%v rendered %d of %d declared inputs: %#v", credentialsSet, len(got), len(inputs), got)
+		}
+		if got[0].Key != "client_id" || got[1].Key != "client_secret" {
+			t.Fatalf("credential inputs must always render, got %s and %s", got[0].Key, got[1].Key)
+		}
 	}
-	state.Facts["credentials"] = true
-	got := inputsFor(picintegration.Action{Inputs: inputs}, state)
-	if len(got) != 1 || got[0].Key != "scope" {
-		t.Fatalf("satisfied fact must drop its inputs: %#v", got)
+}
+
+// Pre-fill exists so skip and clear are distinguishable. That only works if the
+// three answers states are encoded deliberately rather than inferred from which
+// bytes happen to be empty.
+func TestEncodeAnswersDistinguishesSetClearAndKeep(t *testing.T) {
+	inputs := []picintegration.ActionInput{
+		{Key: "client_id", Type: "text", Title: "id", Required: true},
+		{Key: "client_secret", Type: "secret", Title: "secret", Sensitive: true, Required: true},
+		{Key: "project_id", Type: "text", Title: "project", Destination: ""},
 	}
+	state := picintegration.State{Values: map[string]picintegration.FieldState{
+		"client_id":     {Value: "stored-id", Set: true},
+		"client_secret": {Set: true}, // presence only; the value never travels
+	}}
+
+	// (a) nothing touched: id keeps its pre-filled value, secret is omitted, so
+	// the integration reads it as keep rather than as a blank to store.
+	got := encodeAnswers(inputs, state, map[string]string{
+		"client_id": "stored-id", "client_secret": "", "project_id": "",
+	})
+	if got["client_secret"] != "" || hasKey(got, "client_secret") {
+		t.Errorf("untouched secret must be omitted (keep), got %#v", got)
+	}
+	if !hasKey(got, "project_id") || got["project_id"] != "" {
+		t.Errorf("emptied optional field must be sent as a clear, got %#v", got)
+	}
+	if got["client_id"] != "stored-id" {
+		t.Errorf("pre-filled value should resubmit unchanged, got %q", got["client_id"])
+	}
+
+	// (b) typed replacement travels as typed.
+	got = encodeAnswers(inputs, state, map[string]string{
+		"client_id": "new-id", "client_secret": "new-secret", "project_id": "p",
+	})
+	if got["client_secret"] != "new-secret" || got["client_id"] != "new-id" {
+		t.Errorf("typed values must be sent: %#v", got)
+	}
+
+	// (c) an undeclared key can never ride along, however it got into raw.
+	got = encodeAnswers(inputs, state, map[string]string{"client_id": "x", "unrelated": "leak"})
+	if hasKey(got, "unrelated") {
+		t.Errorf("undeclared key leaked: %#v", got)
+	}
+
+	// (d) nothing reported about a secret (older bundle): typed blank is still
+	// omitted, so no path can send an accidental clear of a stored secret.
+	got = encodeAnswers(inputs, picintegration.State{}, map[string]string{"client_secret": ""})
+	if hasKey(got, "client_secret") {
+		t.Errorf("secret must be omitted when untouched: %#v", got)
+	}
+}
+
+func TestRequiredValidatorBlocksEmptyButNotKeep(t *testing.T) {
+	secret := picintegration.ActionInput{Key: "client_secret", Type: "secret", Title: "OAuth client secret", Required: true}
+	id := picintegration.ActionInput{Key: "client_id", Type: "text", Title: "OAuth client ID", Required: true}
+
+	// A stored secret may be left blank — that is the keep gesture, not an absence.
+	if err := requiredValidator(secret, true)(""); err != nil {
+		t.Errorf("blank must be allowed when it means keep: %v", err)
+	}
+	// A visible field left blank is a real gap, and submitting must not proceed.
+	if err := requiredValidator(id, false)(""); err == nil {
+		t.Error("empty required field must block the form")
+	} else if !strings.Contains(err.Error(), "esc") {
+		t.Errorf("block message should say how to get out: %v", err)
+	}
+	if err := requiredValidator(id, false)("192902532576-abc.apps.googleusercontent.com"); err != nil {
+		t.Errorf("a typed value must pass: %v", err)
+	}
+}
+
+func TestSensitiveInputRecognition(t *testing.T) {
+	cases := []struct {
+		in   picintegration.ActionInput
+		want bool
+	}{
+		{picintegration.ActionInput{Type: "secret"}, true},
+		{picintegration.ActionInput{Type: "text", Sensitive: true}, true},
+		{picintegration.ActionInput{Type: "text"}, false},
+		{picintegration.ActionInput{Type: "path"}, false},
+	}
+	for _, tc := range cases {
+		if got := tc.in.SensitiveInput(); got != tc.want {
+			t.Errorf("SensitiveInput(%#v) = %v, want %v", tc.in, got, tc.want)
+		}
+	}
+}
+
+func hasKey(m map[string]string, key string) bool {
+	_, ok := m[key]
+	return ok
 }
 
 func TestActionContainerNamesAreDeterministicAndScoped(t *testing.T) {

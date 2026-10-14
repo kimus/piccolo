@@ -201,6 +201,11 @@ func stageHostFile(hostPath, stateDirRoot, destination, containerState string, c
 // answersJSON builds the single document delivered to the action's stdin.
 // Values travel here — never as argv or env — because both are readable
 // through `docker top` and `docker inspect`.
+//
+// Which keys are present is meaningful and is decided by renderActionInputs:
+// a present empty value says clear, an absent key says keep. This function only
+// restricts the document to declared keys, so an internal value can never leak
+// into an action through a stray map entry.
 func answersJSON(inputs []picintegration.ActionInput, values map[string]string) ([]byte, error) {
 	out := map[string]string{}
 	for _, in := range inputs {
@@ -332,10 +337,44 @@ func relayCallbackIntoContainer(ctx context.Context, runner integrationRunner, c
 	return nil
 }
 
+// errActionAborted signals that the user backed out of a rendered form. It is not
+// a failure: nothing is saved for that action, no container starts, and the menu
+// redraws — while a configuration proposal earned by an already-completed action
+// stays pending, because it belongs to that action and not to the form abandoned.
+var errActionAborted = errors.New("integration form abandoned")
+
+// requiredValidator blocks advancing past, and submitting with, an empty required
+// field. A sensitive field that already holds a value is the one exception: blank
+// there is the gesture for "keep what is stored", not an absence of input.
+func requiredValidator(in picintegration.ActionInput, blankMeansKeep bool) func(string) error {
+	return func(v string) error {
+		if strings.TrimSpace(v) != "" {
+			return nil
+		}
+		if blankMeansKeep {
+			return nil
+		}
+		return fmt.Errorf("%s is required — enter a value, or press esc to go back without saving", in.Title)
+	}
+}
+
 // renderActionInputs builds a huh form from the action's declared inputs and
-// returns answer values keyed by input. For a `path` input the returned value
-// is the *container-side* path, staged under the integration state directory.
-func renderActionInputs(action picintegration.Action, inputs []picintegration.ActionInput, hostStateDir, containerState string, tty bool) (map[string]string, error) {
+// returns the answers to deliver, keyed by input. Every declared input renders:
+// state facts gate which actions are selectable, never which fields appear,
+// because a field deleted before rendering can be neither validated nor replaced.
+//
+// Three states stay distinguishable on the wire, which is the whole point of
+// pre-filling:
+//
+//   - non-empty value      -> set
+//   - empty value          -> clear, which is what deleting a pre-filled optional
+//     field means, and the reason "absent means keep" alone cannot work
+//   - key absent           -> keep; only an untouched sensitive field produces this,
+//     since no stored secret may travel outbound
+//
+// For a `path` input the returned value is the *container-side* path, staged
+// under the integration state directory.
+func renderActionInputs(action picintegration.Action, inputs []picintegration.ActionInput, state picintegration.State, hostStateDir, containerState string, tty bool) (map[string]string, error) {
 	if len(inputs) == 0 {
 		return map[string]string{}, nil
 	}
@@ -345,24 +384,40 @@ func renderActionInputs(action picintegration.Action, inputs []picintegration.Ac
 
 	// One holder per input: values are only meaningful after the form runs.
 	type holder struct {
-		key   string
-		kind  string
-		text  string
-		check bool
-		multi []string
-		input picintegration.ActionInput
+		key        string
+		kind       string
+		text       string
+		check      bool
+		multi      []string
+		input      picintegration.ActionInput
+		sensitive  bool
+		blankKeeps bool // blank means keep a stored value, not clear it
 	}
 	holders := make([]*holder, 0, len(inputs))
 	var groups []*huh.Group
 
 	for _, in := range inputs {
-		h := &holder{key: in.Key, kind: in.Type, input: in}
+		current := state.Field(in.Key)
+		h := &holder{key: in.Key, kind: in.Type, input: in, sensitive: in.SensitiveInput()}
+		// Show what is stored so skipping and clearing remain distinguishable —
+		// except a secret, which is reported as a state instead of a value.
+		if !h.sensitive {
+			h.text = current.Value
+		} else {
+			h.blankKeeps = current.Set
+		}
 		holders = append(holders, h)
 		switch in.Type {
 		case "text", "secret":
 			field := huh.NewInput().Title(in.Title)
-			if in.Type == "secret" || in.Sensitive {
+			if h.sensitive {
 				field = field.EchoMode(huh.EchoModePassword)
+				if current.Set {
+					field = field.Description("Already set. Press enter to keep it, or type a value to replace it.")
+				}
+			}
+			if in.Required {
+				field = field.Validate(requiredValidator(in, h.blankKeeps))
 			}
 			groups = append(groups, huh.NewGroup(field.Value(&h.text)))
 		case "confirm":
@@ -372,12 +427,16 @@ func renderActionInputs(action picintegration.Action, inputs []picintegration.Ac
 		case "multiselect":
 			groups = append(groups, huh.NewGroup(huh.NewMultiSelect[string]().Title(in.Title).Options(multiOptions(in.Options, &h.multi)...)))
 		case "path":
-			// The picker starts inside the integration's own state directory:
-			// the user is choosing a host file to stage there, not browsing the
-			// whole filesystem by default.
+			// The picker starts inside the integration's own state directory: the
+			// user is choosing a host file to stage there, not browsing the whole
+			// filesystem by default. A pre-filled path shows the stored container-side
+			// path; emptying it asks the integration to stop using it.
 			picker := huh.NewFilePicker().Title(in.Title).Height(12).Picking(true).ShowHidden(true).ShowPermissions(true).FileAllowed(true).DirAllowed(false).CurrentDirectory(hostStateDir)
 			if _, err := os.Stat(hostStateDir); err != nil {
 				picker = picker.CurrentDirectory(homeOr(hostStateDir))
+			}
+			if in.Required {
+				picker = picker.Validate(requiredValidator(in, false))
 			}
 			groups = append(groups, huh.NewGroup(picker.Value(&h.text)))
 		default:
@@ -386,6 +445,9 @@ func renderActionInputs(action picintegration.Action, inputs []picintegration.Ac
 	}
 
 	if err := huh.NewForm(groups...).Run(); err != nil {
+		if errors.Is(err, huh.ErrUserAborted) {
+			return nil, errActionAborted
+		}
 		return nil, err
 	}
 
@@ -398,6 +460,9 @@ func renderActionInputs(action picintegration.Action, inputs []picintegration.Ac
 			values[h.key] = strings.Join(h.multi, ",")
 		case "path":
 			if strings.TrimSpace(h.text) == "" {
+				// Blank is a decision, not an absence: send it, so the integration
+				// can unset a path it was previously given.
+				values[h.key] = ""
 				continue
 			}
 			// Staging is Piccolo's job: it owns the mount that makes a host
@@ -408,12 +473,36 @@ func renderActionInputs(action picintegration.Action, inputs []picintegration.Ac
 			}
 			values[h.key] = cont
 		default:
-			if h.text != "" {
-				values[h.key] = h.text
-			}
+			values[h.key] = h.text
 		}
 	}
-	return values, nil
+	return encodeAnswers(inputs, state, values), nil
+}
+
+// encodeAnswers turns raw form output into the answers document, applying the
+// three-state rule that pre-fill makes possible:
+//
+//   - a non-empty value sets
+//   - an empty value on a field that can be seen clears, which is the only way
+//     deleting a stored optional value can mean anything
+//   - an omitted key keeps, reserved for an untouched sensitive field, since no
+//     stored secret may travel outbound to be shown
+//
+// Sensitive fields are the sole source of omission, so a blank can never be
+// misread as "keep" on a field the user was looking at.
+func encodeAnswers(inputs []picintegration.ActionInput, state picintegration.State, raw map[string]string) map[string]string {
+	out := map[string]string{}
+	for _, in := range inputs {
+		value, ok := raw[in.Key]
+		if !ok {
+			continue
+		}
+		if in.SensitiveInput() && value == "" {
+			continue // untouched: the integration keeps what it stores
+		}
+		out[in.Key] = value
+	}
+	return out
 }
 
 func stringOptions(opts []string, target *string) []huh.Option[string] {
@@ -670,6 +759,11 @@ func runDeclarativeSetup(ctx context.Context, out io.Writer, runner integrationR
 		}
 		chosen, done, err := s.chooseAction(displayIntegration(*found), menu)
 		if err != nil {
+			if errors.Is(err, huh.ErrUserAborted) {
+				// Quitting from the menu abandons the run: a proposal from a completed
+				// action is not applied behind the user's back.
+				return nil
+			}
 			return err
 		}
 		if done {
@@ -677,6 +771,11 @@ func runDeclarativeSetup(ctx context.Context, out io.Writer, runner integrationR
 		}
 		patch, err := s.runAction(ctx, chosen, state)
 		if err != nil {
+			if errors.Is(err, errActionAborted) {
+				// Backing out of a form saves nothing for that action and keeps any
+				// proposal already earned, then re-reads state and redraws.
+				continue
+			}
 			return err
 		}
 		if len(patch) > 0 {
@@ -772,27 +871,23 @@ func (s *setupSession) chooseAction(title string, menu []menuEntry) (*menuEntry,
 	return nil, false, fmt.Errorf("selection %q no longer matches the integration's actions", pick)
 }
 
-// inputsFor drops inputs whose whenUnmet fact is already satisfied, so a
-// credentials form collapses to a scope prompt once credentials exist.
+// inputsFor returns the inputs an action must present. It is a seam rather than
+// logic: state facts gate which actions are selectable (buildMenu) and have never
+// been allowed to remove a declared field. An earlier version did suppress, keyed
+// on whenUnmet, which made the credential action unfillable once credentials
+// existed — the form lost the two fields it was for and submitted an unrelated
+// optional one. The accompanying test pins that this returns every declared input.
 func inputsFor(action picintegration.Action, state picintegration.State) []picintegration.ActionInput {
-	var out []picintegration.ActionInput
-	for _, in := range action.Inputs {
-		if in.WhenUnmet != "" && state.Facts[in.WhenUnmet] {
-			continue
-		}
-		out = append(out, in)
-	}
-	return out
+	return action.Inputs
 }
 
-// runAction executes one chosen action. `state` is the same snapshot the menu
-// was built from, so the facts that gated availability are also the facts that
-// filter the inputs: one read per iteration, no window where the two disagree,
-// and no extra container start per action.
+// runAction executes one chosen action. `state` is the same snapshot the menu was
+// built from, so availability and the values shown for pre-fill come from one read
+// per iteration — no window where the two disagree, and no extra container start.
 func (s *setupSession) runAction(ctx context.Context, entry *menuEntry, state picintegration.State) (json.RawMessage, error) {
 	action := entry.Action
 	inputs := inputsFor(action, state)
-	values, err := renderActionInputs(action, inputs, s.hostStateDir, s.contState, s.tty)
+	values, err := renderActionInputs(action, inputs, state, s.hostStateDir, s.contState, s.tty)
 	if err != nil {
 		return nil, err
 	}

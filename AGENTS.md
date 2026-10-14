@@ -12,6 +12,8 @@ Instructions for coding agents implementing Piccolo. Read [README.md](README.md)
 - The implementation SHALL run a single gateway container hosting multiple PicoClaw agents — not one container per agent.
 - Do NOT implement custom Piccolo memory, native PicoClaw tools, MCP servers, or custom runtime logic.
 - Do not assume PicoClaw features — verify against the pinned version's source before relying on any flag, field, or behavior.
+- An action's declared inputs SHALL ALL render. State facts gate which actions are selectable and SHALL NEVER remove a field from a form; `whenUnmet` is parsed for wire compatibility and ignored. A suppressed field can be neither reviewed nor replaced, and the surviving fields get submitted as if they were the whole answer.
+- The answers document distinguishes three states explicitly: non-empty **sets**, empty **clears**, absent **keeps**. Only an untouched sensitive field may be absent. A secret's value SHALL NOT be sent outbound or placed inside a field as a masked placeholder.
 
 ## Verified PicoClaw Facts (v0.3.1)
 
@@ -189,6 +191,7 @@ Reduced tool allowlists (research: `web_search`, `web_fetch`, `read_file`; coder
 
 ## Non-Goals (PoC)
 
+- No clearing of an optional-and-sensitive field (absence means keep there by construction), and no gesture to wipe stored credentials — a `reset_credentials` action stays an open question, not something to improvise.
 - No custom memory MCP server, SQLite store, tasks/reminders/scheduler.
 - No native PicoClaw tool registration or hooks.
 - No PicoClaw binary bundling, downloading, or `$PATH` usage.

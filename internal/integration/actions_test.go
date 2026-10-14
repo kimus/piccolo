@@ -228,3 +228,38 @@ func TestEventReaderErrorEvent(t *testing.T) {
 		t.Fatal("no result expected")
 	}
 }
+
+// Current field values arrive alongside facts so forms can pre-fill. The addition
+// must not become a version bump: an older integration sends no values, and a
+// newer one may send keys this build does not know.
+func TestParseStateAcceptsValuesAndUnknownKeys(t *testing.T) {
+	withValues := []byte(`{"schema":"piccolo.integration.state.v1","name":"gws","facts":{"credentials":true,"login":false},
+		"values":{"client_id":{"value":"1929.apps.googleusercontent.com","set":true},"client_secret":{"set":true}},
+		"someFutureField":{"ignored":true}}`)
+	state, err := ParseState(withValues)
+	if err != nil {
+		t.Fatalf("state with values must parse: %v", err)
+	}
+	if got := state.Field("client_id"); got.Value != "1929.apps.googleusercontent.com" || !got.Set {
+		t.Errorf("client_id field state = %#v", got)
+	}
+	// A secret reports presence and nothing else.
+	if got := state.Field("client_secret"); !got.Set || got.Value != "" {
+		t.Errorf("secret must report presence without a value: %#v", got)
+	}
+	if got := state.Field("absent"); got.Set || got.Value != "" {
+		t.Errorf("unknown key must read as unset: %#v", got)
+	}
+
+	// Facts-only payload from an older integration stays valid.
+	legacy, err := ParseState([]byte(`{"schema":"piccolo.integration.state.v1","name":"gws","facts":{"credentials":false}}`))
+	if err != nil {
+		t.Fatalf("facts-only state must still parse: %v", err)
+	}
+	if len(legacy.Values) != 0 {
+		t.Errorf("expected no values, got %#v", legacy.Values)
+	}
+	if got := legacy.Field("client_id"); got.Set {
+		t.Error("absent values must read as not-set, which renders an empty field")
+	}
+}

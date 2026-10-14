@@ -238,6 +238,19 @@ Ownership is split deliberately:
 
 After setup, run `piccolo restart`.
 
+### How the setup form behaves
+
+Every field an action declares is always shown. State facts decide which **actions** you can pick; they never delete a field from the form — a hidden field can neither be reviewed nor replaced, and an action whose own fields disappear is a form that submits itself empty.
+
+- **A field left as shown keeps its value.** Where the integration reports what it stores, non-secret fields are pre-filled, so pressing enter resubmits what is already there and deleting a value deliberately clears it.
+- **A required field cannot be skipped or submitted empty.** Piccolo blocks advancing and refuses to invoke the action, with a message pointing at `esc`. An integration that declares no requiredness keeps the old behaviour: everything is optional.
+- **A secret is never shown or sent back.** A stored client secret is reported as *already set*, and the field stays empty: pressing enter keeps it, typing replaces it. There is no masked placeholder sitting in the field as a value, because half-editing one produces a wrong secret that looks present.
+- **`esc` goes back to the menu.** Nothing is saved for the action you abandoned, and a configuration change proposed by an action that already finished is still offered at the end. Quitting from the menu itself exits without applying anything.
+
+Pre-filling and requiredness depend on the integration publishing them (`state.values`, `inputs[].required`). An older release still renders every field correctly; its fields simply start empty and none are enforced as required.
+
+The wire encoding carries those decisions explicitly: a non-empty value sets, an empty value clears, and a key that is absent means keep (reserved for an untouched secret).
+
 `upgrade [package]` advances latest-channel release installs. Fixed selector installs remain pinned; change versions by running `piccolo integration add <owner/repo@selector>` again. Setup is not rerun automatically.
 
 `build <package-ref>` is the explicit developer/source-build path using Devbox/Nix and may download compilers/build dependencies:

@@ -42,15 +42,29 @@ type ActionInput struct {
 	Key   string `json:"key"`
 	Type  string `json:"type"`
 	Title string `json:"title"`
+	// Required blocks advancing to the next field and blocks submitting while the
+	// field is empty, so a half-filled form never reaches an integration. Absent
+	// means optional, which keeps an integration that declares nothing behaving
+	// as it did before this existed.
+	Required bool `json:"required,omitempty"`
 	// Destination is relative to the integration state directory and only
 	// meaningful for type "path": Piccolo stages the host file there and hands
 	// the integration the container-side path.
 	Destination string `json:"destination,omitempty"`
-	// WhenUnmet skips prompting while the named fact is still false (ask until the
-	// prerequisite is satisfied). Unknown fact names read as unmet, so the input shows.
+	// WhenUnmet is still parsed for wire compatibility, but it no longer hides
+	// anything. Suppressing a field that the action itself exists to set made that
+	// action unfillable once it had been filled: the credential form lost its two
+	// required fields and submitted an unrelated optional one instead. State facts
+	// gate which actions are selectable, never which fields render.
 	WhenUnmet string   `json:"whenUnmet,omitempty"`
 	Sensitive bool     `json:"sensitive,omitempty"`
 	Options   []string `json:"options,omitempty"`
+}
+
+// SensitiveInput reports whether a value must never be displayed or logged for
+// this input, by type or by explicit marking.
+func (in ActionInput) SensitiveInput() bool {
+	return in.Type == "secret" || in.Sensitive
 }
 
 // Supported reports whether every input type is in the closed vocabulary.
@@ -132,12 +146,36 @@ func (d Descriptor) ValidateActions() error {
 	return nil
 }
 
+// FieldState reports what the integration currently holds for one input, so the
+// form can tell "leave it alone" apart from "clear it". A sensitive field reports
+// presence only, never the value: a secret must not cross the stdout boundary even
+// masked, because a mask sitting in the field can be half-edited into a wrong
+// secret that still validates as present.
+type FieldState struct {
+	Value string `json:"value,omitempty"`
+	Set   bool   `json:"set,omitempty"`
+}
+
 // State is what `call`-less fact lookup returns: it gates the menu so users
-// cannot select an action whose prerequisites are unmet.
+// cannot select an action whose prerequisites are unmet, and it carries current
+// field values so a rendered form can show what is already stored.
 type State struct {
 	Schema string          `json:"schema"`
 	Name   string          `json:"name"`
 	Facts  map[string]bool `json:"facts"`
+	// Values is optional: an integration that predates it reports facts only, and
+	// fields simply start empty. Unknown keys are ignored on both sides, which is
+	// why no state schema version bump is needed.
+	Values map[string]FieldState `json:"values,omitempty"`
+}
+
+// Field reports the state for one input key, or the zero value when the
+// integration sent nothing.
+func (s State) Field(key string) FieldState {
+	if s.Values == nil {
+		return FieldState{}
+	}
+	return s.Values[key]
 }
 
 func ParseState(data []byte) (State, error) {
