@@ -16,8 +16,6 @@ const (
 	PicoclawDir     = "picoclaw"
 	IntegrationsDir = "integrations"
 	RuntimeDir      = "runtime"
-	RuntimeDevbox   = "devbox"
-	RuntimeNix      = "nix"
 	RuntimeMedia    = "media"
 	ConfigName      = "config.json"
 	PidFileName     = ".picoclaw.pid"
@@ -25,8 +23,6 @@ const (
 	ContainerPicoclawHome = "/root/.picoclaw"
 	ContainerPiccoloHome  = "/root/.piccolo"
 	ContainerIntegrations = ContainerPiccoloHome + "/integrations"
-	ContainerDevbox       = "/root/.local/share/devbox/global/default"
-	ContainerNix          = "/nix"
 	ContainerMedia        = "/tmp/picoclaw_media"
 )
 
@@ -42,12 +38,15 @@ func (l Layout) Agents() string                 { return filepath.Join(l.Picocla
 func (l Layout) Integrations() string           { return filepath.Join(l.Root, IntegrationsDir) }
 func (l Layout) Integration(name string) string { return filepath.Join(l.Integrations(), name) }
 func (l Layout) Runtime() string                { return filepath.Join(l.Root, RuntimeDir) }
-func (l Layout) RuntimeDevbox() string          { return filepath.Join(l.Runtime(), RuntimeDevbox) }
-func (l Layout) RuntimeNix() string             { return filepath.Join(l.Runtime(), RuntimeNix) }
 func (l Layout) RuntimeMedia() string           { return filepath.Join(l.Runtime(), RuntimeMedia) }
 
+// RuntimeDirs returns the directories Piccolo creates in a workspace. The
+// Devbox profile and Nix cache directories are gone: the toolchain is image
+// content, so those caches had no purpose beyond shadowing /nix, and creating
+// them implied a start-time install that no longer exists. Older workspaces may
+// still contain them; Piccolo neither uses nor deletes them.
 func (l Layout) RuntimeDirs() []string {
-	return []string{l.RuntimeDevbox(), l.RuntimeNix(), l.RuntimeMedia(), l.Integrations(), l.PicoclawHome()}
+	return []string{l.RuntimeMedia(), l.Integrations(), l.PicoclawHome()}
 }
 
 func (l Layout) IntegrationBind() string {

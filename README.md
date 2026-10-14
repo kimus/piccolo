@@ -133,11 +133,16 @@ The gateway always runs. If you enabled the optional **web console** (launcher i
     gws/
       auth/
       backend.json
-  runtime/           # workspace-visible caches
+  runtime/           # media mirror only (older workspaces may also hold unused devbox/nix dirs)
+    media/           # -> /tmp/picoclaw_media and per-agent media mirrors
     media/           # -> /tmp/picoclaw_media and agent media mirrors
 ```
 
-Mount ownership is intentionally split: `/root/.picoclaw` is PicoClaw's home only (including PicoClaw runtime files like `.security.yml`, `logs/`, and `launcher-auth.db`), while integration packages persist their state under `/root/.piccolo/integrations/<name>` (for Google Workspace, `<name>` is `gws`). The toolchain is **not** mounted from the host any more: it is baked into the runtime image, because a host bind over `/nix` hides the image's own store. `runtime/devbox` and `runtime/nix` may still exist in older workspaces; they are unused leftovers, and Piccolo never deletes them — `piccolo runtime reset-cache --yes` does, on request.
+Mount ownership is intentionally split: `/root/.picoclaw` is PicoClaw's home only (including PicoClaw runtime files like `.security.yml`, `logs/`, and `launcher-auth.db`), while integration packages persist their state under `/root/.piccolo/integrations/<name>` (for Google Workspace, `<name>` is `gws`). The toolchain is **not** mounted from the host any more: it is baked into the runtime image, because a host bind over `/nix` hides the image's own store. `runtime/devbox` and `runtime/nix` may still exist in older workspaces. They are unused leftovers: Piccolo no longer creates them, never mounts them, and never deletes them. To clear one, note that a Nix store directory is read-only (`555`), so a plain `rm -rf` fails partway:
+
+```sh
+chmod -R u+w <workspace>/runtime/nix && rm -rf <workspace>/runtime/nix <workspace>/runtime/devbox
+```
 
 ## Configuration ownership
 
@@ -393,7 +398,9 @@ The toolchain installs in its **own layer, before the integration layers**. Dock
 
 Every locally built image records what it contains, in labels: `piccolo.base`, `piccolo.toolchain`, and one `piccolo.integration.<owner>/<repo>="<version>+<digest>"` per installed release. Those labels are what turn "the image is stale" into a reason you can act on.
 
-Use `piccolo runtime status` to inspect configured/live commands, `piccolo runtime apply` to check whether the running image already contains the configured toolchain (it reports the mismatch and the rebuild command; it no longer installs anything, because a running container is not where the toolchain is defined), `piccolo runtime prune` to attempt Nix garbage collection, and `piccolo runtime reset-cache --yes` to remove leftover `runtime/` caches.
+Use `piccolo runtime status` to inspect configured and live commands, and `piccolo runtime apply` to check whether the running image already contains the configured toolchain — it reports a mismatch and names the rebuild command, and it installs nothing, because a running container is not where the toolchain is defined.
+
+There is deliberately no `runtime prune` or `runtime reset-cache`: garbage-collecting Nix inside a running container reclaims nothing durable (the store is image content, and the writable layer is discarded on recreate), and the cache directories it used to clear are no longer created. Disk reclamation belongs to the image layer — see `docker image prune` and the planned `piccolo image prune`.
 
 For QR codes the Devbox package is `zbar`; other common mappings include image normalization with ImageMagick (`magick`, `convert`, `identify`), OCR with `tesseract`, PDF inspection/rendering with Poppler (`pdfinfo`, `pdftotext`, `pdftoppm`, `pdftocairo`), office conversion with LibreOffice (`soffice`/`libreoffice`), structured data parsing with Python/`jq`/`yq`/`xmllint`, archive listing before extraction, EXIF inspection with `exiftool`, and media inspection with `ffprobe`/`ffmpeg`. The skill tells agents to call these directly, avoid OpenCV/`cv2` unless explicitly needed, write intermediates under the workspace, and never use `apt-get` (the base image is Alpine).
 

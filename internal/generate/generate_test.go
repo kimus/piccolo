@@ -267,7 +267,7 @@ func TestFileHandlingSkillGenerated(t *testing.T) {
 		"name: file-handling",
 		"deterministic tools for exact payloads",
 		"available directly on PATH",
-		"piccolo-setup-tools",
+		"the runtime image was built without it",
 		"zbarimg --quiet --raw <image-path>",
 		"Do not use `apt-get`",
 		"Do not import `cv2`",

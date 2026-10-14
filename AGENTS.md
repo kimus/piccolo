@@ -33,7 +33,7 @@ Verified against `github.com/sipeed/picoclaw@v0.3.1` source (present in the Go m
 
 - Workspace = the target directory itself (default: cwd; `-D/--dir` flag overrides). `piccolo.yaml` lives at the root; PicoClaw-owned files live under `picoclaw/`; integration state under `integrations/`; runtime caches under `runtime/`.
 - Workspace resolution rule is shared by ALL commands: `-D/--dir` flag, else cwd. `serve`/`doctor` fail with `no piccolo workspace found — run 'piccolo init' first` when `piccolo.yaml` is absent.
-- Mounts: `<workspace>/picoclaw` → `/root/.picoclaw`, `<workspace>/integrations` → `/root/.piccolo/integrations`, and `<workspace>/runtime/media` → `/tmp/picoclaw_media` plus per-agent media mirrors. Nothing SHALL be bind-mounted over `/nix` or the Devbox global dir: the toolchain is image content, and shadowing the image's store makes its own binaries unexecutable in the running gateway while one-shot containers (which take no such bind) still work.
+- Mounts: `<workspace>/picoclaw` → `/root/.picoclaw`, `<workspace>/integrations` → `/root/.piccolo/integrations`, and `<workspace>/runtime/media` → `/tmp/picoclaw_media` plus per-agent media mirrors. `runtime/media` is the only directory under `runtime/` that Piccolo creates. Nothing SHALL be bind-mounted over `/nix` or the Devbox global dir: the toolchain is image content, and shadowing the image's store makes its own binaries unexecutable in the running gateway while one-shot containers (which take no such bind) still work.
 - All `workspace` paths in `config.json` SHALL be container-side paths, e.g. `~/.picoclaw/agents/main` (image runs with `HOME=/root`; upstream defaults use `~`, tilde expansion supported).
 
 ### `piccolo.yaml` schema

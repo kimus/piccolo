@@ -48,7 +48,7 @@ func TestEnsureDirsAndLegacyDetection(t *testing.T) {
 	if err := l.EnsureDirs(); err != nil {
 		t.Fatal(err)
 	}
-	for _, p := range []string{l.PicoclawHome(), l.Integrations(), l.RuntimeDevbox(), l.RuntimeNix(), l.RuntimeMedia()} {
+	for _, p := range []string{l.PicoclawHome(), l.Integrations(), l.RuntimeMedia()} {
 		if st, err := os.Stat(p); err != nil || !st.IsDir() {
 			t.Fatalf("missing dir %s err=%v", p, err)
 		}

@@ -50,8 +50,6 @@ func TestWorkspaceMigrateLegacy(t *testing.T) {
 		filepath.Join(dir, "picoclaw", ".security.yml"),
 		filepath.Join(dir, "picoclaw", "launcher-auth.db"),
 		filepath.Join(dir, "integrations", "gws", "backend.json"),
-		filepath.Join(dir, "runtime", "devbox"),
-		filepath.Join(dir, "runtime", "nix"),
 		filepath.Join(dir, "runtime", "media"),
 		filepath.Join(dir, "piccolo-migration-summary.md"),
 	} {
