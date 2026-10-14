@@ -502,6 +502,11 @@ func renderActionInputs(action picintegration.Action, inputs []picintegration.Ac
 	var groups []*huh.Group
 
 	for _, in := range inputs {
+		// The library never renders its own abort binding, so the hint is written
+		// into the screen -- the way `piccolo setup` does it. Once per form, on the
+		// first field, because repeating it on every field buries the parts that
+		// explain what pressing enter will do.
+		first := len(groups) == 0
 		current := state.Field(in.Key)
 		h := &holder{key: in.Key, kind: in.Type, input: in, sensitive: in.SensitiveInput()}
 		// Show what is stored so skipping and clearing remain distinguishable —
@@ -515,27 +520,46 @@ func renderActionInputs(action picintegration.Action, inputs []picintegration.Ac
 		switch in.Type {
 		case "text", "secret":
 			field := huh.NewInput().Title(in.Title)
+			desc := ""
 			if h.sensitive {
 				field = field.EchoMode(huh.EchoModePassword)
 				if current.Set {
-					field = field.Description("Already set. Press enter to keep it, or type a value to replace it.")
+					desc = "Already set. Press enter to keep it, or type a value to replace it."
 				}
 			} else if current.Value != "" {
 				// A pre-filled visible field is otherwise silent about the fact
 				// that pressing enter means KEEP. That silence is how a user ends
 				// up authorizing a stale client while believing they replaced it.
-				field = field.Description(fmt.Sprintf("Currently: %s — press enter to keep it, or edit to replace it.", elide(current.Value)))
+				desc = fmt.Sprintf("Currently: %s — press enter to keep it, or edit to replace it.", elide(current.Value))
+			}
+			if first {
+				desc = withEscHint(desc, "esc back to the menu")
+			}
+			if desc != "" {
+				field = field.Description(desc)
 			}
 			if in.Required {
 				field = field.Validate(requiredValidator(in, h.blankKeeps))
 			}
 			groups = append(groups, huh.NewGroup(field.Value(&h.text)))
 		case "confirm":
-			groups = append(groups, huh.NewGroup(huh.NewConfirm().Title(in.Title).Value(&h.check)))
+			confirm := huh.NewConfirm().Title(in.Title)
+			if first {
+				confirm = confirm.Description(escBackHint)
+			}
+			groups = append(groups, huh.NewGroup(confirm.Value(&h.check)))
 		case "select":
-			groups = append(groups, huh.NewGroup(huh.NewSelect[string]().Title(in.Title).Options(stringOptions(in.Options, &h.text)...)))
+			sel := huh.NewSelect[string]().Title(in.Title).Options(stringOptions(in.Options, &h.text)...)
+			if first {
+				sel = sel.Description(escBackHint)
+			}
+			groups = append(groups, huh.NewGroup(sel))
 		case "multiselect":
-			groups = append(groups, huh.NewGroup(huh.NewMultiSelect[string]().Title(in.Title).Options(multiOptions(in.Options, &h.multi)...)))
+			multi := huh.NewMultiSelect[string]().Title(in.Title).Options(multiOptions(in.Options, &h.multi)...)
+			if first {
+				multi = multi.Description(escBackHint)
+			}
+			groups = append(groups, huh.NewGroup(multi))
 		case "path":
 			// The picker starts inside the integration's own state directory: the
 			// user is choosing a host file to stage there, not browsing the whole
@@ -547,6 +571,9 @@ func renderActionInputs(action picintegration.Action, inputs []picintegration.Ac
 			}
 			if in.Required {
 				picker = picker.Validate(requiredValidator(in, false))
+			}
+			if first {
+				picker = picker.Description(escBackHint)
 			}
 			groups = append(groups, huh.NewGroup(picker.Value(&h.text)))
 		default:
@@ -941,6 +968,19 @@ func runDeclarativeSetup(ctx context.Context, out io.Writer, runner integrationR
 // caller: a summary that prints whatever it is handed would list a success or a
 // cancel the user chose as a failure the moment a second call site appears, and
 // a summary with false entries is the thing that teaches people to skip it.
+// escBackHint is shown once per form. huh never renders its own abort binding,
+// so a key that works must also be advertised -- see the setup-ux spec.
+const escBackHint = "esc back to the menu"
+
+// withEscHint appends the abort hint to a field description that may already
+// carry an explanation of its own.
+func withEscHint(desc, hint string) string {
+	if strings.TrimSpace(desc) == "" {
+		return hint
+	}
+	return desc + " · " + hint
+}
+
 func (s *setupSession) summarize(reports []actionReport) {
 	var unfinished []actionReport
 	for _, r := range reports {
@@ -1095,6 +1135,11 @@ func (s *setupSession) chooseAction(title string, menu []menuEntry, state picint
 		Title(title + " — what do you want to do?").
 		Options(huh.NewOptions(labels...)...).
 		Value(&pick)
+	if subtitle != "" {
+		subtitle += "  ·  esc quit"
+	} else {
+		subtitle = "esc quit"
+	}
 	if subtitle != "" {
 		selectField = selectField.Description(subtitle)
 	}

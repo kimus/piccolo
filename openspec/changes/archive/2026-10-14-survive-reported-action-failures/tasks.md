@@ -23,9 +23,16 @@
 
 - [x] 4.1 Against a genuinely failing action (Drive not enabled): menu returned, failure and link rendered, no `Error:` in output
 - [x] 4.2 Re-drawn menu showed the descriptor description and the stored client, confirming state was re-read
-- [ ] 4.3 Confirm the summary line interactively (the driver's terminal cancel at the menu did not register; the filter is covered by unit test instead)
+- [x] 4.3 Summary line confirmed live, which surfaced a second defect: every attempt was logged separately, so a failing check followed by a passing retry still printed "reported failure" at the end of a clean run. Outcomes are now keyed by action id
 
 ## 5. Checks
 
 - [x] 5.1 `go build ./...`, `go vet ./...`, `go test ./...`
 - [x] 5.2 `go build -o piccolo` after every change — a verification run against a stale binary already cost hours this session
+
+## 6. Follow-up found in the field
+
+- [x] 6.1 `attemptLog.record` replaces the entry for an action instead of appending
+- [x] 6.2 Order stays first-attempt, so the summary reads like the session did
+- [x] 6.3 Quitting with nothing pending no longer claims a config change was abandoned
+- [x] 6.4 Test reproduces the exact sequence the user hit: reported → crashed → succeeded

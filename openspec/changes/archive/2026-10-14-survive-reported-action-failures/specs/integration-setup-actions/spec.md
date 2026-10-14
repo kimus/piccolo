@@ -64,3 +64,18 @@ Piccolo SHALL render action severity with colour when writing to a terminal, fol
 
 - **WHEN** the output is not a terminal, or NO_COLOR is set
 - **THEN** every line still carries its textual status marker
+
+### Requirement: The closing report reflects the latest attempt
+
+Piccolo SHALL record one outcome per action, replaced by each new attempt, so that a successful retry removes an earlier failure from the closing summary.
+
+#### Scenario: Failure then success
+
+- **WHEN** an action reports failure and the user runs it again successfully
+- **THEN** the closing summary does not list that action
+- **AND** the command still lists any other action left unfinished
+
+#### Scenario: Success then failure
+
+- **WHEN** an action succeeds and a later attempt at the same action reports failure
+- **THEN** the summary lists the action as unfinished, once
