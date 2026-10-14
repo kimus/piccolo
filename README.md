@@ -65,7 +65,7 @@ Install a specific version:
 curl -fsSL https://kimus.github.io/piccolo/install.sh | sh -s -- --version 0.2.0
 ```
 
-The installer downloads the matching GitHub Release archive, verifies `checksums.txt`, and installs only the host `piccolo` CLI. It does not install Docker, PicoClaw, Devbox/Nix, or integrations.
+The installer downloads the matching GitHub Release archive, verifies `checksums.txt`, and installs only the host `piccolo` CLI. It does not install Docker, PicoClaw, or integrations.
 
 Manual installs can download a release archive and `checksums.txt` from GitHub Releases, verify the SHA-256 digest, and place `piccolo` on `PATH`.
 
@@ -138,7 +138,7 @@ The gateway always runs. If you enabled the optional **web console** (launcher i
     media/           # -> /tmp/picoclaw_media and agent media mirrors
 ```
 
-Mount ownership is intentionally split: `/root/.picoclaw` is PicoClaw's home only (including PicoClaw runtime files like `.security.yml`, `logs/`, and `launcher-auth.db`), while integration packages persist their state under `/root/.piccolo/integrations/<name>` (for Google Workspace, `<name>` is `gws`). The toolchain is **not** mounted from the host any more: it is baked into the runtime image, because a host bind over `/nix` hides the image's own store. `runtime/devbox` and `runtime/nix` may still exist in older workspaces. They are unused leftovers: Piccolo no longer creates them, never mounts them, and never deletes them. To clear one, note that a Nix store directory is read-only (`555`), so a plain `rm -rf` fails partway:
+Mount ownership is intentionally split: `/root/.picoclaw` is PicoClaw's home only (including PicoClaw runtime files like `.security.yml`, `logs/`, and `launcher-auth.db`), while integration packages persist their state under `/root/.piccolo/integrations/<name>` (for Google Workspace, `<name>` is `gws`). The toolchain is **not** mounted from the host: it is baked into the runtime image with the base distribution's package manager (`apk`). A host bind over `/nix` would hide the runtime closure that integration bundles unpack there. `runtime/devbox` and `runtime/nix` may still exist in older workspaces from the previous mechanism. They are unused leftovers: Piccolo no longer creates them, never mounts them, and never deletes them. To clear one, note that a Nix store directory is read-only (`555`), so a plain `rm -rf` fails partway:
 
 ```sh
 chmod -R u+w <workspace>/runtime/nix && rm -rf <workspace>/runtime/nix <workspace>/runtime/devbox
@@ -253,10 +253,11 @@ The wire encoding carries those decisions explicitly: a non-empty value sets, an
 
 `upgrade [package]` advances latest-channel release installs. Fixed selector installs remain pinned; change versions by running `piccolo integration add <owner/repo@selector>` again. Setup is not rerun automatically.
 
-`build <package-ref>` is the explicit developer/source-build path using Devbox/Nix and may download compilers/build dependencies:
+Source-built integrations are **no longer supported**: that path resolved a Nix flake reference, and the runtime image installs with `apk`. Install from a published release instead — the release bundle carries its own runtime closure, so it needs nothing extra in the image. A `piccolo.yaml` that still records `source: build` loads normally, and any image rebuild refuses it with the remedy:
 
 ```sh
-piccolo integration build kimus/piccolo-gws@main
+piccolo image build
+# Error: integration "github:kimus/piccolo-gws" is recorded as built from source ("github:kimus/piccolo-gws?ref=main"), which is no longer supported: … Reinstall it from a published release with 'piccolo integration add github:kimus/piccolo-gws' (…)
 ```
 
 `status <package>` runs the integration-owned connectivity checks in a one-shot container and renders provider-specific results through a generic Piccolo status format. For Google Workspace, this is where Gmail, Calendar, and Drive connectivity is checked:
@@ -386,7 +387,7 @@ Generated agents include the PicoClaw skill `file-handling`, which teaches them 
 zbarimg --quiet --raw /tmp/picoclaw_media/<uploaded>.png
 ```
 
-Build the local runtime image to bake in Devbox/Nix, the file-handling toolchain, and every installed integration:
+Build the local runtime image to bake in the file-handling toolchain (installed with the base image's `apk`) and every installed integration:
 
 ```sh
 piccolo image build --set
@@ -395,11 +396,13 @@ piccolo restart
 
 The build uses the configured pinned PicoClaw image as its base, generates a temporary/in-memory Docker build context, and tags a local image such as `piccolo/picoclaw-runtime:<hash>`. It does not require a public Piccolo image registry. Omit `--set` to leave `piccolo.yaml` unchanged; Piccolo will print the `container.image` value to adopt manually. `image build` composes the **whole** workspace image — toolchain plus all installed integrations — which is why it is the command the staleness warning points at.
 
-**The toolchain is baked into the image.** Nothing installs when the gateway starts, and Piccolo binds nothing over `/nix`. That is the fix for a failure mode that was silent and total: mounting the workspace Nix cache over `/nix` hid the image's own store (1464 entries in the image, 68 visible in the running container), so `gws`, `piccolo-gws`, `python3` and `jq` existed on `PATH` and still could not execute — the integration worked when Piccolo configured it and failed when Piccolo ran it.
+**The toolchain is baked into the image.** Nothing installs when the gateway starts, and Piccolo binds nothing over `/nix` or `/usr`. That is the fix for a failure mode that was silent and total: mounting a host package cache over the image's own store hid it (1464 entries in the image, 68 visible in the running container), so `gws`, `piccolo-gws`, `python3` and `jq` existed on `PATH` and still could not execute — the integration worked when Piccolo configured it and failed when Piccolo ran it.
 
-The cost is disk, and it is measured rather than assumed: with the default package list the runtime image goes from **440 MB to about 8.3 GB**, and the toolchain layer alone is **5.78 GB** (libreoffice, ffmpeg, imagemagick and tesseract dominate). Two things keep that from being worse: the layer is gc-rooted and pruned in place (collection recovered ~30 MB, because the closure genuinely is that size), and layer digests are shared across tags, so rebuilding for an integration change does not pay for it again — a `0.3.1 → 0.3.2` upgrade rebuilt in ~40s with the toolchain layer reporting `Using cache`. Trim `runtime.toolchain.packages` if the full office/media set is not needed.
+The cost is disk, and it is measured rather than assumed: the default list is **17 packages providing 23 commands**, and the runtime image goes from a ~440 MB base to about **2.1 GB** (1.6 GB of rootfs in a running container). A cold build takes about a minute. LibreOffice (761 MB) and pandoc (235 MB) dominate; OCR installs the engine plus **English language data only** — the all-languages variant measured 1015 MB against 39 MB, so extra languages are an explicit `tesseract-ocr-data-<lang>` entry rather than a default.
 
-**Old images accumulate, and Piccolo never deletes them silently.** Every distinct toolchain/integration/base configuration is a new ~8 GB tag, and the rollback slot (`container.previous_image`) deliberately keeps an older one reachable. Ask Piccolo what is there:
+Layer digests are shared across tags, so rebuilding for an integration change does not pay for the toolchain again. An integration upgrade rebuilt in ~40s with the toolchain layer reporting `Using cache`. Edit `runtime.toolchain.packages` if the full office/media set is not needed, and pin a version by naming it (`jq=1.7.1-r0`) — apk has no lockfile, so the content-derived tag identifies the list you requested, not the exact resolved bytes.
+
+**Old images accumulate, and Piccolo never deletes them silently.** Every distinct toolchain/integration/base configuration is a new ~2 GB tag, and the rollback slot (`container.previous_image`) deliberately keeps an older one reachable. Ask Piccolo what is there:
 
 ```sh
 piccolo image list          # size, age, and why each image was kept
@@ -427,7 +430,7 @@ Use `piccolo runtime status` to inspect configured and live commands, and `picco
 
 There is deliberately no `runtime prune` or `runtime reset-cache`: garbage-collecting Nix inside a running container reclaims nothing durable (the store is image content, and the writable layer is discarded on recreate), and the cache directories it used to clear are no longer created. Disk reclamation belongs to the image layer — see `docker image prune` and the planned `piccolo image prune`.
 
-For QR codes the Devbox package is `zbar`; other common mappings include image normalization with ImageMagick (`magick`, `convert`, `identify`), OCR with `tesseract`, PDF inspection/rendering with Poppler (`pdfinfo`, `pdftotext`, `pdftoppm`, `pdftocairo`), office conversion with LibreOffice (`soffice`/`libreoffice`), structured data parsing with Python/`jq`/`yq`/`xmllint`, archive listing before extraction, EXIF inspection with `exiftool`, and media inspection with `ffprobe`/`ffmpeg`. The skill tells agents to call these directly, avoid OpenCV/`cv2` unless explicitly needed, write intermediates under the workspace, and never use `apt-get` (the base image is Alpine).
+For QR codes the package is `zbar`; other common mappings include image normalization with ImageMagick (`magick`, `convert`, `identify`), OCR with `tesseract`, PDF inspection/rendering with Poppler (`pdfinfo`, `pdftotext`, `pdftoppm`, `pdftocairo`), office conversion with LibreOffice (`soffice`/`libreoffice`), structured data parsing with Python/`jq`/`yq`/`xmllint`, archive listing before extraction, EXIF inspection with `exiftool`, and media inspection with `ffprobe`/`ffmpeg`. The skill tells agents to call these directly, avoid OpenCV/`cv2` unless explicitly needed, write intermediates under the workspace, and never install anything at runtime — a tool that is missing was left out of the image, and the fix is `piccolo image build` with the package added (`apt-get` is also the wrong package manager: the base image is Alpine).
 
 Piccolo also configures container-scoped media/debug settings: `agents.defaults.allow_read_outside_workspace` is enabled (this is a container, not a personal computer), and `agents.defaults.tool_feedback` is enabled with `max_args_length: 300` so tool execution is visible directly in chat. PicoClaw natively allows exec/read access to its upload dir `/tmp/picoclaw_media`, and Piccolo mirrors that media volume into each agent workspace as `media/` for convenience.
 

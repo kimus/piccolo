@@ -41,7 +41,7 @@ func (l Layout) Runtime() string                { return filepath.Join(l.Root, R
 func (l Layout) RuntimeMedia() string           { return filepath.Join(l.Runtime(), RuntimeMedia) }
 
 // RuntimeDirs returns the directories Piccolo creates in a workspace. The
-// Devbox profile and Nix cache directories are gone: the toolchain is image
+// No package-manager cache directories: the toolchain is image
 // content, so those caches had no purpose beyond shadowing /nix, and creating
 // them implied a start-time install that no longer exists. Older workspaces may
 // still contain them; Piccolo neither uses nor deletes them.
@@ -54,10 +54,11 @@ func (l Layout) IntegrationBind() string {
 }
 
 // RuntimeBinds returns the host caches mounted into the gateway. Only the media
-// mirror belongs here: the Devbox/Nix toolchain is baked into the image, and
-// mounting the workspace Nix cache over /nix HIDES the image's own store —
-// which left gws, piccolo-gws, python3 and jq unexecutable in a container
-// started from an image that contained all of them.
+// mirror belongs here. The toolchain is baked into the image, and integration
+// bundles unpack their own /nix/store closure into it — mounting a host
+// directory over /nix HIDES that content, which left gws, piccolo-gws, python3
+// and jq unexecutable in a container started from an image that contained all
+// of them.
 func (l Layout) RuntimeBinds() []string {
 	return []string{
 		l.RuntimeMedia() + ":" + ContainerMedia + ":rw",

@@ -6,6 +6,34 @@ import (
 	"testing"
 )
 
+// The generated Dockerfile is executed by the daemon, not by Go, so a missing
+// line continuation is a build failure rather than a test failure. This checks
+// the one rule that a string-building function can get wrong silently.
+func TestDockerfileLineContinuationsAreValid(t *testing.T) {
+	plan, err := BuildPlan(Options{
+		Packages: []string{"file", "libreoffice"},
+		Commands: []string{"file", "soffice"},
+		Bundles:  []IntegrationBundle{{Package: "kimus/x", Version: "1", Digest: "sha256:aaaa", Commands: []string{"x"}}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(plan.Dockerfile, "\n")
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if !strings.HasPrefix(trimmed, "&&") && !strings.HasPrefix(trimmed, "if [") && !strings.HasPrefix(trimmed, "for ") {
+			continue
+		}
+		if i == 0 {
+			t.Fatalf("line 0 starts a continuation: %q", line)
+		}
+		prev := strings.TrimRight(lines[i-1], " \t")
+		if !strings.HasSuffix(prev, "\\") {
+			t.Errorf("line %d continues a command but the previous line has no trailing backslash:\nprev=%q\nline=%q", i+1, lines[i-1], line)
+		}
+	}
+}
+
 func TestBuildPlanDeterministic(t *testing.T) {
 	p1, err := BuildPlan(Options{BaseImage: "docker.io/sipeed/picoclaw:v0.3.1", Packages: []string{"file", "zbar", "file"}, Commands: []string{"file", "zbarimg", "file"}})
 	if err != nil {
@@ -15,50 +43,40 @@ func TestBuildPlanDeterministic(t *testing.T) {
 	if err != nil {
 		t.Fatalf("BuildPlan: %v", err)
 	}
-	if p1.Tag != p2.Tag || p1.Dockerfile != p2.Dockerfile || p1.DevboxJSON != p2.DevboxJSON {
+	if p1.Tag != p2.Tag || p1.Dockerfile != p2.Dockerfile {
 		t.Fatal("plan is not deterministic")
 	}
 	for _, want := range []string{
 		"FROM docker.io/sipeed/picoclaw:v0.3.1",
-		"apk add --no-cache bash curl ca-certificates xz tar git shadow coreutils",
-		"COPY devbox.json /root/.local/share/devbox/global/default/devbox.json",
-		"groupadd -g 30000 nixbld",
-		"RUN devbox version",
+		// Bootstrap carries only what the build and runtime need. `shadow` and
+		// `xz` existed solely for the Nix installer and are gone.
+		"RUN apk add --no-cache bash curl ca-certificates tar git coreutils",
 	} {
 		if !strings.Contains(p1.Dockerfile, want) {
 			t.Errorf("Dockerfile missing %q", want)
 		}
 	}
-	// The toolchain is image content now: installed at BUILD time, rooted so a
-	// later layer's garbage collection cannot take it, and symlinked onto PATH.
-	// Nothing about it depends on a start-time step or a host mount.
+	// The toolchain is installed by the base distribution at BUILD time and each
+	// configured command is verified on PATH afterwards. A package that does not
+	// provide one fails the build by name instead of shipping an image that
+	// advertises a tool it cannot run.
 	for _, want := range []string{
-		"RUN set -eu; cd " + DevboxGlobalDir,
-		"&& devbox install \\",
-		"eval \"$(devbox shellenv)\"",
-		"install -m 0755 \"$bin\" /usr/local/bin/\"$tool\"",
-		"ln -sfn \"$bin\" " + ToolchainGCRoot,
+		"apk add --no-cache --update 'file' 'zbar'",
+		`for tool in 'file' 'zbarimg'; do command -v "$tool" >/dev/null || { echo "configured command is not provided by the installed packages: $tool" >&2; exit 3; }; done`,
 	} {
 		if !strings.Contains(p1.Dockerfile, want) {
-			t.Errorf("Dockerfile missing toolchain bake step %q", want)
+			t.Errorf("Dockerfile missing toolchain step %q\nDockerfile:\n%s", want, p1.Dockerfile)
 		}
 	}
-	// The start-time setup script is gone: an image that bakes its own toolchain
-	// must not also offer a second, divergent install path.
-	if strings.Contains(p1.Dockerfile, "piccolo-setup-tools") {
-		t.Error("Dockerfile must not ship the start-time tool setup script")
-	}
-	// Layer order is the caching contract: the toolchain install follows the
-	// devbox config copy (so the package list is part of its cache key) and
-	// precedes the integration layers (so an integration change reuses it).
-	idxCopy := strings.Index(p1.Dockerfile, "COPY devbox.json")
-	idxToolchain := strings.Index(p1.Dockerfile, "cd "+DevboxGlobalDir)
-	if !(idxCopy >= 0 && idxToolchain > idxCopy) {
-		t.Errorf("toolchain install must follow the devbox config copy (copy=%d toolchain=%d)", idxCopy, idxToolchain)
-	}
-	for _, want := range []string{`"file"`, `"zbar"`} {
-		if !strings.Contains(p1.DevboxJSON, want) {
-			t.Errorf("devbox.json missing %q", want)
+	// Nothing from the removed packaging system may come back: not as an
+	// installer, a config file, a PATH, a profile, or a garbage-collection step.
+	// The image's /nix/store holds only what integration bundles copy into it.
+	for _, banned := range []string{
+		"devbox", "nixbld", "groupadd", "useradd", "shellenv", "nix-collect-garbage",
+		"get.jetify.com", "/root/.nix-profile", "devbox.json", "piccolo-setup-tools",
+	} {
+		if strings.Contains(p1.Dockerfile, banned) {
+			t.Errorf("Dockerfile must not mention %q", banned)
 		}
 	}
 	if !strings.HasPrefix(p1.Tag, DefaultTagPrefix+":") || strings.HasSuffix(p1.Tag, ":latest") {
@@ -66,14 +84,69 @@ func TestBuildPlanDeterministic(t *testing.T) {
 	}
 }
 
-func TestBuildPlanWithIntegrationsInstallsAtBuildTime(t *testing.T) {
-	p, err := BuildPlan(Options{BaseImage: "docker.io/sipeed/picoclaw:v0.3.1", Integrations: []Integration{{Ref: "github:kimus/piccolo-gws", Commands: []string{"piccolo-gws"}}}})
+// The default lists must describe something that actually installs. These are
+// the apk names verified against Alpine 3.21, where all 23 commands resolve;
+// `7za` is absent because neither Alpine p7zip nor 7zip provides it.
+func TestDefaultToolchainIsAlpineNamed(t *testing.T) {
+	for _, want := range []string{
+		"tesseract-ocr", "tesseract-ocr-data-eng", "yq", "libxml2-utils",
+		"poppler-utils", "libreoffice", "imagemagick",
+	} {
+		if !strings.Contains(strings.Join(DefaultPackages, " "), want) {
+			t.Errorf("DefaultPackages missing %q", want)
+		}
+	}
+	for _, gone := range []string{"yq-go", "libxml2\"", "tesseract\""} {
+		for _, p := range DefaultPackages {
+			if p == strings.TrimSuffix(strings.TrimPrefix(gone, "\""), "\"") && p != "yq" {
+				t.Errorf("DefaultPackages still uses the nixpkgs name %q", p)
+			}
+		}
+	}
+	if strings.Contains(strings.Join(DefaultCommands, " "), "7za") {
+		t.Error("7za is not provided by any Alpine package and must not be a default command")
+	}
+	// OCR ships English data only; the all-language package measured 1015 MB of
+	// the image's 4.28 GiB of tool closures.
+	for _, p := range DefaultPackages {
+		if p == "tesseract-ocr-data-all" {
+			t.Error("default toolchain must not install every OCR language")
+		}
+	}
+}
+
+// An entry may pin a version; Piccolo passes it through unchanged so the user
+// can trade floating repos for reproducibility without any new syntax.
+func TestPackageEntryPassesThroughVerbatim(t *testing.T) {
+	plan, err := BuildPlan(Options{Packages: []string{"jq=1.7.1-r0"}, Commands: []string{"jq"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(plan.Dockerfile, "'jq=1.7.1-r0'") {
+		t.Errorf("pinned package was rewritten or dropped:\n%s", plan.Dockerfile)
+	}
+}
+
+// The same toolchain layer must not be re-executed when only integrations move.
+func TestBakedIntegrationInstallUsesBundleClosure(t *testing.T) {
+	p, err := BuildPlan(Options{
+		BaseImage: "docker.io/sipeed/picoclaw:v0.3.1",
+		Bundles: []IntegrationBundle{{
+			Package: "kimus/piccolo-gws", Version: "0.3.4", Digest: "sha256:8a0937a5d583",
+			Commands: []string{"piccolo-gws", "gws"},
+		}},
+	})
 	if err != nil {
 		t.Fatalf("BuildPlan: %v", err)
 	}
-	for _, want := range []string{"piccolo-integrations-devbox.json", "github:kimus/piccolo-gws", "Installing integration packages with Devbox/Nix", "devbox install", "Finalizing integration commands", "install -m 0755", "ln -sfn", "nix-collect-garbage -d", "command -v 'piccolo-gws'"} {
-		if !strings.Contains(p.Dockerfile+p.IntegrationsJSON, want) {
-			t.Errorf("integration plan missing %q", want)
+	for _, want := range []string{
+		"install -m 0755", "command -v 'piccolo-gws'", "command -v 'gws'",
+		// Bundles carry their own runtime closure; it lands in /nix/store as
+		// ordinary image content, with no Nix installed to manage it.
+		"$src/nix/store", "/nix/store/",
+	} {
+		if !strings.Contains(p.Dockerfile, want) {
+			t.Errorf("bundle layer missing %q", want)
 		}
 	}
 	p2, err := BuildPlan(Options{BaseImage: "docker.io/sipeed/picoclaw:v0.3.1"})
@@ -81,28 +154,24 @@ func TestBuildPlanWithIntegrationsInstallsAtBuildTime(t *testing.T) {
 		t.Fatalf("BuildPlan no integration: %v", err)
 	}
 	if p.Tag == p2.Tag {
-		t.Fatal("integration refs must affect deterministic tag")
+		t.Fatal("integration identity must affect the deterministic tag")
 	}
 }
 
-// Layer order is the caching contract, across both kinds of integration input:
-// the toolchain layer must be reusable when only integrations change.
 func TestToolchainLayerPrecedesIntegrationLayers(t *testing.T) {
 	p, err := BuildPlan(Options{
-		BaseImage:    "docker.io/sipeed/picoclaw:v0.3.1",
-		Packages:     []string{"file"},
-		Commands:     []string{"file"},
-		Integrations: []Integration{{Ref: "github:kimus/piccolo-gws", Commands: []string{"piccolo-gws"}}},
-		Bundles:      []IntegrationBundle{{Package: "kimus/piccolo-gws", Version: "1", Digest: "sha256:aaaa"}},
+		BaseImage: "b",
+		Packages:  []string{"file"},
+		Commands:  []string{"file"},
+		Bundles:   []IntegrationBundle{{Package: "kimus/piccolo-gws", Version: "1", Digest: "sha256:aaaa", Commands: []string{"gws"}}},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	toolchain := strings.Index(p.Dockerfile, "cd "+DevboxGlobalDir)
-	source := strings.Index(p.Dockerfile, "piccolo-integrations-devbox.json")
+	toolchain := strings.Index(p.Dockerfile, "apk add --no-cache --update")
 	release := strings.Index(p.Dockerfile, "release-integrations/")
-	if !(toolchain >= 0 && toolchain < source && toolchain < release) {
-		t.Errorf("toolchain layer must precede the integration layers (toolchain=%d source=%d release=%d)", toolchain, source, release)
+	if !(toolchain >= 0 && toolchain < release) {
+		t.Errorf("toolchain layer must precede the integration layers (toolchain=%d release=%d)", toolchain, release)
 	}
 }
 
@@ -119,20 +188,18 @@ func TestContextTarContainsBuildFiles(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read tar: %v", err)
 	}
-	for _, want := range []string{"Dockerfile", "devbox.json", "piccolo-integrations-devbox.json"} {
-		if !strings.Contains(string(b), want) {
-			t.Errorf("tar missing expected file %q", want)
-		}
+	if !strings.Contains(string(b), "Dockerfile") {
+		t.Error("tar missing Dockerfile")
 	}
-	if strings.Contains(string(b), "piccolo-setup-tools") {
-		t.Error("tar must not contain the removed start-time setup script")
+	// The devbox config files were the old mechanism's only context inputs. A
+	// plan that still ships one has grown a second, divergent install path.
+	for _, gone := range []string{"devbox.json", "piccolo-integrations-devbox.json", "piccolo-setup-tools"} {
+		if strings.Contains(string(b), gone) {
+			t.Errorf("tar must not contain %q", gone)
+		}
 	}
 }
 
-// A bundle needs its expanded bytes only when the context is tarred. Identity —
-// package, version, digest — is enough for the tag and the labels, which is what
-// lets a drift check run on every serve without transferring ~31 MB per
-// installed integration.
 func TestPlanIdentityNeedsNoArtifactBytes(t *testing.T) {
 	opts := Options{
 		BaseImage: "docker.io/sipeed/picoclaw:v0.3.1",

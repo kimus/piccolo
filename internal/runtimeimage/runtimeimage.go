@@ -2,11 +2,12 @@
 // build inputs. The build context is generated on demand and is not written
 // into the user's workspace.
 //
-// The image is self-contained: the Devbox/Nix toolchain and the release
-// integrations are both baked in as layers, so nothing installs at container
-// start and no host cache is mounted over /nix. Anything that shadows the
-// image's own store makes its binaries unexecutable, which is why the toolchain
-// moved into the build.
+// The image is self-contained: the toolchain (installed with the base
+// distribution's own package manager) and the release integrations are both
+// baked in as layers, so nothing installs at container start and no host cache
+// is mounted over the image's package directories. Anything that shadows image
+// content makes its binaries unexecutable, which is why the toolchain lives in
+// the build.
 package runtimeimage
 
 import (
@@ -14,7 +15,6 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -27,26 +27,9 @@ const (
 	DefaultBaseImage = "docker.io/sipeed/picoclaw:v0.3.1"
 	DefaultTagPrefix = "piccolo/picoclaw-runtime"
 
-	// DevboxGlobalDir is Devbox's default HOME-based global project location
-	// (the PicoClaw image runs with HOME=/root). `devbox global install`
-	// populates it; DevboxGlobalBin is then added to PATH so tools resolve
-	// from any cwd.
-	DevboxGlobalDir = "/root/.local/share/devbox/global/default"
-	DevboxGlobalBin = DevboxGlobalDir + "/.devbox/nix/profile/default/bin"
-
 	// MediaTempDir is mirrored from workspace runtime/media so deterministic
 	// tools can read channel attachments.
 	MediaTempDir = "/tmp/picoclaw_media"
-
-	// ToolchainGCRoot pins the baked toolchain's store paths so a later
-	// nix-collect-garbage (the integration layers run one) cannot delete the
-	// binaries the image installed into /usr/local/bin. Entries are plain
-	// symlinks inside a gcroots directory — Nix's "direct root" mechanism, which
-	// needs no nix-store operation and so cannot fail on argument syntax.
-	ToolchainGCRoot = "/nix/var/nix/gcroots/piccolo-toolchain"
-	// IntegrationGCRoot does the same for binaries installed from source-built
-	// integration packages, whose layer prunes build dependencies afterwards.
-	IntegrationGCRoot = "/nix/var/nix/gcroots/piccolo-integrations"
 
 	// Image label keys. Labels are written at build time, so a container
 	// inherits them and they cannot drift from the image's actual content.
@@ -57,13 +40,14 @@ const (
 	LabelIntegrationPrefix = "piccolo.integration."
 )
 
-// DefaultCommands are the command names symlinked onto PATH by the setup
-// script. Each is provided by one of DefaultPackages.
+// DefaultCommands are the command names the build verifies are on PATH after
+// the toolchain packages are installed. Each must be provided by one of
+// DefaultPackages; a configured command no package provides fails the build.
 var DefaultCommands = []string{
 	"zbarimg", "file", "python3", "jq", "yq",
 	"pdftotext", "pdfinfo", "pdftoppm", "pdftocairo",
 	"tesseract", "pandoc", "xmllint", "exiftool",
-	"ffprobe", "ffmpeg", "sqlite3", "unzip", "7z", "7za",
+	"ffprobe", "ffmpeg", "sqlite3", "unzip", "7z",
 	"libreoffice", "soffice", "magick", "convert", "identify",
 }
 
@@ -71,18 +55,25 @@ var DefaultCommands = []string{
 // refer to the old name.
 var DefaultTools = DefaultCommands
 
-// DefaultPackages is the standard file-handling toolset installed into the
-// Devbox global environment after the container starts.
+// DefaultPackages is the standard file-handling toolset, named for the base
+// distribution's package manager (Alpine apk). Verified against Alpine 3.21:
+// every entry exists and every DefaultCommands entry resolves after install.
+//
+// OCR installs the engine plus English language data only. The alternative —
+// one package carrying every trained model — measured 1015 MB against 39 MB
+// for engine + English, which is why broad language coverage is an explicit
+// opt-in through a custom package list rather than a default.
 var DefaultPackages = []string{
 	"zbar",
 	"file",
 	"python3",
 	"jq",
-	"yq-go",
+	"yq",
 	"poppler-utils",
-	"tesseract",
+	"tesseract-ocr",
+	"tesseract-ocr-data-eng",
 	"pandoc",
-	"libxml2",
+	"libxml2-utils",
 	"exiftool",
 	"ffmpeg",
 	"sqlite",
@@ -93,19 +84,11 @@ var DefaultPackages = []string{
 }
 
 type Options struct {
-	BaseImage    string
-	Tag          string
-	Packages     []string
-	Commands     []string
-	Integrations []Integration
-	Bundles      []IntegrationBundle
-}
-
-// Integration is a build-time package that must be available before the
-// gateway entrypoint starts (for example, a stdio MCP server binary).
-type Integration struct {
-	Ref      string
-	Commands []string
+	BaseImage string
+	Tag       string
+	Packages  []string
+	Commands  []string
+	Bundles   []IntegrationBundle
 }
 
 // IntegrationBundle is a verified, already-expanded release artifact directory.
@@ -121,15 +104,12 @@ type IntegrationBundle struct {
 }
 
 type Plan struct {
-	BaseImage        string
-	Tag              string
-	Dockerfile       string
-	DevboxJSON       string
-	IntegrationsJSON string
-	Packages         []string
-	Commands         []string
-	Integrations     []Integration
-	Bundles          []IntegrationBundle
+	BaseImage  string
+	Tag        string
+	Dockerfile string
+	Packages   []string
+	Commands   []string
+	Bundles    []IntegrationBundle
 	// Identity is the sorted owner/repo@version+digest list of installed
 	// release integrations. It is part of the tag and of the image labels.
 	Identity []string
@@ -153,19 +133,10 @@ func BuildPlan(opts Options) (Plan, error) {
 		commands = append([]string(nil), DefaultCommands...)
 	}
 	commands = uniqueSorted(commands)
-	devbox, err := renderDevbox(packages)
-	if err != nil {
-		return Plan{}, err
-	}
-	integrations := normalizeIntegrations(opts.Integrations)
-	integrationsJSON, err := renderIntegrationsDevbox(integrations)
-	if err != nil {
-		return Plan{}, err
-	}
 	bundles := normalizeBundles(opts.Bundles)
 	identity := bundleIdentity(bundles)
 	toolchainID := toolchainIdentity(packages, commands)
-	dockerfile := renderDockerfile(base, packages, commands, integrations, bundles)
+	dockerfile := renderDockerfile(base, packages, commands, bundles)
 	tag := strings.TrimSpace(opts.Tag)
 	if tag == "" {
 		// The tag must cover integration identity: without version+digest here,
@@ -176,22 +147,17 @@ func BuildPlan(opts Options) (Plan, error) {
 		// and once inside the Dockerfile text through the content labels — so an
 		// edit that drops either one still cannot produce a stale-cache reuse.
 		// Removing BOTH is what reintroduces the collision.
-		tag = DefaultTag(base, dockerfile, devbox, integrationsJSON, strings.Join(identity, "\n"))
+		tag = DefaultTag(base, dockerfile, strings.Join(identity, "\n"))
 	}
-	return Plan{BaseImage: base, Tag: tag, Dockerfile: dockerfile, DevboxJSON: devbox, IntegrationsJSON: integrationsJSON, Packages: packages, Commands: commands, Integrations: integrations, Bundles: bundles, Identity: identity, ToolchainIdentity: toolchainID}, nil
+	return Plan{BaseImage: base, Tag: tag, Dockerfile: dockerfile, Packages: packages, Commands: commands, Bundles: bundles, Identity: identity, ToolchainIdentity: toolchainID}, nil
 }
 
 func IsLocalRuntimeImage(ref string) bool {
 	return strings.HasPrefix(ref, DefaultTagPrefix+":")
 }
 
-// DefaultDevboxJSON renders the global Devbox project config (package list
-// only). It is baked into the image at DevboxGlobalDir/devbox.json and the
-// packages are installed BY THE IMAGE BUILD, not at container start.
-func DefaultDevboxJSON() (string, error) {
-	return renderDevbox(uniqueSorted(DefaultPackages))
-}
-
+// DefaultTag derives the content-addressed local image tag from the build
+// inputs that determine image content.
 func DefaultTag(parts ...string) string {
 	sum := sha256.Sum256([]byte(strings.Join(parts, "\n")))
 	return fmt.Sprintf("%s:%s", DefaultTagPrefix, hex.EncodeToString(sum[:])[:12])
@@ -212,8 +178,6 @@ func (p Plan) ContextTar() (io.Reader, error) {
 		body string
 	}{
 		{name: "Dockerfile", body: p.Dockerfile},
-		{name: "devbox.json", body: p.DevboxJSON},
-		{name: "piccolo-integrations-devbox.json", body: p.IntegrationsJSON},
 	}
 	for _, f := range files {
 		b := []byte(f.body)
@@ -270,61 +234,56 @@ func (p Plan) ContextTar() (io.Reader, error) {
 }
 
 // renderDockerfile bakes everything the gateway needs into the image: the
-// Devbox binary, the toolchain itself, the integration layers, and content
-// labels. Nothing installs at container start any more — /nix is image content
-// and Piccolo must never bind-mount over it (that shadowing is what made the
-// image's own binaries unexecutable in the running gateway). The default
-// PicoClaw entrypoint is left untouched.
-func renderDockerfile(base string, packages, commands []string, integrations []Integration, bundles []IntegrationBundle) string {
+// toolchain (via the base distribution's package manager), the integration
+// layers, and content labels. Nothing installs at container start any more.
+//
+// There is deliberately no secondary package system here. The image used to
+// install Devbox and Nix to get these same tools, and measured the cost: 4.28
+// GiB of tool closures plus a ~0.58 GiB Nix floor, against 1.3 GB of rootfs for
+// the identical command list installed with apk. Integration bundles still
+// unpack into /nix/store, because they ship their own closure there, but Nix is
+// no longer installed to run it. The default PicoClaw entrypoint is untouched.
+func renderDockerfile(base string, packages, commands []string, bundles []IntegrationBundle) string {
 	integrationBlock := ""
-	if len(integrations) > 0 {
-		integrationBlock = renderIntegrationInstallBlock(integrations)
-	}
 	if len(bundles) > 0 {
-		integrationBlock += renderBundleInstallBlock(bundles)
+		integrationBlock = renderBundleInstallBlock(bundles)
 	}
 	return fmt.Sprintf(`FROM %s
 USER root
-RUN apk add --no-cache bash curl ca-certificates xz tar git shadow coreutils
-# Nix (bootstrapped by Devbox at runtime) requires the 'nixbld' build group and
-# users to exist. They normally live in /etc/group + /etc/passwd, which are
-# ephemeral and reset on container recreation, breaking the tool install after a
-# restart ("group 'nixbld' does not exist"). Bake them into the image so they
-# always survive; the runtime Nix installer detects and reuses them.
-RUN groupadd -g 30000 nixbld \
- && i=1; while [ "$i" -le 32 ]; do useradd -M -N -g nixbld -G nixbld -u "$((30000 + i))" -s /sbin/nologin "nixbld$i"; i=$((i + 1)); done
-RUN curl -fsSL https://get.jetify.com/devbox | bash -s -- -f
-RUN mkdir -p %[2]s
-COPY devbox.json %[2]s/devbox.json
-ENV PATH="/root/.nix-profile/bin:/nix/var/nix/profiles/default/bin:${PATH}"
-RUN devbox version
-%[3]s%[4]sLABEL org.opencontainers.image.title="Piccolo PicoClaw Runtime"
-LABEL org.opencontainers.image.description="PicoClaw runtime with the Devbox/Nix toolchain and release integrations baked in"
-%[5]s`, base, DevboxGlobalDir, renderToolchainInstallBlock(commands), integrationBlock, renderLabelBlock(base, packages, commands, bundles))
+RUN apk add --no-cache bash curl ca-certificates tar git coreutils
+%[2]s%[3]sLABEL org.opencontainers.image.title="Piccolo PicoClaw Runtime"
+LABEL org.opencontainers.image.description="PicoClaw runtime with the distribution toolchain and release integrations baked in"
+%[4]s`, base, renderToolchainInstallBlock(packages, commands), integrationBlock, renderLabelBlock(base, packages, commands, bundles))
 }
 
-// renderToolchainInstallBlock installs the configured Devbox packages at BUILD
-// time and symlinks every configured command's real store binary into
-// /usr/local/bin, so tools are ordinary cwd-independent PATH commands with no
-// start-time install and no host cache mount. The layer sits before the
-// integration layers so Docker's prefix cache reuses it across integration
-// changes, and each binary is gc-rooted because the integration layers run
-// nix-collect-garbage that would otherwise collect it. A missing configured
-// command fails the build: an image must not claim tools it cannot provide.
-func renderToolchainInstallBlock(commands []string) string {
+// renderToolchainInstallBlock installs the configured packages at BUILD time and
+// verifies every configured command resolves on PATH afterwards. The
+// distribution installs into /usr/bin, which is already on PATH, so no copies,
+// symlinks, or garbage-collection pinning are needed — and no later layer
+// collects what this one installed.
+//
+// A configured command that no package provides fails the build: an image must
+// not claim tools it cannot run. The layer sits before the integration layers so
+// Docker's cache reuses it across integration changes.
+func renderToolchainInstallBlock(packages, commands []string) string {
+	pkgs := uniqueSorted(packages)
 	tools := uniqueSorted(commands)
-	if len(tools) == 0 {
+	if len(pkgs) == 0 && len(tools) == 0 {
 		return ""
 	}
-	return fmt.Sprintf(`RUN set -eu; cd %[1]s \
- && echo "Baking the Devbox/Nix toolchain into the image; this can take several minutes on first build..." \
- && devbox install \
- && eval "$(devbox shellenv)" \
- && mkdir -p %[2]s \
- && for tool in %[3]s; do bin="$(readlink -f "$(command -v "$tool")")"; [ -n "$bin" ] || { echo "configured command is not provided by the toolchain: $tool" >&2; exit 3; }; install -m 0755 "$bin" /usr/local/bin/"$tool"; ln -sfn "$bin" %[2]s/"$tool"; done \
- && echo "Pruning unreachable store paths from the toolchain layer..." \
- && nix-collect-garbage -d >/dev/null
-`, DevboxGlobalDir, ToolchainGCRoot, strings.Join(shellQuoteList(tools), " "))
+	install := ""
+	if len(pkgs) > 0 {
+		install = fmt.Sprintf("apk add --no-cache --update %s", strings.Join(shellQuoteList(pkgs), " "))
+	}
+	if len(tools) > 0 {
+		verify := fmt.Sprintf(`for tool in %s; do command -v "$tool" >/dev/null || { echo "configured command is not provided by the installed packages: $tool" >&2; exit 3; }; done`, strings.Join(shellQuoteList(tools), " "))
+		if install != "" {
+			install += " \\\n && " + verify
+		} else {
+			install = verify
+		}
+	}
+	return fmt.Sprintf("RUN set -eu \\\n && %s\n", install)
 }
 
 // renderLabelBlock records image content. Labels answer "what is in this
@@ -448,47 +407,6 @@ func labelValue(s string) string {
 	return "\"" + strings.NewReplacer(`\`, `\\`, `"`, `\"`).Replace(s) + "\""
 }
 
-func renderDevbox(packages []string) (string, error) {
-	data := map[string]any{"packages": packages}
-	b, err := json.MarshalIndent(data, "", "  ")
-	if err != nil {
-		return "", err
-	}
-	return string(b) + "\n", nil
-}
-
-func renderIntegrationsDevbox(integrations []Integration) (string, error) {
-	pkgs := make([]string, 0, len(integrations))
-	for _, in := range integrations {
-		pkgs = append(pkgs, in.Ref)
-	}
-	return renderDevbox(pkgs)
-}
-
-func normalizeIntegrations(in []Integration) []Integration {
-	byRef := map[string]Integration{}
-	for _, item := range in {
-		ref := strings.TrimSpace(item.Ref)
-		if ref == "" {
-			continue
-		}
-		cur := byRef[ref]
-		cur.Ref = ref
-		cur.Commands = uniqueSorted(append(cur.Commands, item.Commands...))
-		byRef[ref] = cur
-	}
-	refs := make([]string, 0, len(byRef))
-	for ref := range byRef {
-		refs = append(refs, ref)
-	}
-	sort.Strings(refs)
-	out := make([]Integration, 0, len(refs))
-	for _, ref := range refs {
-		out = append(out, byRef[ref])
-	}
-	return out
-}
-
 func normalizeBundles(in []IntegrationBundle) []IntegrationBundle {
 	out := append([]IntegrationBundle(nil), in...)
 	sort.Slice(out, func(i, j int) bool {
@@ -518,31 +436,6 @@ func renderBundleInstallBlock(bundles []IntegrationBundle) string {
 		b.WriteString("\n")
 	}
 	return b.String()
-}
-
-func renderIntegrationInstallBlock(integrations []Integration) string {
-	var commands []string
-	for _, in := range integrations {
-		commands = append(commands, in.Commands...)
-	}
-	commands = uniqueSorted(commands)
-	var verify strings.Builder
-	for _, cmd := range commands {
-		verify.WriteString(fmt.Sprintf("RUN command -v %s >/dev/null\n", shellQuote(cmd)))
-	}
-	return fmt.Sprintf(`COPY piccolo-integrations-devbox.json /opt/piccolo/integrations/devbox.json
-ARG PICCOLO_INTEGRATIONS_CACHE_BUST=static
-RUN echo "Integration cache key: ${PICCOLO_INTEGRATIONS_CACHE_BUST}" >/dev/null \
- && cd /opt/piccolo/integrations \
- && echo "Installing integration packages with Devbox/Nix; this can take several minutes on first run..." \
- && devbox install \
- && echo "Finalizing integration commands; this may take a moment..." \
- && eval "$(devbox shellenv)" \
- && mkdir -p %[2]s \
- && for tool in %[1]s; do bin="$(readlink -f "$(command -v "$tool")")"; install -m 0755 "$bin" /usr/local/bin/"$tool"; ln -sfn "$bin" %[2]s/"$tool"; done \
- && echo "Pruning integration build dependencies from the image layer..." \
- && nix-collect-garbage -d >/dev/null
-%[3]s`, strings.Join(shellQuoteList(commands), " "), IntegrationGCRoot, verify.String())
 }
 
 func shellQuoteList(values []string) []string {

@@ -32,8 +32,11 @@ type Runtime struct {
 	Integrations []Integration `yaml:"integrations,omitempty"`
 }
 
-// Toolchain describes Devbox/Nix packages to install and command names to
-// expose on PATH inside the container.
+// Toolchain describes packages to install with the base image's distribution
+// package manager (Alpine apk names) and the command names that must end up on
+// PATH inside the container. An entry may pin a version, e.g. "jq=1.7.1-r0".
+// Changing either list changes the image content, so Piccolo asks for a
+// rebuild rather than rebuilding implicitly.
 type Toolchain struct {
 	Packages []string `yaml:"packages,omitempty"`
 	Commands []string `yaml:"commands,omitempty"`

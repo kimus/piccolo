@@ -76,14 +76,14 @@ func TestPrepareCommandOverrideAndTTY(t *testing.T) {
 
 func TestPrepareAddsNamedVolumes(t *testing.T) {
 	r := New()
-	pc, err := r.Prepare(Spec{Name: "n", Image: "img:1", Source: "/ws", Volumes: []string{"piccolo-devbox-nix-cache:/nix:rw"}})
+	pc, err := r.Prepare(Spec{Name: "n", Image: "img:1", Source: "/ws", Volumes: []string{"piccolo-media-cache:/var/cache/media:rw"}})
 	if err != nil {
 		t.Fatalf("Prepare: %v", err)
 	}
 	if len(pc.HostConfig.Binds) != 2 {
 		t.Fatalf("binds = %v", pc.HostConfig.Binds)
 	}
-	if pc.HostConfig.Binds[1] != "piccolo-devbox-nix-cache:/nix:rw" {
+	if pc.HostConfig.Binds[1] != "piccolo-media-cache:/var/cache/media:rw" {
 		t.Errorf("named volume bind = %q", pc.HostConfig.Binds[1])
 	}
 }

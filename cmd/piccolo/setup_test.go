@@ -26,7 +26,10 @@ func TestUpdateAgentSkillsFrontmatter(t *testing.T) {
 	}
 }
 
-func TestSyncEnabledToolWorkspaceChangesAddsDevboxJSON(t *testing.T) {
+// The name records the old expectation. Setup must write NO workspace package
+// config: the toolchain is image content, and a workspace file here would be a
+// second, divergent install path.
+func TestSyncEnabledToolWorkspaceChangesWritesNoWorkspacePackageConfig(t *testing.T) {
 	dir := t.TempDir()
 	agentDir := filepath.Join(dir, "picoclaw", "agents", "main")
 	if err := os.MkdirAll(agentDir, 0o755); err != nil {

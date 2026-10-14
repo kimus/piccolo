@@ -291,7 +291,7 @@ func (st *setupState) applyWebConsoleChange(enabled bool) error {
 		st.manifest.Container.Env["PICOCLAW_GATEWAY_HOST"] = "0.0.0.0"
 		if runtimeimage.IsLocalRuntimeImage(st.manifest.Container.Image) {
 			st.manifest.Container.Image = generate.LauncherImage
-			fmt.Fprintln(st.out, "note: switched to the official launcher image so the web console listens on :18800. Run 'piccolo image build --set' after this if you want a local launcher runtime with Devbox tools.")
+			fmt.Fprintln(st.out, "note: switched to the official launcher image so the web console listens on :18800. Run 'piccolo image build --set' after this if you want a local launcher runtime with the file-handling toolchain baked in.")
 		} else {
 			st.manifest.Container.Image = generate.LauncherImage
 		}
@@ -299,7 +299,7 @@ func (st *setupState) applyWebConsoleChange(enabled bool) error {
 		st.manifest.Container.Ports = removeContainerPort(st.manifest.Container.Ports, 18800)
 		if runtimeimage.IsLocalRuntimeImage(st.manifest.Container.Image) {
 			st.manifest.Container.Image = generate.DefaultImage
-			fmt.Fprintln(st.out, "note: switched to the official gateway image. Run 'piccolo image build --set' after this if you want a local gateway runtime with Devbox tools.")
+			fmt.Fprintln(st.out, "note: switched to the official gateway image. Run 'piccolo image build --set' after this if you want a local gateway runtime with the file-handling toolchain baked in.")
 		} else {
 			st.manifest.Container.Image = generate.DefaultImage
 		}
@@ -1036,7 +1036,7 @@ func (st *setupState) syncEnabledToolAllowlists() error {
 	if err != nil {
 		return err
 	}
-	return st.applyAgentFileChanges("agent tool allowlists, file-handling skill, and workspace Devbox config", changes)
+	return st.applyAgentFileChanges("agent tool allowlists and the file-handling skill", changes)
 }
 
 func (st *setupState) syncEnabledToolWorkspaceChanges() ([]agentFileChange, error) {

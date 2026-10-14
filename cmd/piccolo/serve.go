@@ -126,8 +126,9 @@ func preflight(cmd *cobra.Command) (*serveContext, error) {
 
 	volumes := []string{layout.IntegrationBind()}
 	if runtimeimage.IsLocalRuntimeImage(m.Container.Image) {
-		// Only the media mirror is bound. The toolchain and /nix are image
-		// content: binding the workspace Nix cache over /nix hid the store the
+		// Only the media mirror is bound. The toolchain is image content, and
+		// integration bundles unpack their own /nix/store closure: binding a
+		// host cache over /nix hid the content the
 		// image baked and made its own binaries unexecutable.
 		volumes = append(volumes, layout.RuntimeBinds()...)
 		volumes = append(volumes, agentMediaMirrorMounts(layout, cfg)...)

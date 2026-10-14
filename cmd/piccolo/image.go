@@ -94,7 +94,7 @@ func newImageBuildCmd() *cobra.Command {
 	cmd.Flags().BoolVar(&f.setManifest, "set", false, "update piccolo.yaml container.image to the built tag after a successful build")
 	cmd.Flags().BoolVar(&f.yes, "yes", false, "non-interactive: do not prompt; requires --set to modify piccolo.yaml")
 	cmd.Flags().BoolVar(&f.pull, "pull", false, "ask Docker to pull a newer base image before building")
-	cmd.Flags().StringArrayVar(&f.packageList, "package", nil, "additional or replacement Devbox package list entry (repeatable; replaces defaults when provided)")
+	cmd.Flags().StringArrayVar(&f.packageList, "package", nil, "additional or replacement toolchain package, named for the base image distribution (repeatable; replaces the defaults when provided). Include an explicit version to pin, e.g. 'jq=1.7.1-r0'.")
 	return cmd
 }
 
@@ -139,13 +139,15 @@ func runImageBuild(cmd *cobra.Command, f imageBuildFlags) error {
 		}
 		bundles = fetched
 	}
+	if err := rejectSourceBuilds(m, ""); err != nil {
+		return err
+	}
 	plan, err := runtimeimage.BuildPlan(runtimeimage.Options{
-		BaseImage:    base,
-		Tag:          f.tag,
-		Packages:     packages,
-		Commands:     tc.Commands,
-		Integrations: sourceManifestIntegrationsForBuild(m.Runtime.Integrations),
-		Bundles:      bundles,
+		BaseImage: base,
+		Tag:       f.tag,
+		Packages:  packages,
+		Commands:  tc.Commands,
+		Bundles:   bundles,
 	})
 	if err != nil {
 		return err
@@ -172,11 +174,6 @@ func runImageBuild(cmd *cobra.Command, f imageBuildFlags) error {
 	fmt.Fprintf(out, "  toolchain: %d packages, %d commands (baked into the image)\n", len(plan.Packages), len(plan.Commands))
 	for _, identity := range plan.Identity {
 		fmt.Fprintf(out, "  integration: %s\n", identity)
-	}
-	if len(plan.Integrations) > 0 {
-		for _, in := range plan.Integrations {
-			fmt.Fprintf(out, "  integration (source build): %s\n", in.Ref)
-		}
 	}
 	fmt.Fprintln(out, "")
 	if err := runner.BuildImage(ctx, buildCtx, docker.ImageBuildOptions{Tag: plan.Tag, Dockerfile: "Dockerfile", Pull: f.pull, Remove: true}, out); err != nil {

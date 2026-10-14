@@ -352,27 +352,43 @@ func TestIntegrationSetupAndStatusUsePackageIdentity(t *testing.T) {
 	}
 }
 
-func TestIntegrationBuildSourceWarnsAndBuilds(t *testing.T) {
+// The source-build path resolved a Devbox/Nix flake ref, so a manifest that
+// still records one cannot produce an image. Refusing must name the offending
+// integration and the replacement command: a strict-decode error or a plan that
+// silently drops the layer would leave a gateway without the integration it
+// advertises.
+func TestSourceBuildIntegrationIsRefusedActionably(t *testing.T) {
 	dir := t.TempDir()
-	writeTestManifest(t, dir, "docker.io/sipeed/picoclaw:v0.3.1")
-	desc := `{"schema":"piccolo.integration.v1","name":"gws","displayName":"Google Workspace","commands":["piccolo-gws"],"setup":{"command":["piccolo-gws","setup"]}}`
-	fake := &fakeIntegrationRunner{stdout: desc}
-	old := newIntegrationRunner
-	newIntegrationRunner = func() integrationRunner { return fake }
-	defer func() { newIntegrationRunner = old }()
+	writeIntegrationManifest(t, dir, []manifest.Integration{{
+		Package: "github:kimus/piccolo-gws", Name: "gws", Source: "build",
+		Ref: "github:kimus/piccolo-gws?ref=main", Commands: []string{"piccolo-gws"},
+	}})
 	oldDir := dirFlag
 	dirFlag = dir
 	defer func() { dirFlag = oldDir }()
+
 	var out bytes.Buffer
-	if err := runIntegrationBuild(testCommand(&out), "kimus/piccolo-gws@main", integrationFlags{yes: true, tag: "piccolo/picoclaw-runtime:src"}); err != nil {
-		t.Fatalf("build: %v", err)
+	err := runImageBuild(testCommand(&out), imageBuildFlags{yes: true, tag: "piccolo/picoclaw-runtime:refuse"})
+	if err == nil {
+		t.Fatal("expected refusal for a source-built integration")
 	}
-	if !strings.Contains(out.String(), "source builds can download") {
-		t.Fatalf("out=%s", out.String())
+	msg := err.Error()
+	for _, want := range []string{"built from source", "no longer supported", "piccolo integration add"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("refusal missing %q: %s", want, msg)
+		}
 	}
-	m, _ := manifest.Load(filepath.Join(dir, "piccolo.yaml"))
-	if m.Runtime.Integrations[0].Source != "build" || m.Runtime.Integrations[0].Ref != "github:kimus/piccolo-gws?ref=main" {
-		t.Fatalf("integration=%#v", m.Runtime.Integrations[0])
+	if !strings.Contains(msg, "kimus/piccolo-gws") {
+		t.Errorf("refusal must name the integration: %s", msg)
+	}
+	// The manifest must still load: the entry is retained precisely so the
+	// failure can explain itself instead of failing to parse.
+	m, loadErr := manifest.Load(filepath.Join(dir, "piccolo.yaml"))
+	if loadErr != nil {
+		t.Fatalf("manifest with a legacy source entry must still load: %v", loadErr)
+	}
+	if len(m.Runtime.Integrations) != 1 {
+		t.Fatalf("integrations=%#v", m.Runtime.Integrations)
 	}
 }
 

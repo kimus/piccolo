@@ -81,40 +81,6 @@ func Bundles(in []manifest.Integration) []runtimeimage.IntegrationBundle {
 	return out
 }
 
-// SourceIntegrations returns the legacy source-built integration build inputs.
-func SourceIntegrations(in []manifest.Integration) []runtimeimage.Integration {
-	return SourceIntegrationsExcept(in, "")
-}
-
-// SourceIntegrationsExcept is the same list with one package omitted, used while
-// re-adding an integration whose record is about to be replaced.
-//
-// The predicate is shared with the real build path: an entry contributes a
-// source-build layer when it is marked as built or still carries a legacy ref.
-// If the two sides disagreed, a drift check would report staleness against an
-// image the build could never produce.
-func SourceIntegrationsExcept(in []manifest.Integration, excludePackage string) []runtimeimage.Integration {
-	excludePackage = strings.TrimSpace(excludePackage)
-	out := make([]runtimeimage.Integration, 0, len(in))
-	for _, item := range in {
-		// Exclusion comes first: a release add must drop the package's legacy
-		// source-build layer, and a legacy entry carries a Ref without the
-		// Source marker, so filtering on source alone would let it back in.
-		if excludePackage != "" && integrationPackageKey(item) == excludePackage {
-			continue
-		}
-		if item.Source != SourceBuild && item.Ref == "" {
-			continue
-		}
-		cmds := append([]string(nil), item.Commands...)
-		if len(cmds) == 0 && len(item.DescriptorCommand) > 0 {
-			cmds = []string{item.DescriptorCommand[0]}
-		}
-		out = append(out, runtimeimage.Integration{Ref: item.Ref, Commands: cmds})
-	}
-	return out
-}
-
 func integrationPackageKey(in manifest.Integration) string {
 	if pkg := strings.TrimSpace(in.Package); pkg != "" {
 		if i := strings.Index(pkg, "@"); i >= 0 {
@@ -134,15 +100,45 @@ func integrationPackageKey(in manifest.Integration) string {
 	return ""
 }
 
-// Plan composes the runtime image this workspace describes.
+// RejectSourceBuilds fails a REBUILD that would silently drop a legacy
+// source-built integration. Those entries named a Devbox/Nix flake ref, and the
+// image no longer installs a package system that can resolve one.
+//
+// The exclusion names the integration this command is replacing, because
+// `piccolo integration add <pkg>` is precisely the documented remedy: refusing
+// it would block the way out. An empty exclude refuses every entry.
+//
+// This guards destructive composition only. Drift checks keep computing a plan
+// for such a workspace — the image already built still runs, and a refusal there
+// would turn a warning into a broken serve.
+func RejectSourceBuilds(in []manifest.Integration, excludePackage string) error {
+	excludePackage = strings.TrimSpace(excludePackage)
+	for _, item := range in {
+		if item.Source != SourceBuild && strings.TrimSpace(item.Ref) == "" {
+			continue
+		}
+		name := integrationPackageKey(item)
+		if name == "" {
+			name = strings.TrimSpace(item.Package)
+		}
+		if excludePackage != "" && name == excludePackage {
+			continue
+		}
+		return fmt.Errorf("integration %q is recorded as built from source (%q), which is no longer supported: the runtime image installs its toolchain with the base distribution's package manager and has no Nix. Reinstall it from a published release with 'piccolo integration add %s' (or drop the entry from runtime.integrations in piccolo.yaml) before rebuilding", name, item.Ref, name)
+	}
+	return nil
+}
+
+// Plan composes the runtime image this workspace describes. Source-built entries
+// contribute nothing to it — they cannot be installed any more — which is why
+// every command that BUILDS calls RejectSourceBuilds first.
 func Plan(m *manifest.Manifest) (runtimeimage.Plan, error) {
 	tc := Toolchain(m)
 	return runtimeimage.BuildPlan(runtimeimage.Options{
-		BaseImage:    BaseImage(m),
-		Packages:     tc.Packages,
-		Commands:     tc.Commands,
-		Integrations: SourceIntegrations(m.Runtime.Integrations),
-		Bundles:      Bundles(m.Runtime.Integrations),
+		BaseImage: BaseImage(m),
+		Packages:  tc.Packages,
+		Commands:  tc.Commands,
+		Bundles:   Bundles(m.Runtime.Integrations),
 	})
 }
 
