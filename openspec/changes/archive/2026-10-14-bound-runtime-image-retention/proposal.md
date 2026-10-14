@@ -17,9 +17,12 @@ Baking the toolchain made every runtime image ~8.3 GB instead of 440 MB, and the
 
 ### Modified Capabilities
 
+(none — accumulation reporting is its own requirement in `runtime-image-retention`; drift
+reporting in `runtime-maintenance` is unchanged by it)
+
 ## Impact
 
 - `cmd/piccolo/image.go`: `list` and `prune` subcommands
 - `internal/docker`: list images by repository prefix, inspect referencing containers, remove an image by id
-- `internal/doctor`: unreferenced-image size check (warn, never fail)
-- README/AGENTS: replace "check with docker images yourself" guidance with the Piccolo commands
+- `internal/doctor`: unreferenced-image count/size check (warn, never fail)
+- README/AGENTS: replace the "run docker images yourself" guidance with the Piccolo commands
