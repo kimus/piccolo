@@ -853,6 +853,13 @@ func (s *setupSession) runAction(ctx context.Context, entry *menuEntry, state pi
 				courierErr = err
 				return
 			}
+			// Surface the callback target, and defuse the trap: the port is
+			// re-randomised per attempt, so registering it is both pointless and
+			// impossible to keep working. A user who feels the need to add it is
+			// holding a Web-application client, which is the wrong type.
+			fmt.Fprintf(s.out, "  callback: %s (Piccolo is listening; nothing to open here)\n", c.callbackAddr())
+			fmt.Fprintf(s.out, "            this port changes every attempt — do not add it to Google's redirect URIs;\n")
+			fmt.Fprintf(s.out, "            a Desktop app client needs no registered redirect URI at all.\n")
 			relay := func(rctx context.Context, q string) error {
 				return relayCallbackIntoContainer(rctx, s.runner, spec.Name, port, q)
 			}
