@@ -2,13 +2,11 @@
 // build inputs. The build context is generated on demand and is not written
 // into the user's workspace.
 //
-// Design: the image stays lean — it installs only the Devbox binary plus a
-// setup script. The actual file-handling tools are installed AFTER `docker run`
-// (by `piccolo serve`/runtime apply) into Devbox's default HOME-based global
-// location, which is backed by a named volume so the installed tools and the
-// Nix store persist across container recreation. Tools land on PATH, so they
-// work from any working directory without wrappers or a per-workspace
-// devbox.json.
+// The image is self-contained: the Devbox/Nix toolchain and the release
+// integrations are both baked in as layers, so nothing installs at container
+// start and no host cache is mounted over /nix. Anything that shadows the
+// image's own store makes its binaries unexecutable, which is why the toolchain
+// moved into the build.
 package runtimeimage
 
 import (
@@ -40,15 +38,23 @@ const (
 	// tools can read channel attachments.
 	MediaTempDir = "/tmp/picoclaw_media"
 
-	// SetupScriptPath is baked into the image and run by `piccolo serve` after
-	// the gateway is healthy. It installs the Devbox packages and symlinks each
-	// tool's real /nix/store binary into /usr/local/bin, so tools become
-	// ordinary PATH commands that work from any cwd with relative or absolute
-	// args (no per-call devbox overhead, no cwd rewrite). `devbox run` cds to
-	// the project root and Devbox's profile-bin links only a subset of packages
-	// in this daemon-less Nix setup, so resolving real binaries via
-	// `devbox shellenv` is the reliable path.
-	SetupScriptPath = "/usr/local/bin/piccolo-setup-tools"
+	// ToolchainGCRoot pins the baked toolchain's store paths so a later
+	// nix-collect-garbage (the integration layers run one) cannot delete the
+	// binaries the image installed into /usr/local/bin. Entries are plain
+	// symlinks inside a gcroots directory — Nix's "direct root" mechanism, which
+	// needs no nix-store operation and so cannot fail on argument syntax.
+	ToolchainGCRoot = "/nix/var/nix/gcroots/piccolo-toolchain"
+	// IntegrationGCRoot does the same for binaries installed from source-built
+	// integration packages, whose layer prunes build dependencies afterwards.
+	IntegrationGCRoot = "/nix/var/nix/gcroots/piccolo-integrations"
+
+	// Image label keys. Labels are written at build time, so a container
+	// inherits them and they cannot drift from the image's actual content.
+	// They explain WHY a rebuild is wanted; the tag remains the cache identity.
+	LabelBaseImage = "piccolo.base"
+	LabelToolchain = "piccolo.toolchain"
+	// LabelIntegrationPrefix + sanitised package = "<version>+<short digest>".
+	LabelIntegrationPrefix = "piccolo.integration."
 )
 
 // DefaultCommands are the command names symlinked onto PATH by the setup
@@ -104,9 +110,12 @@ type Integration struct {
 
 // IntegrationBundle is a verified, already-expanded release artifact directory.
 // Its contents are copied into the image; bin/* is installed onto PATH.
+// Package/Version/Digest contribute to the image identity even when Root is
+// empty, which is how a desired tag is computed without downloading anything.
 type IntegrationBundle struct {
 	Package  string
 	Version  string
+	Digest   string
 	Root     string
 	Commands []string
 }
@@ -121,6 +130,12 @@ type Plan struct {
 	Commands         []string
 	Integrations     []Integration
 	Bundles          []IntegrationBundle
+	// Identity is the sorted owner/repo@version+digest list of installed
+	// release integrations. It is part of the tag and of the image labels.
+	Identity []string
+	// ToolchainIdentity is the short digest of the baked toolchain layer
+	// (package list + command list).
+	ToolchainIdentity string
 }
 
 func BuildPlan(opts Options) (Plan, error) {
@@ -148,12 +163,22 @@ func BuildPlan(opts Options) (Plan, error) {
 		return Plan{}, err
 	}
 	bundles := normalizeBundles(opts.Bundles)
-	dockerfile := renderDockerfile(base, integrations, bundles)
+	identity := bundleIdentity(bundles)
+	toolchainID := toolchainIdentity(packages, commands)
+	dockerfile := renderDockerfile(base, packages, commands, integrations, bundles)
 	tag := strings.TrimSpace(opts.Tag)
 	if tag == "" {
-		tag = DefaultTag(base, dockerfile, devbox, integrationsJSON)
+		// The tag must cover integration identity: without version+digest here,
+		// two versions of one integration collide on the same tag while the
+		// manifest records a version the image does not contain.
+		//
+		// The identity is carried twice on purpose — once as this explicit input
+		// and once inside the Dockerfile text through the content labels — so an
+		// edit that drops either one still cannot produce a stale-cache reuse.
+		// Removing BOTH is what reintroduces the collision.
+		tag = DefaultTag(base, dockerfile, devbox, integrationsJSON, strings.Join(identity, "\n"))
 	}
-	return Plan{BaseImage: base, Tag: tag, Dockerfile: dockerfile, DevboxJSON: devbox, IntegrationsJSON: integrationsJSON, Packages: packages, Commands: commands, Integrations: integrations, Bundles: bundles}, nil
+	return Plan{BaseImage: base, Tag: tag, Dockerfile: dockerfile, DevboxJSON: devbox, IntegrationsJSON: integrationsJSON, Packages: packages, Commands: commands, Integrations: integrations, Bundles: bundles, Identity: identity, ToolchainIdentity: toolchainID}, nil
 }
 
 func IsLocalRuntimeImage(ref string) bool {
@@ -161,8 +186,8 @@ func IsLocalRuntimeImage(ref string) bool {
 }
 
 // DefaultDevboxJSON renders the global Devbox project config (package list
-// only). It is baked into the image at DevboxGlobalDir/devbox.json and used by
-// `devbox global install` at runtime; tools are NOT installed at build time.
+// only). It is baked into the image at DevboxGlobalDir/devbox.json and the
+// packages are installed BY THE IMAGE BUILD, not at container start.
 func DefaultDevboxJSON() (string, error) {
 	return renderDevbox(uniqueSorted(DefaultPackages))
 }
@@ -170,6 +195,13 @@ func DefaultDevboxJSON() (string, error) {
 func DefaultTag(parts ...string) string {
 	sum := sha256.Sum256([]byte(strings.Join(parts, "\n")))
 	return fmt.Sprintf("%s:%s", DefaultTagPrefix, hex.EncodeToString(sum[:])[:12])
+}
+
+// Labels returns the content labels this plan writes into the image. Comparing
+// them against a running image's labels is how a drift warning names the reason
+// (base, toolchain, or which integration version) instead of only "different".
+func (p Plan) Labels() map[string]string {
+	return contentLabels(p.BaseImage, p.Packages, p.Commands, p.Bundles)
 }
 
 func (p Plan) ContextTar() (io.Reader, error) {
@@ -182,7 +214,6 @@ func (p Plan) ContextTar() (io.Reader, error) {
 		{name: "Dockerfile", body: p.Dockerfile},
 		{name: "devbox.json", body: p.DevboxJSON},
 		{name: "piccolo-integrations-devbox.json", body: p.IntegrationsJSON},
-		{name: "piccolo-setup-tools", body: renderSetupScript()},
 	}
 	for _, f := range files {
 		b := []byte(f.body)
@@ -193,8 +224,16 @@ func (p Plan) ContextTar() (io.Reader, error) {
 			return nil, err
 		}
 	}
-	for i, bundle := range p.Bundles {
+	for _, bundle := range p.Bundles {
+		// ContextTar needs expanded bytes; the tag/labels do not. A plan built
+		// from manifest metadata alone (drift checks) must never be tarred.
+		if strings.TrimSpace(bundle.Root) == "" {
+			return nil, fmt.Errorf("release bundle %s has no expanded artifact directory", bundle.Package)
+		}
 		root := filepath.Clean(bundle.Root)
+		if _, err := os.Stat(root); err != nil {
+			return nil, fmt.Errorf("release bundle %s: %w", bundle.Package, err)
+		}
 		if err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
 			if err != nil {
 				return err
@@ -214,7 +253,7 @@ func (p Plan) ContextTar() (io.Reader, error) {
 			if err != nil {
 				return err
 			}
-			name := filepath.ToSlash(filepath.Join("release-integrations", fmt.Sprintf("bundle-%d", i), rel))
+			name := filepath.ToSlash(filepath.Join(bundleContextDir(bundle), rel))
 			if err := tw.WriteHeader(&tar.Header{Name: name, Mode: int64(info.Mode().Perm()), Size: int64(len(b))}); err != nil {
 				return err
 			}
@@ -230,12 +269,13 @@ func (p Plan) ContextTar() (io.Reader, error) {
 	return bytes.NewReader(buf.Bytes()), nil
 }
 
-// renderDockerfile installs the Devbox binary, the global project config, the
-// nixbld group Nix needs, and the setup script. The tools themselves are
-// installed after run (the setup script, triggered by `piccolo serve`) into the
-// persisted volumes and symlinked onto PATH. The default PicoClaw entrypoint is
-// left untouched.
-func renderDockerfile(base string, integrations []Integration, bundles []IntegrationBundle) string {
+// renderDockerfile bakes everything the gateway needs into the image: the
+// Devbox binary, the toolchain itself, the integration layers, and content
+// labels. Nothing installs at container start any more — /nix is image content
+// and Piccolo must never bind-mount over it (that shadowing is what made the
+// image's own binaries unexecutable in the running gateway). The default
+// PicoClaw entrypoint is left untouched.
+func renderDockerfile(base string, packages, commands []string, integrations []Integration, bundles []IntegrationBundle) string {
 	integrationBlock := ""
 	if len(integrations) > 0 {
 		integrationBlock = renderIntegrationInstallBlock(integrations)
@@ -256,69 +296,156 @@ RUN groupadd -g 30000 nixbld \
 RUN curl -fsSL https://get.jetify.com/devbox | bash -s -- -f
 RUN mkdir -p %[2]s
 COPY devbox.json %[2]s/devbox.json
-COPY piccolo-setup-tools %[3]s
-RUN chmod 0755 %[3]s
 ENV PATH="/root/.nix-profile/bin:/nix/var/nix/profiles/default/bin:${PATH}"
 RUN devbox version
-%sLABEL org.opencontainers.image.title="Piccolo PicoClaw Runtime"
-LABEL org.opencontainers.image.description="PicoClaw runtime with Devbox/Nix; file-handling tools install into persisted volumes after start"
-`, base, DevboxGlobalDir, SetupScriptPath, integrationBlock)
+%[3]s%[4]sLABEL org.opencontainers.image.title="Piccolo PicoClaw Runtime"
+LABEL org.opencontainers.image.description="PicoClaw runtime with the Devbox/Nix toolchain and release integrations baked in"
+%[5]s`, base, DevboxGlobalDir, renderToolchainInstallBlock(commands), integrationBlock, renderLabelBlock(base, packages, commands, bundles))
 }
 
-// renderSetupScript is run by `piccolo serve` after the gateway is healthy. It
-// installs the configured Devbox packages (idempotent; fast when the /nix
-// volume is warm) and symlinks each configured tool's real store binary into
-// /usr/local/bin so tools are ordinary cwd-independent PATH commands. Packages
-// and commands are passed as space-separated argv values by Piccolo; defaults
-// are used only for backwards compatibility with older callers.
-func renderSetupScript() string {
-	return `#!/bin/sh
-set -eu
-PROJ=` + DevboxGlobalDir + `
-STATE_DIR=/usr/local/share/piccolo
-STATE_FILE=$STATE_DIR/toolchain.commands
-PACKAGES="${1:-` + strings.Join(DefaultPackages, " ") + `}"
-COMMANDS="${2:-` + strings.Join(DefaultCommands, " ") + `}"
-mkdir -p "$PROJ" "$STATE_DIR"
-cd "$PROJ"
-{
-  printf '{\n  "packages": [\n'
-  first=1
-  for pkg in $PACKAGES; do
-    if [ "$first" = 1 ]; then first=0; else printf ',\n'; fi
-    printf '    "%s"' "$pkg"
-  done
-  printf '\n  ]\n}\n'
-} > devbox.json
+// renderToolchainInstallBlock installs the configured Devbox packages at BUILD
+// time and symlinks every configured command's real store binary into
+// /usr/local/bin, so tools are ordinary cwd-independent PATH commands with no
+// start-time install and no host cache mount. The layer sits before the
+// integration layers so Docker's prefix cache reuses it across integration
+// changes, and each binary is gc-rooted because the integration layers run
+// nix-collect-garbage that would otherwise collect it. A missing configured
+// command fails the build: an image must not claim tools it cannot provide.
+func renderToolchainInstallBlock(commands []string) string {
+	tools := uniqueSorted(commands)
+	if len(tools) == 0 {
+		return ""
+	}
+	return fmt.Sprintf(`RUN set -eu; cd %[1]s \
+ && echo "Baking the Devbox/Nix toolchain into the image; this can take several minutes on first build..." \
+ && devbox install \
+ && eval "$(devbox shellenv)" \
+ && mkdir -p %[2]s \
+ && for tool in %[3]s; do bin="$(readlink -f "$(command -v "$tool")")"; [ -n "$bin" ] || { echo "configured command is not provided by the toolchain: $tool" >&2; exit 3; }; install -m 0755 "$bin" /usr/local/bin/"$tool"; ln -sfn "$bin" %[2]s/"$tool"; done \
+ && echo "Pruning unreachable store paths from the toolchain layer..." \
+ && nix-collect-garbage -d >/dev/null
+`, DevboxGlobalDir, ToolchainGCRoot, strings.Join(shellQuoteList(tools), " "))
+}
 
-devbox install >/dev/null 2>&1 || devbox install
-if [ -f "$STATE_FILE" ]; then
-  for old in $(cat "$STATE_FILE"); do
-    keep=0
-    for tool in $COMMANDS; do [ "$old" = "$tool" ] && keep=1; done
-    if [ "$keep" = 0 ] && [ -L /usr/local/bin/"$old" ]; then
-      rm -f /usr/local/bin/"$old"
-    fi
-  done
-fi
+// renderLabelBlock records image content. Labels answer "what is in this
+// image?" and explain WHY a rebuild is wanted; the tag stays the cache identity.
+// They are written at build time, so a container inherits them and cannot drift
+// from the image's bytes — including across a promotion rename.
+func renderLabelBlock(base string, packages, commands []string, bundles []IntegrationBundle) string {
+	labels := contentLabels(base, packages, commands, bundles)
+	keys := make([]string, 0, len(labels))
+	for k := range labels {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	var b strings.Builder
+	for _, k := range keys {
+		fmt.Fprintf(&b, "LABEL %s=%s\n", k, labelValue(labels[k]))
+	}
+	return b.String()
+}
 
-eval "$(devbox shellenv 2>/dev/null)"
-: > "$STATE_FILE"
-missing=""
-for tool in $COMMANDS; do
-  bin="$(command -v "$tool" 2>/dev/null || true)"
-  if [ -n "$bin" ]; then
-    ln -sf "$(readlink -f "$bin")" /usr/local/bin/"$tool"
-    printf '%s\n' "$tool" >> "$STATE_FILE"
-  else
-    missing="$missing $tool"
-  fi
-done
-if [ -n "$missing" ]; then
-  echo "missing configured commands:$missing" >&2
-  exit 2
-fi
-`
+// contentLabels is the single definition of what an image says about itself.
+// renderLabelBlock writes exactly this map into the Dockerfile and Plan.Labels
+// returns it, so a drift comparison can never be checking something other than
+// what the build recorded.
+func contentLabels(base string, packages, commands []string, bundles []IntegrationBundle) map[string]string {
+	labels := map[string]string{
+		LabelBaseImage: base,
+		LabelToolchain: toolchainIdentity(packages, commands),
+	}
+	for _, bundle := range bundles {
+		if strings.TrimSpace(bundle.Package) == "" {
+			continue
+		}
+		labels[IntegrationLabelKey(bundle.Package)] = bundleLabelValue(bundle)
+	}
+	return labels
+}
+
+// IntegrationLabelKey is the image label key recording one integration's
+// installed identity. Package refs carry a provider prefix (`github:kimus/x`),
+// so the key is sanitised the same way build-context paths are: one rule, and a
+// lookup that cannot disagree with what the build wrote.
+func IntegrationLabelKey(pkg string) string {
+	return LabelIntegrationPrefix + sanitizeBundleSegment(pkg)
+}
+
+func bundleLabelValue(bundle IntegrationBundle) string {
+	return fmt.Sprintf("%s+%s", valueOrUnknown(bundle.Version), shortDigest(bundle.Digest))
+}
+
+// bundleIdentity is the sorted owner/repo@version+digest list of installed
+// release integrations. Identity comes from release metadata, never from the
+// artifact bytes, so the desired image tag is computable on every serve without
+// downloading anything — a drift warning that cost ~31 MB per integration would
+// be worse than no warning at all.
+func bundleIdentity(bundles []IntegrationBundle) []string {
+	out := make([]string, 0, len(bundles))
+	for _, bundle := range bundles {
+		if strings.TrimSpace(bundle.Package) == "" {
+			continue
+		}
+		out = append(out, fmt.Sprintf("%s@%s+%s", bundle.Package, valueOrUnknown(bundle.Version), shortDigest(bundle.Digest)))
+	}
+	// Sorted: the tag must not depend on install order.
+	sort.Strings(out)
+	return out
+}
+
+func toolchainIdentity(packages, commands []string) string {
+	sum := sha256.Sum256([]byte(strings.Join(uniqueSorted(packages), " ") + "|" + strings.Join(uniqueSorted(commands), " ")))
+	return "sha256:" + hex.EncodeToString(sum[:])[:12]
+}
+
+func shortDigest(digest string) string {
+	d := strings.TrimPrefix(strings.TrimSpace(digest), "sha256:")
+	if d == "" {
+		return "unknown"
+	}
+	if len(d) > 12 {
+		return d[:12]
+	}
+	return d
+}
+
+func valueOrUnknown(v string) string {
+	if strings.TrimSpace(v) == "" {
+		return "unknown"
+	}
+	return strings.TrimSpace(v)
+}
+
+// bundleContextDir is the build-context directory for one release bundle. It is
+// named by package rather than by positional index: an index shifts when an
+// alphabetically earlier integration is added, invalidating unrelated layers.
+func bundleContextDir(bundle IntegrationBundle) string {
+	return "release-integrations/" + sanitizeBundleSegment(bundle.Package)
+}
+
+func sanitizeBundleSegment(pkg string) string {
+	parts := strings.Split(strings.TrimSpace(pkg), "/")
+	for i, part := range parts {
+		var b strings.Builder
+		for _, r := range part {
+			switch {
+			case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '.', r == '_', r == '-':
+				b.WriteRune(r)
+			default:
+				b.WriteRune('_')
+			}
+		}
+		cleaned := b.String()
+		if cleaned == "" || cleaned == "." || cleaned == ".." {
+			cleaned = "x"
+		}
+		parts[i] = cleaned
+	}
+	return strings.Join(parts, "/")
+}
+
+func labelValue(s string) string {
+	return "\"" + strings.NewReplacer(`\`, `\\`, `"`, `\"`).Replace(s) + "\""
 }
 
 func renderDevbox(packages []string) (string, error) {
@@ -378,10 +505,11 @@ func normalizeBundles(in []IntegrationBundle) []IntegrationBundle {
 
 func renderBundleInstallBlock(bundles []IntegrationBundle) string {
 	var b strings.Builder
-	for i, bundle := range bundles {
+	for _, bundle := range bundles {
 		commands := uniqueSorted(bundle.Commands)
-		b.WriteString(fmt.Sprintf("COPY release-integrations/bundle-%d/ /opt/piccolo/release-integrations/bundle-%d/\n", i, i))
-		b.WriteString(fmt.Sprintf("RUN set -eu; src=/opt/piccolo/release-integrations/bundle-%d; \\\n", i))
+		dir := bundleContextDir(bundle)
+		b.WriteString(fmt.Sprintf("COPY %s/ /opt/piccolo/%s/\n", dir, dir))
+		b.WriteString(fmt.Sprintf("RUN set -eu; src=/opt/piccolo/%s; \\\n", dir))
 		b.WriteString(" if [ -d \"$src/nix/store\" ]; then mkdir -p /nix/store; cp -a \"$src/nix/store/.\" /nix/store/; fi; \\\n")
 		b.WriteString(" if [ -d \"$src/bin\" ]; then for bin in \"$src\"/bin/*; do [ -f \"$bin\" ] || continue; install -m 0755 \"$bin\" /usr/local/bin/\"$(basename \"$bin\")\"; done; fi")
 		for _, cmd := range commands {
@@ -410,11 +538,11 @@ RUN echo "Integration cache key: ${PICCOLO_INTEGRATIONS_CACHE_BUST}" >/dev/null 
  && devbox install \
  && echo "Finalizing integration commands; this may take a moment..." \
  && eval "$(devbox shellenv)" \
- && mkdir -p /nix/var/nix/gcroots/piccolo-integrations \
- && for tool in %s; do bin="$(readlink -f "$(command -v "$tool")")"; install -m 0755 "$bin" /usr/local/bin/"$tool"; nix-store --add-root /nix/var/nix/gcroots/piccolo-integrations/"$tool" --indirect "$bin" >/dev/null; done \
+ && mkdir -p %[2]s \
+ && for tool in %[1]s; do bin="$(readlink -f "$(command -v "$tool")")"; install -m 0755 "$bin" /usr/local/bin/"$tool"; ln -sfn "$bin" %[2]s/"$tool"; done \
  && echo "Pruning integration build dependencies from the image layer..." \
  && nix-collect-garbage -d >/dev/null
-%s`, strings.Join(shellQuoteList(commands), " "), verify.String())
+%[3]s`, strings.Join(shellQuoteList(commands), " "), IntegrationGCRoot, verify.String())
 }
 
 func shellQuoteList(values []string) []string {

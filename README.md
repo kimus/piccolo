@@ -20,12 +20,13 @@ piccolo integration setup kimus/piccolo-gws
 piccolo doctor    validates Docker, workspace, and generated files
 piccolo serve     starts the PicoClaw gateway container in the background,
                   waits until http://127.0.0.1:18790/health answers
-piccolo restart   stop + serve in one step (apply config or piccolo.yaml changes)
+piccolo restart   promote/replace the gateway with the current config (reverts on failure)
 piccolo reload    apply config.json changes without recreating the container
 piccolo chat      talk to the assistant in the terminal (PicoClaw's own REPL)
 piccolo status    container + health state
 piccolo logs      gateway logs (-f to follow)
 piccolo stop      stop and remove the container
+piccolo integration rollback   go back to the previously running runtime image
 ```
 
 ```text
@@ -132,13 +133,11 @@ The gateway always runs. If you enabled the optional **web console** (launcher i
     gws/
       auth/
       backend.json
-  runtime/           # workspace-visible caches for the local runtime image
-    devbox/          # -> /root/.local/share/devbox/global/default
-    nix/             # -> /nix
+  runtime/           # workspace-visible caches
     media/           # -> /tmp/picoclaw_media and agent media mirrors
 ```
 
-Mount ownership is intentionally split: `/root/.picoclaw` is PicoClaw's home only (including PicoClaw runtime files like `.security.yml`, `logs/`, and `launcher-auth.db`), while integration packages persist their state under `/root/.piccolo/integrations/<name>` (for Google Workspace, `<name>` is `gws`). Runtime cache directories can grow; use `piccolo runtime prune` for Nix garbage collection in a running container or `piccolo runtime reset-cache --yes` to delete/recreate the workspace `runtime/` caches.
+Mount ownership is intentionally split: `/root/.picoclaw` is PicoClaw's home only (including PicoClaw runtime files like `.security.yml`, `logs/`, and `launcher-auth.db`), while integration packages persist their state under `/root/.piccolo/integrations/<name>` (for Google Workspace, `<name>` is `gws`). The toolchain is **not** mounted from the host any more: it is baked into the runtime image, because a host bind over `/nix` hides the image's own store. `runtime/devbox` and `runtime/nix` may still exist in older workspaces; they are unused leftovers, and Piccolo never deletes them — `piccolo runtime reset-cache --yes` does, on request.
 
 ## Configuration ownership
 
@@ -162,6 +161,7 @@ container:
   ports: []                                 # web console enabled: ["127.0.0.1:18800:18800"]
   env:                                      # "env:VAR" reads the host env at serve time
     {}
+  previous_image: ""                        # rollback slot: image run before the last promotion
 setup:                                      # optional non-secret setup metadata
   channels:
     discord:
@@ -360,16 +360,18 @@ Generated agents include the PicoClaw skill `file-handling`, which teaches them 
 zbarimg --quiet --raw /tmp/picoclaw_media/<uploaded>.png
 ```
 
-Build the optional local runtime image to provide Devbox/Nix and common file-handling tools:
+Build the local runtime image to bake in Devbox/Nix, the file-handling toolchain, and every installed integration:
 
 ```sh
 piccolo image build --set
 piccolo restart
 ```
 
-The build uses the configured pinned PicoClaw image as its base, generates a temporary/in-memory Docker build context, and tags a local image such as `piccolo/picoclaw-runtime:<hash>`. It does not require a public Piccolo image registry. Omit `--set` to leave `piccolo.yaml` unchanged; Piccolo will print the `container.image` value to adopt manually.
+The build uses the configured pinned PicoClaw image as its base, generates a temporary/in-memory Docker build context, and tags a local image such as `piccolo/picoclaw-runtime:<hash>`. It does not require a public Piccolo image registry. Omit `--set` to leave `piccolo.yaml` unchanged; Piccolo will print the `container.image` value to adopt manually. `image build` composes the **whole** workspace image — toolchain plus all installed integrations — which is why it is the command the staleness warning points at.
 
-The image is intentionally **lean**: it installs only the Devbox binary, the `nixbld` build group/users Nix needs, and a `piccolo-setup-tools` script. The tools themselves are **not** baked into the image. On the first `piccolo serve`/`restart` after the gateway is healthy, Piccolo applies the `runtime.toolchain` section from `piccolo.yaml`; installed packages and the Nix store persist in workspace-visible directories (`runtime/devbox` and `runtime/nix`), so later restarts are near-instant and cache size is inspectable from the host.
+**The toolchain is baked into the image.** Nothing installs when the gateway starts, and Piccolo binds nothing over `/nix`. That is the fix for a failure mode that was silent and total: mounting the workspace Nix cache over `/nix` hid the image's own store (1464 entries in the image, 68 visible in the running container), so `gws`, `piccolo-gws`, `python3` and `jq` existed on `PATH` and still could not execute — the integration worked when Piccolo configured it and failed when Piccolo ran it.
+
+The cost is disk, and it is measured rather than estimated: with the default package list the runtime image goes from **440 MB to about 8.3 GB**, and the toolchain layer alone is **5.78 GB** (libreoffice, ffmpeg, imagemagick and tesseract dominate). Two things keep that from being worse: the layer is gc-rooted and pruned in place (collection recovered ~30 MB, because the closure genuinely is that size), and layer digests are shared across tags, so rebuilding for an integration change does not pay for it again. Trim `runtime.toolchain.packages` if the full office/media set is not needed.
 
 ```yaml
 runtime:
@@ -378,9 +380,11 @@ runtime:
     commands: [zbarimg, file, python3, jq, yq, pdftotext, pdfinfo, pdftoppm, pdftocairo, tesseract, pandoc, xmllint, exiftool, ffprobe, ffmpeg, sqlite3, unzip, 7z, 7za, libreoffice, soffice, magick, convert, identify]
 ```
 
-`piccolo-setup-tools` writes the configured package list to Devbox, runs `devbox install`, then resolves each configured command's real `/nix/store` binary via `devbox shellenv` and symlinks it into `/usr/local/bin`. The tools thus become ordinary PATH commands that work from **any** working directory with relative or absolute args, with no per-call Devbox overhead. This routes around two Devbox limitations verified in this daemon-less Nix container: `devbox global install` links only a subset of binaries into the profile `bin`, and `devbox run` always cds to the project root (breaking relative paths). The `nixbld` group is baked into the image because it lives in `/etc/group`, which is ephemeral and otherwise resets on container recreation (breaking Nix after a restart). A future Piccolo-maintained public image can replace this local image by editing `piccolo.yaml`.
+The toolchain installs in its **own layer, before the integration layers**. Docker's cache is prefix-based, so changing an integration reuses the toolchain layer, and editing the package list invalidates exactly the toolchain layer and what follows it. Each configured command is copied into `/usr/local/bin` and symlinked under `/nix/var/nix/gcroots/piccolo-toolchain`, so the layer's own garbage collection cannot delete a tool the image advertises — and a configured command that the package list does not provide **fails the build**, because an image must not claim tools it cannot run. The `nixbld` group stays baked in: it lives in `/etc/group`, which is ephemeral and otherwise resets on container recreation.
 
-Use `piccolo runtime status` to inspect configured/live commands, `piccolo runtime apply` to reconcile a running container after editing `runtime.toolchain`, `piccolo runtime prune` to attempt Nix garbage collection, and `piccolo runtime reset-cache --yes` to remove/recreate the persisted `runtime/{devbox,nix,media}` directories for a clean reinstall.
+Every locally built image records what it contains, in labels: `piccolo.base`, `piccolo.toolchain`, and one `piccolo.integration.<owner>/<repo>="<version>+<digest>"` per installed release. Those labels are what turn "the image is stale" into a reason you can act on.
+
+Use `piccolo runtime status` to inspect configured/live commands, `piccolo runtime apply` to check whether the running image already contains the configured toolchain (it reports the mismatch and the rebuild command; it no longer installs anything, because a running container is not where the toolchain is defined), `piccolo runtime prune` to attempt Nix garbage collection, and `piccolo runtime reset-cache --yes` to remove leftover `runtime/` caches.
 
 For QR codes the Devbox package is `zbar`; other common mappings include image normalization with ImageMagick (`magick`, `convert`, `identify`), OCR with `tesseract`, PDF inspection/rendering with Poppler (`pdfinfo`, `pdftotext`, `pdftoppm`, `pdftocairo`), office conversion with LibreOffice (`soffice`/`libreoffice`), structured data parsing with Python/`jq`/`yq`/`xmllint`, archive listing before extraction, EXIF inspection with `exiftool`, and media inspection with `ffprobe`/`ffmpeg`. The skill tells agents to call these directly, avoid OpenCV/`cv2` unless explicitly needed, write intermediates under the workspace, and never use `apt-get` (the base image is Alpine).
 
@@ -416,11 +420,39 @@ Validates the setup and prints `[OK]` / `[WARN]` / `[FAIL]` lines:
 
 Exit code is non-zero only on `[FAIL]`; warnings never fail.
 
-### `piccolo serve`
+### `piccolo serve` / `piccolo restart`
 
-Starts the gateway container **in the background**: pulls the image if missing, replaces a stale container of the same name (crash-safe restart), auto-publishes the gateway health port on `127.0.0.1:18790` (unless your `piccolo.yaml` already maps it), and injects `PICOCLAW_GATEWAY_HOST=0.0.0.0` inside the container so the published port can reach it. Then it polls `http://127.0.0.1:18790/health` until the gateway answers — on failure it prints the error plus recent container logs and exits non-zero, leaving the container in place for debugging (`piccolo logs`, `piccolo stop`).
+Starts the gateway container **in the background**: pulls the image if missing, auto-publishes the gateway health port on `127.0.0.1:18790` (unless your `piccolo.yaml` already maps it), and injects `PICOCLAW_GATEWAY_HOST=0.0.0.0` inside the container so the published port can reach it.
 
-Use `--foreground` to attach stdio instead (Ctrl-C stops the container).
+When the container that exists runs a **different image** than `container.image`, Piccolo promotes instead of replacing:
+
+1. stop the current gateway and rename it to `<name>.prev` — the canonical name is freed, but the known-good container survives as a revert target
+2. start the target image under the canonical name
+3. gate it: `/health` must answer **and** every installed integration binary must actually execute inside the container (`docker exec`, not `command -v`)
+4. pass → remove `<name>.prev`, record the replaced image for `piccolo integration rollback`
+5. fail → capture the gate output and the candidate's logs, remove the candidate, restart the previous gateway, exit non-zero
+
+The gate executes because health alone is not readiness: a gateway whose integration binaries cannot run answers `200 OK` happily, and `command -v piccolo-gws` succeeded in exactly such a container. Promoting with a revert target is what turns "new image is broken" from an outage into a warning.
+
+A promotion that was interrupted (crash, Ctrl-C mid-restart) leaves `<name>.prev` with nothing on the canonical name; the next `serve` detects it, restores it, and says so. `doctor` and `status` report the same condition.
+
+`piccolo restart` is now just "serve with the current configuration" — it no longer stops and removes the gateway first, because that destroyed the only thing a failed promotion could fall back to.
+
+Use `--foreground` to attach stdio instead (Ctrl-C stops the container); it promotes with the same park/gate/revert sequence while attached.
+
+### `piccolo integration rollback`
+
+Puts the workspace back on the image it ran before the last successful promotion — for the case where the new gateway is healthy but wrong:
+
+```sh
+piccolo integration rollback --dry-run   # show the target and what it contains
+piccolo integration rollback             # confirm, then promote through the same gate
+piccolo integration rollback --to <image>
+```
+
+It refuses before stopping anything if the target image is no longer present locally, and it routes through the same gated promotion, so a rollback that does not work restores the current gateway instead of leaving nothing running. `piccolo.yaml` keeps one rollback slot (`container.previous_image`).
+
+Rollback restores **service**, not configuration: the workspace still records the integration versions it has now, so the image-content warning will legitimately keep reporting a difference until you make the choice durable with `piccolo integration add <owner/repo>@<selector>` or `piccolo image build --set`.
 
 ### `piccolo chat`
 
@@ -435,7 +467,7 @@ For the optional **web console**, init with `--dashboard` (launcher image) and o
 
 ### `piccolo status` / `piccolo logs` / `piccolo stop`
 
-`status` shows container state + a live `/health` probe. `logs [-f] [--tail N]` streams gateway logs. `stop` gracefully stops and removes the container.
+`status` shows container state, the image it is running, a live `/health` probe, the rollback target when one is recorded, and a parked `<name>.prev` container when a promotion was interrupted. `logs [-f] [--tail N]` streams gateway logs. `stop` gracefully stops and removes the container.
 
 All commands resolve the workspace the same way: `-D/--dir` flag, else the current directory. Commands fail with an actionable message when `piccolo.yaml` is missing.
 

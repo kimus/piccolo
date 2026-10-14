@@ -13,9 +13,9 @@ import (
 	"golang.org/x/term"
 
 	"github.com/kimus/piccolo/internal/docker"
-	"github.com/kimus/piccolo/internal/generate"
 	"github.com/kimus/piccolo/internal/manifest"
 	"github.com/kimus/piccolo/internal/runtimeimage"
+	"github.com/kimus/piccolo/internal/runtimeplan"
 	"github.com/kimus/piccolo/internal/workspace"
 )
 
@@ -46,19 +46,50 @@ func newImageCmd() *cobra.Command {
 	return cmd
 }
 
+// refreshInstalledIdentity aligns the recorded integration metadata with the
+// artifacts that were actually placed in the image.
+func refreshInstalledIdentity(m *manifest.Manifest, bundles []runtimeimage.IntegrationBundle) {
+	byPackage := make(map[string]runtimeimage.IntegrationBundle, len(bundles))
+	for _, bundle := range bundles {
+		byPackage[bundle.Package] = bundle
+	}
+	for i := range m.Runtime.Integrations {
+		item := m.Runtime.Integrations[i]
+		if item.Source != runtimeplan.SourceRelease {
+			continue
+		}
+		bundle, ok := byPackage[item.Package]
+		if !ok {
+			continue
+		}
+		if bundle.Version != "" {
+			item.ResolvedVersion = bundle.Version
+		}
+		if bundle.Digest != "" {
+			item.ArtifactDigest = bundle.Digest
+		}
+		if len(bundle.Commands) > 0 {
+			item.Commands = append([]string(nil), bundle.Commands...)
+		}
+		m.Runtime.Integrations[i] = item
+	}
+}
+
 func newImageBuildCmd() *cobra.Command {
 	var f imageBuildFlags
 	cmd := &cobra.Command{
 		Use:   "build",
-		Short: "Build a local PicoClaw runtime image with Devbox file-handling tools",
-		Long: "Builds a local, pinned Docker image derived from the workspace's configured " +
-			"PicoClaw image (or --base). The generated build context is temporary/in-memory; " +
-			"Piccolo only edits piccolo.yaml when --set is used or when an interactive prompt is accepted.",
+		Short: "Rebuild this workspace's runtime image: toolchain and integrations baked in",
+		Long: "Builds a local, pinned Docker image from the workspace's configured base plus its " +
+			"runtime toolchain and every installed integration. This is the command a stale-image " +
+			"warning points at: Piccolo never rebuilds implicitly, so an image edit stays user-initiated. " +
+			"The generated build context is temporary/in-memory; Piccolo only edits piccolo.yaml when " +
+			"--set is used or when an interactive prompt is accepted.",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runImageBuild(cmd, f)
 		},
 	}
-	cmd.Flags().StringVar(&f.base, "base", "", "base PicoClaw image (default: container.image from piccolo.yaml)")
+	cmd.Flags().StringVar(&f.base, "base", "", "base PicoClaw image (default: the workspace's official base, preserving the launcher flavor)")
 	cmd.Flags().StringVar(&f.tag, "tag", "", "local image tag to build (default: deterministic content-derived tag)")
 	cmd.Flags().BoolVar(&f.setManifest, "set", false, "update piccolo.yaml container.image to the built tag after a successful build")
 	cmd.Flags().BoolVar(&f.yes, "yes", false, "non-interactive: do not prompt; requires --set to modify piccolo.yaml")
@@ -87,21 +118,35 @@ func runImageBuild(cmd *cobra.Command, f imageBuildFlags) error {
 
 	base := strings.TrimSpace(f.base)
 	if base == "" {
-		base = m.Container.Image
-		// Never stack a rebuild on top of a previous Piccolo runtime image: that
-		// would inherit its (possibly stale) layers. Rebuild from the official
-		// PicoClaw base instead, preserving the launcher flavor for dashboards.
-		if runtimeimage.IsLocalRuntimeImage(base) {
-			base = runtimeimage.DefaultBaseImage
-			for _, p := range m.Container.Ports {
-				if strings.Contains(p, ":18800") {
-					base = generate.LauncherImage
-					break
-				}
-			}
-		}
+		base = integrationBuildBase(m)
 	}
-	plan, err := runtimeimage.BuildPlan(runtimeimage.Options{BaseImage: base, Tag: f.tag, Packages: f.packageList})
+	// An image build must reproduce the WHOLE workspace image: toolchain plus
+	// every installed integration. Building only the toolchain would produce an
+	// image that silently drops integrations, which is worse than not having a
+	// rebuild command at all.
+	tc := effectiveToolchain(m)
+	packages := tc.Packages
+	if len(f.packageList) > 0 {
+		packages = f.packageList
+	}
+	ctxWithTimeout := ctx
+	var bundles []runtimeimage.IntegrationBundle
+	if len(runtimeplan.Bundles(m.Runtime.Integrations)) > 0 {
+		fmt.Fprintf(out, "Expanding installed integration releases (needed in the build context)...\n")
+		fetched, err := fetchReleaseBundlesForManifest(ctxWithTimeout, newReleaseFetcher(), m.Runtime.Integrations)
+		if err != nil {
+			return err
+		}
+		bundles = fetched
+	}
+	plan, err := runtimeimage.BuildPlan(runtimeimage.Options{
+		BaseImage:    base,
+		Tag:          f.tag,
+		Packages:     packages,
+		Commands:     tc.Commands,
+		Integrations: sourceManifestIntegrationsForBuild(m.Runtime.Integrations),
+		Bundles:      bundles,
+	})
 	if err != nil {
 		return err
 	}
@@ -124,7 +169,15 @@ func runImageBuild(cmd *cobra.Command, f imageBuildFlags) error {
 	fmt.Fprintf(out, "Building Piccolo runtime image\n")
 	fmt.Fprintf(out, "  base: %s\n", plan.BaseImage)
 	fmt.Fprintf(out, "  tag:  %s\n", plan.Tag)
-	fmt.Fprintf(out, "  devbox global: %s\n", runtimeimage.DevboxGlobalDir)
+	fmt.Fprintf(out, "  toolchain: %d packages, %d commands (baked into the image)\n", len(plan.Packages), len(plan.Commands))
+	for _, identity := range plan.Identity {
+		fmt.Fprintf(out, "  integration: %s\n", identity)
+	}
+	if len(plan.Integrations) > 0 {
+		for _, in := range plan.Integrations {
+			fmt.Fprintf(out, "  integration (source build): %s\n", in.Ref)
+		}
+	}
 	fmt.Fprintln(out, "")
 	if err := runner.BuildImage(ctx, buildCtx, docker.ImageBuildOptions{Tag: plan.Tag, Dockerfile: "Dockerfile", Pull: f.pull, Remove: true}, out); err != nil {
 		return fmt.Errorf("build image: %w", err)
@@ -138,6 +191,11 @@ func runImageBuild(cmd *cobra.Command, f imageBuildFlags) error {
 	}
 	if adopt {
 		m.Container.Image = plan.Tag
+		// Record what the image actually contains. The build used the expanded
+		// artifacts' version, digest and command list, so those are the values the
+		// drift check must compare against later — otherwise a rebuild moves the tag
+		// without moving the record, and the workspace stays "stale" forever.
+		refreshInstalledIdentity(m, bundles)
 		if err := m.Write(manifestPath); err != nil {
 			return fmt.Errorf("update %s: %w", workspace.ManifestName, err)
 		}
@@ -147,9 +205,10 @@ func runImageBuild(cmd *cobra.Command, f imageBuildFlags) error {
 	}
 
 	fmt.Fprintln(out, "\nNext steps:")
-	fmt.Fprintln(out, "  piccolo setup tools   # ensure agents have the file-handling skill")
-	fmt.Fprintln(out, "  piccolo restart       # recreate the gateway; serve installs the Devbox tools once")
+	fmt.Fprintln(out, "  piccolo restart       # promote the new image (gated, reverts on failure)")
+	fmt.Fprintln(out, "  piccolo runtime status  # confirm the toolchain is available in the container")
 	fmt.Fprintln(out, "  piccolo chat -m 'Run file --version && python3 --version && zbarimg --version'")
-	fmt.Fprintln(out, "\nNote: the image is lean \u2014 tools install into a persisted Devbox global volume on first 'piccolo serve' (or restart). Uploaded media under /tmp/picoclaw_media is readable by the agent.")
+	fmt.Fprintln(out, "\nNote: the toolchain and the integration binaries are baked into this image.")
+	fmt.Fprintln(out, "nothing installs when the gateway starts, and /nix is never mounted over.")
 	return nil
 }

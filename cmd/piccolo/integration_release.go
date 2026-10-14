@@ -119,8 +119,11 @@ func (g githubReleaseFetcher) Download(ctx context.Context, res releaseResolutio
 		Digest:   res.Digest,
 		Manifest: res.Manifest,
 		Bundle: runtimeimage.IntegrationBundle{
-			Package:  res.Ref.Package(),
-			Version:  res.Version,
+			Package: res.Ref.Package(),
+			Version: res.Version,
+			// Digest rides into the plan so the image tag and the content
+			// labels describe the artifact that was actually installed.
+			Digest:   res.Digest,
 			Root:     root,
 			Commands: commands,
 		},

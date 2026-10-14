@@ -16,6 +16,18 @@ Piccolo SHALL compare the runtime image in use with the image the workspace curr
 - **THEN** Piccolo reports the image as stale and names the integration and both versions
 - **AND** Piccolo does not start a build
 
+#### Scenario: Only the build recipe changed
+
+- **WHEN** the image in use records the same content identity as the workspace describes, but under a different tag
+- **THEN** Piccolo does not report the image as stale
+- **AND** it says only that the tag differs because Piccolo's build recipe changed
+
+#### Scenario: The same problem is not reported twice
+
+- **WHEN** the configured image is simply not present locally
+- **THEN** Piccolo reports the missing image once, as a missing image
+- **AND** it does not also report content drift for that image
+
 #### Scenario: Rebuild command is stated
 
 - **WHEN** Piccolo reports stale runtime image

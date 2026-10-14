@@ -174,8 +174,11 @@ func TestIntegrationAddReleaseBuildsDescribesAndUpdatesManifest(t *testing.T) {
 	if fake.builds != 1 || fake.tag != "piccolo/picoclaw-runtime:gws" {
 		t.Fatalf("builds=%d tag=%q", fake.builds, fake.tag)
 	}
-	if !strings.Contains(fake.buildContext, "release-integrations/bundle-0/bin/piccolo-gws") {
-		t.Fatalf("build context missing bundle: %q", fake.buildContext)
+	if !strings.Contains(fake.buildContext, "release-integrations/github_kimus/piccolo-gws/bin/piccolo-gws") {
+		t.Fatalf("build context missing package-named bundle: %q", fake.buildContext)
+	}
+	if strings.Contains(fake.buildContext, "bundle-0") {
+		t.Fatal("bundle context paths must be named by package, not position")
 	}
 	m, err := manifest.Load(filepath.Join(dir, "piccolo.yaml"))
 	if err != nil {
@@ -210,7 +213,11 @@ func TestIntegrationAddReleaseReplacesLegacySourceBuild(t *testing.T) {
 	if err := runIntegrationAdd(testCommand(&bytes.Buffer{}), "kimus/piccolo-gws", integrationFlags{yes: true, tag: "piccolo/picoclaw-runtime:gws"}); err != nil {
 		t.Fatalf("add: %v", err)
 	}
-	if strings.Contains(fake.buildContext, "devbox add github:kimus/piccolo-gws") || strings.Contains(fake.buildContext, "nix-collect-garbage") {
+	// The toolchain layer runs its own Nix GC, so look for the source-build layer
+	// itself: the Devbox integration project it installs into.
+	// The devbox file is always in the context; the source-build LAYER is the
+	// thing a release add must not emit.
+	if strings.Contains(fake.buildContext, "/opt/piccolo/integrations") {
 		t.Fatalf("release add preserved legacy source build context")
 	}
 	m, err := manifest.Load(filepath.Join(dir, "piccolo.yaml"))
@@ -718,5 +725,54 @@ func TestPrintIntegrationPlanShowsVersions(t *testing.T) {
 		if !strings.Contains(got, want) {
 			t.Fatalf("plan must show %q, got:\n%s", want, got)
 		}
+	}
+}
+
+// The record must describe what the image actually verifies. Recording the
+// descriptor's command list instead of the artifact's leaves the drift check
+// comparing a plan the build can never reproduce, and no rebuild clears it.
+func TestInstalledCommandsPrefersWhatTheImageVerifies(t *testing.T) {
+	got := installedCommands([]string{"gws", "piccolo-gws"}, picintegration.CommandList{"piccolo-gws"})
+	if strings.Join(got, ",") != "gws,piccolo-gws" {
+		t.Errorf("installed commands = %v", got)
+	}
+	fallback := installedCommands(nil, picintegration.CommandList{"piccolo-gws"})
+	if strings.Join(fallback, ",") != "piccolo-gws" {
+		t.Errorf("fallback = %v", fallback)
+	}
+}
+
+func TestRefreshInstalledIdentityAlignsTheRecord(t *testing.T) {
+	m := &manifest.Manifest{}
+	m.Runtime.Integrations = []manifest.Integration{
+		{Package: "github:kimus/piccolo-gws", Source: "release", ResolvedVersion: "0.3.0", ArtifactDigest: "sha256:old", Commands: []string{"piccolo-gws"}},
+		{Package: "github:other/x", Source: "build", Ref: "github:other/x@sha"},
+	}
+	bundles := []runtimeimage.IntegrationBundle{{
+		Package: "github:kimus/piccolo-gws", Version: "0.3.1",
+		Digest: "sha256:new", Commands: []string{"gws", "piccolo-gws"},
+	}}
+	refreshInstalledIdentity(m, bundles)
+
+	item := m.Runtime.Integrations[0]
+	if item.ResolvedVersion != "0.3.1" || item.ArtifactDigest != "sha256:new" || strings.Join(item.Commands, ",") != "gws,piccolo-gws" {
+		t.Errorf("record not aligned with the built image: %#v", item)
+	}
+	if m.Runtime.Integrations[1].ResolvedVersion != "" {
+		t.Error("a source-built entry must not be touched by release refresh")
+	}
+
+	// Drift must be gone once the record matches what was built.
+	plan, err := desiredRuntimePlan(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.Container.Image = plan.Tag
+	again, err := desiredRuntimePlan(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again.Tag != plan.Tag {
+		t.Errorf("recomputing the plan changed the tag: %s vs %s", again.Tag, plan.Tag)
 	}
 }

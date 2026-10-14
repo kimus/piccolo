@@ -15,10 +15,10 @@ stopped old, never renamed    → still restartable under its original name
 
 - Promote through a candidate container named `<container.name>.next`: stop the current gateway, start `.next` from the target image, gate it, then either finish or revert.
 - **Gate = execute, not find.** `/health` plus a `docker exec` of each installed integration's binary. Presence checks are known to lie: `command -v piccolo-gws` succeeds where `piccolo-gws state` reports `not found`.
-- **On success:** remove the stopped old container, then rename `.next` to the canonical name. Renaming a running container is free, so there is no second outage.
-- **On failure:** stop `.next`, **capture its gate diagnostics and last log lines into the report**, then remove it, then start the old container again and report non-zero.
+- **On success:** remove the stopped old container, then the candidate already holds the canonical name. There is no second outage and no rename of a running container needed.
+- **On failure:** stop `.next`… specifically: remove the failed candidate, rename the parked container back to the canonical name, start it again, and report non-zero — after its gate diagnostics and last log lines have been printed.
 - Record the previously running image so `piccolo integration rollback` can put a workspace back on it through the same promote path.
-- Mark the candidate with a container label so an interrupted promote is detectable and cleanable.
+- Identify the parked revert target by **name** (`<container.name>.prev`), not by label: this Docker SDK can only set labels at create time and `ContainerUpdateOptions` cannot change them, so a "candidate" label could never be cleared once the candidate won. (The original sketch said "label the one-shot candidate"; the name carries the role instead, and the canonical name always belongs to what should be running.)
 
 ## Capabilities
 

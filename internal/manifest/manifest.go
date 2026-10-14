@@ -103,6 +103,11 @@ type Container struct {
 	Network string            `yaml:"network"`
 	Ports   []string          `yaml:"ports,omitempty"`
 	Env     map[string]string `yaml:"env,omitempty"`
+	// PreviousImage records the image the workspace ran before the last
+	// successful promotion. It is the single rollback slot: one entry, because
+	// "go back to what worked" needs exactly one answer, and a deeper history
+	// would be a different feature.
+	PreviousImage string `yaml:"previous_image,omitempty"`
 }
 
 // Valid network modes for the container.

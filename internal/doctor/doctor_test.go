@@ -9,15 +9,22 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/kimus/piccolo/internal/docker"
 	"github.com/kimus/piccolo/internal/generate"
 	"github.com/kimus/piccolo/internal/manifest"
+	"github.com/kimus/piccolo/internal/runtimeimage"
+	"github.com/kimus/piccolo/internal/runtimeplan"
 )
 
 // fakeEngine is a daemon-free doctor.Engine for tests.
 type fakeEngine struct {
 	pingErr      error
 	imageExists  bool
+	imageLabels  map[string]string
+	labelsFound  bool
+	labelsErr    error
 	container    bool
+	parkedTarget bool
 	setupOrphans []string
 }
 
@@ -25,7 +32,13 @@ func (f fakeEngine) Ping(context.Context) error { return f.pingErr }
 func (f fakeEngine) ImageExists(context.Context, string) (bool, error) {
 	return f.imageExists, nil
 }
-func (f fakeEngine) ContainerExists(context.Context, string) (bool, error) {
+func (f fakeEngine) ImageLabels(context.Context, string) (map[string]string, bool, error) {
+	return f.imageLabels, f.labelsFound, f.labelsErr
+}
+func (f fakeEngine) ContainerExists(_ context.Context, name string) (bool, error) {
+	if strings.HasSuffix(name, docker.PreviousSuffix) {
+		return f.parkedTarget, nil
+	}
 	return f.container, nil
 }
 func (f fakeEngine) ListByPrefix(_ context.Context, prefix string) ([]string, error) {
@@ -511,5 +524,109 @@ func TestCheckChannels(t *testing.T) {
 	// No channel_list → no results, never a failure.
 	if n := len(checkChannels([]byte(`{"version":3}`))); n != 0 {
 		t.Errorf("absent channel_list gave %d results", n)
+	}
+}
+
+// A stale runtime image must be reported with its reason, and never repaired by
+// doctor: adopting a rebuild is the user's decision.
+func TestDoctorReportsStaleRuntimeImage(t *testing.T) {
+	dir := initWorkspace(t)
+	path := filepath.Join(dir, "piccolo.yaml")
+	m, err := manifest.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	desired, err := runtimeplan.Plan(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.Container.Image = desired.Tag
+	if err := m.Write(path); err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+
+	// Up to date: the workspace points at exactly the plan the metadata implies.
+	results := Run(ctx, Options{Workspace: dir, Engine: fakeEngine{
+		imageExists: true, labelsFound: true, imageLabels: desired.Labels(),
+	}})
+	r := find(results, "runtime image matches this workspace")
+	if r == nil || r.Status != OK {
+		t.Fatalf("expected an OK currency line: %#v", results)
+	}
+
+	// Toolchain moved: the recorded image is a different tag, and its labels name
+	// what changed. Comparing labels (not just tags) is what makes the warning
+	// actionable.
+	m.Container.Image = desired.Tag[:len(desired.Tag)-12] + "000000000000"
+	if err := m.Write(path); err != nil {
+		t.Fatal(err)
+	}
+	lagging := desired.Labels()
+	lagging[runtimeimage.LabelToolchain] = "sha256:000000000000"
+	results = Run(ctx, Options{Workspace: dir, Engine: fakeEngine{
+		imageExists: true, labelsFound: true, imageLabels: lagging,
+	}})
+	r = find(results, "runtime image is stale")
+	if r == nil || r.Status != WARN {
+		t.Fatalf("expected a stale warning: %#v", results)
+	}
+	if !strings.Contains(r.Message, "toolchain package list changed") {
+		t.Errorf("stale warning lost the reason: %s", r.Message)
+	}
+	if !strings.Contains(r.Message, "piccolo image build --set") {
+		t.Errorf("stale warning must name the rebuild command: %s", r.Message)
+	}
+	if Failed(results) {
+		t.Error("stale image must warn, never fail")
+	}
+
+	// An image built before content labels cannot be attributed, and doctor says
+	// that instead of inventing a reason. (An image that is absent entirely gets
+	// the "not present locally" reason, which the presence check already covers.)
+	results = Run(ctx, Options{Workspace: dir, Engine: fakeEngine{imageExists: true, labelsFound: true}})
+	r = find(results, "runtime image is stale")
+	if r == nil || !strings.Contains(r.Message, "predates Piccolo content labels") {
+		t.Fatalf("expected the predates-labels reason: %#v", results)
+	}
+
+	// Image missing locally: the presence check owns that message, and the drift
+	// check stays quiet rather than reporting the same problem twice.
+	results = Run(ctx, Options{Workspace: dir, Engine: fakeEngine{imageExists: false}})
+	if r := find(results, "runtime image is stale"); r != nil {
+		t.Errorf("a missing image must not also be reported as content drift: %s", r.Message)
+	}
+	if r := find(results, "local Piccolo runtime image not present"); r == nil {
+		t.Errorf("expected the presence warning: %#v", results)
+	}
+
+	// Template-only drift (identical content labels, older tag from a Piccolo
+	// upgrade) must NOT be sold as a rebuild the user needs to make.
+	m.Container.Image = desired.Tag[:len(desired.Tag)-12] + "111111111111"
+	if err := m.Write(path); err != nil {
+		t.Fatal(err)
+	}
+	results = Run(ctx, Options{Workspace: dir, Engine: fakeEngine{
+		imageExists: true, labelsFound: true, imageLabels: desired.Labels(),
+	}})
+	if r := find(results, "runtime image is stale"); r != nil {
+		t.Errorf("template-only drift reported as stale: %s", r.Message)
+	}
+	if r := find(results, "runtime image content matches this workspace"); r == nil || r.Status != OK {
+		t.Fatalf("expected an OK content-match line for template drift: %#v", results)
+	}
+}
+
+// A promotion that was interrupted leaves the previous gateway under the reserved
+// name. That is the one abnormal state, and serve repairs it.
+func TestDoctorReportsParkedPromotionTarget(t *testing.T) {
+	dir := initWorkspace(t)
+	results := Run(context.Background(), Options{Workspace: dir, Engine: fakeEngine{imageExists: true, parkedTarget: true}})
+	r := find(results, "parked promotion target")
+	if r == nil || r.Status != WARN {
+		t.Fatalf("expected a parked-target warning: %#v", results)
+	}
+	if !strings.Contains(r.Message, "piccolo serve") {
+		t.Errorf("parked target message should name the repair: %s", r.Message)
 	}
 }

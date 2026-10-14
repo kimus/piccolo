@@ -16,8 +16,10 @@ func TestLayoutPathsAndBinds(t *testing.T) {
 		t.Fatalf("config = %s", l.Config())
 	}
 	want := []string{
-		filepath.Join("/ws", "runtime", "devbox") + ":" + ContainerDevbox + ":rw",
-		filepath.Join("/ws", "runtime", "nix") + ":" + ContainerNix + ":rw",
+		// Only the media mirror is bound. The toolchain and the Nix store are
+		// image content: mounting the workspace cache over /nix HID the store
+		// the image baked, which is how a gateway ended up unable to execute its
+		// own integration binaries.
 		filepath.Join("/ws", "runtime", "media") + ":" + ContainerMedia + ":rw",
 	}
 	if !reflect.DeepEqual(l.RuntimeBinds(), want) {

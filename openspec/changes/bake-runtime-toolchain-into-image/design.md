@@ -92,11 +92,13 @@ Ordering: entries are sorted by package, and the bundle list is already normalis
 
 ### Labels live on the image, not the container
 
-The Dockerfile emits them at build time (`LABEL` lines already exist there), so a container inherits them and they cannot drift from the image's actual content. Runtime-set labels could lie after a hand-started or renamed container, and promotion renames containers by design.
+The Dockerfile emits them at build time, so a container inherits them and they cannot drift from the image's actual content. Runtime-set labels could lie after a hand-started or renamed container, and promotion renames containers by design.
 
-Keys: `piccolo.base`, `piccolo.toolchain`, `piccolo.integration.<owner>/<repo>`. Value form `<version>+<short digest>`.
+Keys: `piccolo.base`, `piccolo.toolchain`, `piccolo.integration.<sanitized package>`. Value form `<version>+<short digest>`.
 
 Rejected: labels alone without the tag identity. Labels are queryable but not a cache key, and a container's labels can be set by whoever started it.
+
+**Found during implementation:** the identity is carried twice — as an explicit tag input and inside the Dockerfile text through the label block. Either one alone still invalidates the cache on a version change; only removing both reintroduces the collision. That is documented at the tag computation rather than treated as a redundancy to clean up.
 
 Note for the companion change: labels are metadata, not proof. The promotion gate must still **execute** the binaries.
 
@@ -108,7 +110,7 @@ Rejected: auto-rebuild on `restart`. It was the tempting option and is the wrong
 
 ## Risks / Trade-offs
 
-- **Bigger images.** The ~162 MB of Nix store currently living in `.data/runtime/nix` becomes image layers. Layers are shared by digest across tags, so it isn't paid per tag; the visible cost is per-image numbers and the first build.
+- **Bigger images — measured, not estimated.** The default toolchain bake costs **5.78 GB** in one layer (total image 440 MB → ~8.3 GB); in-layer `nix-collect-garbage` recovered only ~30 MB, because libreoffice/ffmpeg/imagemagick/tesseract genuinely have that closure. The earlier estimate (the 162 MB workspace cache) was wrong precisely because that cache was never complete — which is why the gateway could not execute its own binaries. Mitigations: the layer is reused across integration-only changes, layer digests are shared across tags, and `runtime.toolchain.packages` is the user's reduction knob.
 - **Toolchain changes re-download.** Accepted explicitly: no BuildKit cache mount, since `ImageBuildOptions` has no builder field and package-list changes are rare.
 - **Existing workspaces stop working until rebuilt** — including their integration tools. Acceptable under the WiP no-migration policy; the drift warning is the mitigation and the reason it must be good.
 - **Nothing can install into `/nix` at runtime any more.** If a future integration needs that, it's a design change, not a flag.
@@ -119,7 +121,9 @@ Rejected: auto-rebuild on `restart`. It was the tempting option and is the wrong
 
 Deliberately none. A workspace whose gateway lacks the toolchain is reported by the drift warning with the exact command to run; re-creating or rebuilding by hand is expected at this stage. No code reads old layouts or upgrades caches.
 
-## Open Questions
+## Open Questions (resolved by measurement)
 
-- Should `piccolo serve` print the drift warning on **every** start (loud, easy to ignore after a while) or only when `--quiet` is absent plus always in `doctor`?
-- Is `piccolo.toolchain` best as a digest of the package list, or should a build resolve actual package versions (costs a build-time query and a per-build metadata file)?
+- ~~Should the toolchain be rooted against later GC?~~ Yes: an in-layer `nix-collect-garbage -d` runs, so unrooted binaries would be collected. Direct gcroot symlinks are used because `nix-store --add-root <path> --indirect` fails with `no operation specified` — it requires `--realise`.
+- ~~Should a missing configured command warn?~~ No: it fails the build. An image must not advertise a tool it cannot run.
+- Still open: should `piccolo.toolchain` resolve actual package versions at build time (costs a build-time query) rather than digesting the package list?
+- Still open: is 5.78 GB acceptable as the default, or should the default package list split into a core set plus opt-in office/media tooling?

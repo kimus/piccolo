@@ -19,6 +19,7 @@ import (
 	"github.com/kimus/piccolo/internal/manifest"
 	"github.com/kimus/piccolo/internal/picoclaw"
 	"github.com/kimus/piccolo/internal/runtimeimage"
+	"github.com/kimus/piccolo/internal/runtimeplan"
 	"github.com/kimus/piccolo/internal/workspace"
 )
 
@@ -49,14 +50,18 @@ func newServeCmd() *cobra.Command {
 
 // serveContext holds everything the serve paths share after preflight.
 type serveContext struct {
-	runner    *docker.Runner
-	spec      docker.Spec
-	health    string // host-side health URL, e.g. http://127.0.0.1:18790/health
-	gwPort    int
-	webURL    string // non-empty in launcher/web mode
-	dir       string
-	stdout    io.Writer
-	toolchain manifest.Toolchain
+	runner       *docker.Runner
+	spec         docker.Spec
+	health       string // host-side health URL, e.g. http://127.0.0.1:18790/health
+	gwPort       int
+	webURL       string // non-empty in launcher/web mode
+	dir          string
+	layout       workspace.Layout
+	manifestPath string
+	stdout       io.Writer
+	manifest     *manifest.Manifest
+	toolchain    manifest.Toolchain
+	swap         *gatewaySwap
 }
 
 // preflight resolves the workspace, checks the daemon, and composes the
@@ -121,6 +126,9 @@ func preflight(cmd *cobra.Command) (*serveContext, error) {
 
 	volumes := []string{layout.IntegrationBind()}
 	if runtimeimage.IsLocalRuntimeImage(m.Container.Image) {
+		// Only the media mirror is bound. The toolchain and /nix are image
+		// content: binding the workspace Nix cache over /nix hid the store the
+		// image baked and made its own binaries unexecutable.
 		volumes = append(volumes, layout.RuntimeBinds()...)
 		volumes = append(volumes, agentMediaMirrorMounts(layout, cfg)...)
 	}
@@ -139,14 +147,17 @@ func preflight(cmd *cobra.Command) (*serveContext, error) {
 	webURL := webConsoleURL(m)
 
 	return &serveContext{
-		runner:    runner,
-		spec:      spec,
-		health:    fmt.Sprintf("http://127.0.0.1:%d/health", gwPort),
-		gwPort:    gwPort,
-		webURL:    webURL,
-		dir:       dir,
-		stdout:    out,
-		toolchain: effectiveToolchain(m),
+		runner:       runner,
+		spec:         spec,
+		health:       fmt.Sprintf("http://127.0.0.1:%d/health", gwPort),
+		gwPort:       gwPort,
+		webURL:       webURL,
+		dir:          dir,
+		layout:       layout,
+		manifestPath: layout.Manifest(),
+		stdout:       out,
+		manifest:     m,
+		toolchain:    effectiveToolchain(m),
 	}, nil
 }
 
@@ -215,18 +226,7 @@ func containerWorkspacePath(path string) (string, bool) {
 }
 
 func effectiveToolchain(m *manifest.Manifest) manifest.Toolchain {
-	tc := m.Runtime.Toolchain
-	if len(tc.Packages) == 0 {
-		tc.Packages = append([]string(nil), runtimeimage.DefaultPackages...)
-	} else {
-		tc.Packages = append([]string(nil), tc.Packages...)
-	}
-	if len(tc.Commands) == 0 {
-		tc.Commands = append([]string(nil), runtimeimage.DefaultCommands...)
-	} else {
-		tc.Commands = append([]string(nil), tc.Commands...)
-	}
-	return tc
+	return runtimeplan.Toolchain(m)
 }
 
 func hasContainerPort(ports []string, containerPort int) bool {
@@ -268,26 +268,58 @@ func runServeDetached(cmd *cobra.Command) error {
 		return err
 	}
 	ctx := cmd.Context()
+	sc.swap = newGatewaySwap(sc.runner, sc.stdout, sc.spec.Name)
+
+	// Repair a gateway left mid-promotion by an interrupted previous run before
+	// anything else touches the container set.
+	if err := sc.swap.recover(ctx); err != nil {
+		return err
+	}
+	// Drift is reported, never repaired here: a config edit must not silently
+	// cost minutes of image building.
+	warnImageDrift(ctx, sc.stdout, sc.runner, sc.manifest)
+
+	current, err := sc.runner.StateByName(ctx, sc.spec.Name)
+	if err != nil {
+		return err
+	}
+	promoting := current.Found && current.Image != sc.spec.Image
+	if promoting {
+		fmt.Fprintf(sc.stdout, "Promoting the gateway to %s (previous gateway parked as %s) ...\n", sc.spec.Image, sc.swap.previous)
+		if err := sc.swap.park(ctx); err != nil {
+			return err
+		}
+	}
 
 	fmt.Fprintf(sc.stdout, "Starting PicoClaw gateway container %q from workspace %s ...\n", sc.spec.Name, sc.dir)
 	if _, err := sc.runner.StartDetached(ctx, sc.spec); err != nil {
-		return err
+		return failGatewayStart(cmd, ctx, sc, gateFailure{Stage: "start", Reason: err.Error()})
 	}
 
 	if err := waitForHealthy(ctx, sc); err != nil {
-		// Dump recent logs to explain the failure, keep the container for
-		// inspection (piccolo logs / piccolo stop).
-		fmt.Fprintf(os.Stderr, "\nerror: %v\n\nRecent container logs:\n", err)
-		dumpLogs(ctx, sc, "30")
-		fmt.Fprintf(os.Stderr, "\nThe container %q was left in place for debugging.\n"+
-			"Inspect: piccolo logs    Retry after fix: piccolo stop && piccolo serve\n", sc.spec.Name)
-		cmd.SilenceErrors = true
-		return fmt.Errorf("gateway did not become healthy")
+		return failGatewayStart(cmd, ctx, sc, gateFailure{Stage: "health", Reason: err.Error()})
+	}
+	// Readiness is not only a health answer: the gateway must also be able to
+	// EXECUTE the integration binaries. Presence checks lie — `command -v
+	// piccolo-gws` succeeded in a container where running it reported "not
+	// found", because the store paths its interpreter lives in were hidden.
+	if details := verifyIntegrationsExecutable(ctx, sc); len(details) > 0 {
+		return failGatewayStart(cmd, ctx, sc, gateFailure{
+			Stage:   "integration",
+			Reason:  "an installed integration is not executable in this gateway",
+			Details: details,
+		})
+	}
+
+	if err := sc.swap.commit(ctx); err != nil {
+		fmt.Fprintf(sc.stdout, "  [WARN] %v\n", err)
+	}
+	if promoting {
+		sc.recordPreviousImage(current.Image)
 	}
 
 	fmt.Fprintf(sc.stdout, "\n\u2713 piccolo-gateway is running (%s)\n", sc.spec.Name)
 	fmt.Fprintf(sc.stdout, "  health: %s\n", sc.health)
-	ensureDevboxTools(ctx, sc)
 	if sc.webURL != "" {
 		fmt.Fprintf(sc.stdout, "  web console: %s\n", sc.webURL)
 		fmt.Fprintf(sc.stdout, "               first run: open %s/launcher-setup to create the dashboard password\n", sc.webURL)
@@ -350,84 +382,150 @@ func healthSummary(body []byte) string {
 	return ""
 }
 
-// devboxInstallTimeout bounds the one-shot tool setup. The first run downloads
-// the Nix toolchain plus packages (can be ~1GB), far beyond the agent's own exec
-// timeout, so serve does it once here. The Devbox global dir and /nix are
-// volumes, so later runs are near-instant no-ops.
-const devboxInstallTimeout = 30 * time.Minute
-
-// ensureDevboxTools installs the file-handling toolset and symlinks the tools
-// onto PATH after the gateway is healthy, by running the image's setup script.
-// Best-effort: failures warn but never fail serve.
-func ensureDevboxTools(ctx context.Context, sc *serveContext) {
-	if !runtimeimage.IsLocalRuntimeImage(sc.spec.Image) {
-		return
+// failGatewayStart reports a gateway that did not come up. When a promotion
+// parked a revert target, the previous gateway is restored — but only after the
+// failed attempt's diagnostics are printed, because the removed container is
+// otherwise the only record of why the promote failed.
+func failGatewayStart(cmd *cobra.Command, ctx context.Context, sc *serveContext, failure gateFailure) error {
+	cmd.SilenceErrors = true
+	if sc.swap != nil && sc.swap.parked() {
+		restored, err := sc.swap.revert(ctx, failure, func(ctx context.Context, tail string) string {
+			return captureLogs(ctx, sc, tail)
+		})
+		if err != nil {
+			// Both the new and the previous gateway are down. Saying that plainly
+			// is better than a "rolled back" line that is not true.
+			return err
+		}
+		fmt.Fprintf(sc.stdout, "\n\u2713 previous gateway restored (%s) — the promoted image was not adopted\n", restored)
+		fmt.Fprintf(sc.stdout, "  Inspect: piccolo logs    Rebuild the runtime image: piccolo image build --set\n")
+		return fmt.Errorf("gateway promotion failed")
 	}
-	installCtx, cancel := context.WithTimeout(ctx, devboxInstallTimeout)
-	defer cancel()
-	fmt.Fprintf(sc.stdout, "\nEnsuring Devbox file-handling tools are installed (first run may download packages)...\n")
-	cmd := []string{runtimeimage.SetupScriptPath, strings.Join(sc.toolchain.Packages, " "), strings.Join(sc.toolchain.Commands, " ")}
-	session, err := sc.runner.Exec(installCtx, sc.spec.Name, cmd, false)
+
+	// Nothing to revert to: keep the container for inspection, as before.
+	fmt.Fprintf(os.Stderr, "\nerror: %v\n\nRecent container logs:\n", failure)
+	dumpLogs(ctx, sc, "30")
+	fmt.Fprintf(os.Stderr, "\nThe container %q was left in place for debugging.\n"+
+		"Inspect: piccolo logs    Retry after fix: piccolo stop && piccolo serve\n", sc.spec.Name)
+	return fmt.Errorf("gateway did not become healthy")
+}
+
+// captureLogs returns the last lines of the gateway container as a string, for
+// embedding in a promotion failure report before the container is removed.
+func captureLogs(ctx context.Context, sc *serveContext, tail string) string {
+	rc, err := sc.runner.Logs(ctx, sc.spec.Name, false, tail)
 	if err != nil {
-		fmt.Fprintf(sc.stdout, "  [WARN] could not start tool setup: %v\n", err)
-		return
+		return fmt.Sprintf("(logs unavailable: %v)", err)
 	}
-	defer session.Close()
-	progress := newSetupProgressWriter(sc.stdout)
-	_ = docker.Demux(session.Reader, progress, progress)
-	progress.Flush()
-	code, err := session.Wait(installCtx)
+	defer rc.Close()
+	var buf strings.Builder
+	_, _ = io.Copy(&buf, rc)
+	return buf.String()
+}
+
+// execInGateway is the seam for running a command inside the gateway container.
+// Production uses the Docker exec API; unit tests substitute a stub so the
+// readiness gate is daemon-free.
+var execInGateway = func(ctx context.Context, runner *docker.Runner, name string, argv []string) (string, int, error) {
+	stdout, stderr, code, err := runtimeExecCapture(ctx, runner, name, argv)
 	if err != nil {
-		fmt.Fprintf(sc.stdout, "  [WARN] tool setup interrupted: %v\n", err)
-		return
+		return "", code, err
 	}
-	if code != 0 {
-		fmt.Fprintf(sc.stdout, "  [WARN] tool setup exited %d \u2014 some tools may be unavailable\n", code)
-		return
+	return stdout + stderr, code, nil
+}
+
+// verifyIntegrationsExecutable runs each installed integration's own status
+// command inside the gateway and reports the ones that cannot execute.
+//
+// Executing, not finding: a PATH lookup passed in a container where the binary
+// could not run, because its ELF interpreter lived in store paths hidden by the
+// /nix bind. An integration that runs and reports "not configured" is a PASS —
+// that is a setup gap, not a broken image. Only the inability to execute is a
+// promotion failure.
+func verifyIntegrationsExecutable(ctx context.Context, sc *serveContext) []string {
+	if sc.manifest == nil {
+		return nil
 	}
-	fmt.Fprintf(sc.stdout, "  \u2713 devbox tools ready\n")
-}
-
-type setupProgressWriter struct {
-	out     io.Writer
-	buf     strings.Builder
-	lastLog time.Time
-}
-
-func newSetupProgressWriter(out io.Writer) *setupProgressWriter {
-	return &setupProgressWriter{out: out, lastLog: time.Now().Add(-10 * time.Second)}
-}
-
-func (w *setupProgressWriter) Write(p []byte) (int, error) {
-	for _, r := range string(p) {
-		if r == '\r' || r == '\n' {
-			w.emit(false)
+	var failures []string
+	for _, item := range sc.manifest.Runtime.Integrations {
+		argv := integrationProbeArgv(item)
+		if len(argv) == 0 {
 			continue
 		}
-		w.buf.WriteRune(r)
+		out, code, err := execInGateway(ctx, sc.runner, sc.spec.Name, argv)
+		if err != nil {
+			failures = append(failures, fmt.Sprintf("%s: %v", displayIntegration(item), err))
+			continue
+		}
+		if !probeExecuted(out, code) {
+			failures = append(failures, fmt.Sprintf("%s: exit %d — %s (command: %s)", displayIntegration(item), code, firstLine(out), strings.Join(argv, " ")))
+		}
 	}
-	return len(p), nil
+	return failures
 }
 
-func (w *setupProgressWriter) Flush() { w.emit(true) }
+// integrationProbeArgv prefers the integration's recorded status command; a
+// source-built entry without one still names its binary, so `describe --json`
+// is the fallback probe.
+func integrationProbeArgv(item manifest.Integration) []string {
+	if len(item.StatusCommand) > 0 {
+		return append([]string(nil), item.StatusCommand...)
+	}
+	if len(item.DescriptorCommand) > 0 {
+		return append([]string(nil), item.DescriptorCommand...)
+	}
+	if len(item.Commands) > 0 {
+		return []string{item.Commands[0], "describe", "--json"}
+	}
+	return nil
+}
 
-func (w *setupProgressWriter) emit(force bool) {
-	line := strings.TrimSpace(w.buf.String())
-	w.buf.Reset()
-	if line == "" {
-		return
+// probeExecuted classifies a probe. 126/127 are the shell's "not found" and
+// "not executable" codes; docker reports a missing binary as an exec error,
+// which the caller already handled. Anything else means the program ran.
+// probeExecuted classifies a probe. It answers one question — did the program
+// start? — and deliberately does NOT treat a non-zero exit as failure: an
+// integration that runs and reports "no credentials" has a setup gap, not a
+// broken image, and reverting a promotion over that would be wrong.
+func probeExecuted(out string, code int) bool {
+	// 126/127 are the shell's "not executable" and "not found". A binary that is
+	// missing entirely surfaces as an exec error from the daemon, which the
+	// caller already handled.
+	if code == 126 || code == 127 {
+		return false
 	}
-	lower := strings.ToLower(line)
-	interesting := strings.Contains(lower, "install") || strings.Contains(lower, "building") || strings.Contains(lower, "copying") || strings.Contains(lower, "downloading") || strings.Contains(lower, "finished") || strings.Contains(lower, "error") || strings.Contains(lower, "warning")
-	if !force && !interesting && time.Since(w.lastLog) < 5*time.Second {
-		return
-	}
+	// Silence plus a failure means nothing ran: a working integration binary
+	// prints its status payload either way.
+	return strings.TrimSpace(out) != "" || code == 0
+}
+
+func firstLine(s string) string {
+	line := strings.TrimSpace(strings.SplitN(strings.TrimSpace(s), "\n", 2)[0])
 	if len(line) > 160 {
-		line = line[:157] + "..."
+		return line[:157] + "..."
 	}
-	fmt.Fprintf(w.out, "  setup: %s\n", line)
-	w.lastLog = time.Now()
+	return line
 }
+
+// recordPreviousImage keeps the single rollback slot after a completed
+// promotion. piccolo.yaml is Piccolo-owned, so this is a state write, not an
+// edit of user-owned runtime config.
+func (sc *serveContext) recordPreviousImage(image string) {
+	if image == "" || image == sc.spec.Image {
+		return
+	}
+	if sc.manifest.Container.PreviousImage == image {
+		return
+	}
+	sc.manifest.Container.PreviousImage = image
+	if err := sc.manifest.Write(sc.manifestPath); err != nil {
+		fmt.Fprintf(sc.stdout, "  [WARN] could not record the previous image for rollback: %v\n", err)
+		return
+	}
+	fmt.Fprintf(sc.stdout, "  previous image recorded for rollback: %s\n", image)
+}
+
+type setupProgressWriter struct{}
 
 // dumpLogs prints the last N log lines of the container to stderr.
 func dumpLogs(ctx context.Context, sc *serveContext, tail string) {
@@ -440,16 +538,44 @@ func dumpLogs(ctx context.Context, sc *serveContext, tail string) {
 	_ = docker.Demux(rc, os.Stdout, os.Stderr)
 }
 
+// runServeForeground attaches the gateway's stdio to the terminal (Ctrl-C stops
+// it). It promotes with the same park / gate / revert sequence as the detached
+// path — the gate runs while the container is attached, so a replacement that
+// cannot execute its integrations still hands the workspace back to the
+// previous gateway instead of ending with nothing running.
 func runServeForeground(cmd *cobra.Command) error {
 	sc, err := preflight(cmd)
 	if err != nil {
 		return err
 	}
 	ctx := cmd.Context()
+	sc.swap = newGatewaySwap(sc.runner, sc.stdout, sc.spec.Name)
+	if err := sc.swap.recover(ctx); err != nil {
+		return err
+	}
+	warnImageDrift(ctx, sc.stdout, sc.runner, sc.manifest)
+
+	current, err := sc.runner.StateByName(ctx, sc.spec.Name)
+	if err != nil {
+		return err
+	}
+	promoting := current.Found && current.Image != sc.spec.Image
+	if promoting {
+		fmt.Fprintf(sc.stdout, "Promoting the gateway to %s (previous gateway parked as %s) ...\n", sc.spec.Image, sc.swap.previous)
+		if err := sc.swap.park(ctx); err != nil {
+			return err
+		}
+	}
 
 	fmt.Fprintf(sc.stdout, "Starting PicoClaw gateway container %q from workspace %s ...\n", sc.spec.Name, sc.dir)
 	proc, err := sc.runner.Run(ctx, sc.spec)
 	if err != nil {
+		if promoting {
+			if _, rerr := sc.swap.revert(ctx, gateFailure{Stage: "start", Reason: err.Error()}, func(context.Context, string) string { return "" }); rerr != nil {
+				return rerr
+			}
+			fmt.Fprintf(sc.stdout, "\n\u2713 previous gateway restored (%s) — the promoted image was not adopted\n", current.Image)
+		}
 		return err
 	}
 
@@ -477,11 +603,56 @@ func runServeForeground(cmd *cobra.Command) error {
 		}
 	}()
 
+	// Readiness gate, running while stdio is attached.
+	gated := make(chan gateFailure, 1)
+	go func() {
+		if err := waitForHealthy(ctx, sc); err != nil {
+			gated <- gateFailure{Stage: "health", Reason: err.Error()}
+			return
+		}
+		if details := verifyIntegrationsExecutable(ctx, sc); len(details) > 0 {
+			gated <- gateFailure{Stage: "integration", Reason: "an installed integration is not executable in this gateway", Details: details}
+			return
+		}
+		gated <- gateFailure{Stage: "ok"}
+	}()
+
 	select {
 	case <-exited:
 	case <-sigCtx.Done():
 		fmt.Fprintln(sc.stdout, "\nStopping gateway container ...")
 		cancelWait()
+	case failure := <-gated:
+		if failure.Stage == "ok" {
+			if err := sc.swap.commit(ctx); err != nil {
+				fmt.Fprintf(sc.stdout, "  [WARN] %v\n", err)
+			}
+			if promoting {
+				sc.recordPreviousImage(current.Image)
+			}
+			fmt.Fprintf(sc.stdout, "\n\u2713 piccolo-gateway is running (%s)\n", sc.spec.Name)
+			// Keep the container running: the user is attached, so wait for the
+			// exit or a signal like before.
+			select {
+			case <-exited:
+			case <-sigCtx.Done():
+				fmt.Fprintln(sc.stdout, "\nStopping gateway container ...")
+				cancelWait()
+			}
+			break
+		}
+		fmt.Fprintf(sc.stdout, "\nPromotion gate failed while attached; stopping the candidate ...\n")
+		_ = proc.Shutdown(stopGrace)
+		restored, rerr := sc.swap.revert(ctx, failure, func(ctx context.Context, tail string) string {
+			return captureLogs(ctx, sc, tail)
+		})
+		if rerr != nil {
+			return rerr
+		}
+		fmt.Fprintf(sc.stdout, "\n\u2713 previous gateway restored (%s) — the promoted image was not adopted\n", restored)
+		<-pumpDone
+		cmd.SilenceErrors = true
+		return fmt.Errorf("gateway promotion failed")
 	}
 
 	if err := proc.Shutdown(stopGrace); err != nil {

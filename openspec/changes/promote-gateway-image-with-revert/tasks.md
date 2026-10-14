@@ -1,51 +1,59 @@
 ## 1. Promotion sequence
 
-- [ ] 1.1 Split stop-into-revert-target from destroy: stop the gateway, then rename it to the reserved previous name
-- [ ] 1.2 Start the target image under the canonical name, labelled as a candidate
-- [ ] 1.3 On success: remove the reserved container, clear the candidate label, record the replaced image as the rollback target
-- [ ] 1.4 Ensure the existing stale-name removal cannot delete the reserved container
-- [ ] 1.5 Reuse one promote entry point for `serve`, `restart` and rollback so there is a single sequencing path
-- [ ] 1.6 Confirm `restart --foreground` keeps its Ctrl-C shutdown semantics while using the same sequence
+- [x] 1.1 Stop-into-revert-target split from destroy: `StopKeptByName` stops without removing, then the container is renamed to the reserved name
+- [x] 1.2 **Deviation from the written design, deliberate:** the plan said park the old container as `<name>.prev` and run the candidate under a temporary name, renaming the winner at the end. Implemented the equivalent with the roles swapped: the candidate takes the canonical name immediately and the old container is parked as `<name>.prev`. Reason: `Start` removes any container holding the configured name, and a stopped container keeps holding its name — so the canonical name is only safe for the thing that should be running, and crash detection then has exactly one abnormal state ("nothing on the canonical name, `.prev` exists") instead of two candidate names to reason about
+- [x] 1.3 Success removes the reserved container and records the replaced image
+- [x] 1.4 Stale-name removal cannot touch the reserved container (different name)
+- [x] 1.5 One sequencing path: `serve`, `restart` (delegates to serve) and `integration rollback` all run it
+- [x] 1.6 `restart --foreground` keeps Ctrl-C shutdown/exit-code semantics while using the same park/gate/commit-or-revert around the attached run
+- [x] 1.7 **Deviation:** the candidate is NOT labelled `piccolo.role=candidate`. This Docker SDK sets labels only at create time and `ContainerUpdateOptions` has no `Label` field, so the label could never be cleared when the candidate won — a healthy long-running gateway would advertise itself as a candidate forever. Roles travel by name instead
 
 ## 2. Readiness gate
 
-- [ ] 2.1 Keep the existing `/health` gate
-- [ ] 2.2 Add a per-integration executed probe over `docker exec`, deriving the binary and command from the descriptor already collected at add time
-- [ ] 2.3 Require an executable result, not a PATH lookup, and report the command plus its output on failure
-- [ ] 2.4 Skip the probe set entirely when the workspace has no integrations
-- [ ] 2.5 Test: health passes but the integration binary cannot execute — promotion fails and reverts
+- [x] 2.1 `/health` gate kept
+- [x] 2.2 Per-integration executed probe over `docker exec`, argv from the recorded status command (fallback: descriptor command, then `<binary> describe --json`; skipped when nothing is recorded)
+- [x] 2.3 Requires that the binary **ran**: exec error, exit 126/127, or silence-with-failure fail the gate; a non-zero exit that produced a payload passes (unconfigured is a setup gap, not a broken image). Failure report names the binary, the probe command and its output
+- [x] 2.4 Skipped entirely when the workspace has no integrations
+- [x] 2.5 Test: health passes, integration cannot execute → gate fails. Verified **live** with an image whose integration binaries were removed: `exit 127 — OCI runtime exec failed: exec: "piccolo-gws": executable file not found in $PATH`
 
 ## 3. Revert path
 
-- [ ] 3.1 Capture gate results, health response and recent container logs before removing the candidate
-- [ ] 3.2 Stop and remove the candidate, restore the reserved container's name, start it
-- [ ] 3.3 Report non-zero with both the failure reason and the restored image
-- [ ] 3.4 Handle revert failure explicitly: state that neither gateway is running and name the next command
-- [ ] 3.5 Never report a successful rollback that did not restore service
-- [ ] 3.6 Test each branch against the runner seam without a daemon
+- [x] 3.1 Gate results, probe command/output and the candidate's last 30 log lines printed before the candidate is removed
+- [x] 3.2 Candidate stopped/removed, reserved container renamed back and started
+- [x] 3.3 Non-zero exit with the failing stage named and the promoted image explicitly NOT adopted
+- [x] 3.4 Revert failure reported separately: "promotion failed AND the previous gateway could not be restored"
+- [x] 3.5 No success-shaped rollback message on a failed restore (the restore path only prints after `StartByName` succeeds)
+- [x] 3.6 Tests cover each branch against the `promoter` seam, daemon-free
+- [x] 3.7 Live: a failed promotion restored the previous gateway and left no `.prev` behind
 
 ## 4. Interrupted-promotion recovery
 
-- [ ] 4.1 Detect the reserved container with nothing on the canonical name, restore and start it, report the interruption
-- [ ] 4.2 Detect a stray reserved container alongside a healthy gateway, report it, leave service untouched
-- [ ] 4.3 Clean the reserved container after a successful promote so exactly zero or one can exist
-- [ ] 4.4 Surface the same conditions in `doctor` and `status`
+- [x] 4.1 Reserved container + nothing canonical → renamed back, started, reported as an interrupted promotion (verified live against a hand-created stray)
+- [x] 4.2 Reserved container + healthy canonical → reported, service untouched, replaced by the next park
+- [x] 4.3 Exactly zero or one reserved container can exist (park removes a leftover before renaming into the name)
+- [x] 4.4 Surfaced in `doctor` (WARN with the repair command) and `status` (parked line)
 
 ## 5. Rollback command
 
-- [ ] 5.1 Record the previously running image in the manifest on successful promote
-- [ ] 5.2 Add `piccolo integration rollback` resolving that image and verifying it exists before stopping anything
-- [ ] 5.3 Route rollback through the same gated promotion, so it inherits revert-on-failure
-- [ ] 5.4 Describe the target using image labels: base plus installed integration versions
-- [ ] 5.5 Refuse with a clear message when there is no recorded target or the image is gone
-- [ ] 5.6 Test: success, missing image, and no-history cases
+- [x] 5.1 `container.previous_image` recorded on a successful promotion
+- [x] 5.2 `piccolo integration rollback` verifies the target exists locally before stopping anything; `--dry-run` and `--to <image>` supported
+- [x] 5.3 Rolls through the same gated promotion, so it inherits the revert path; if the gate rejects it, `piccolo.yaml` is written back to the image that survived
+- [x] 5.4 Target described from image labels (base, toolchain, integration versions)
+- [x] 5.5 Refuses with a clear message when there is no recorded target, when the image is gone, and when the "rollback" would land on the image already running
+- [x] 5.6 Tests: target resolution (default/explicit/empty/already-running) and label description determinism; live run rolled a workspace from a good image back to the previous one and reported the recorded target
+- [x] 5.7 Documented that rollback restores **service**, not configuration: the integration records still describe the newer version, so the content warning keeps reporting the difference until the choice is made durable
 
 ## 6. Constraints and verification
 
-- [ ] 6.1 Enforce that promotion never builds an image implicitly; missing target stops before touching the gateway
-- [ ] 6.2 Keep published ports unchanged across the candidate rename
-- [ ] 6.3 Confirm no window where two gateways run simultaneously
-- [ ] 6.4 Unit-test the sequencing through the runner seam; keep it daemon-free
-- [ ] 6.5 Run `go build ./...`, `go vet ./...`, `go test ./...`
-- [ ] 6.6 Live sequence check: promote good → promote broken image → automatic revert with diagnostics → rollback to the previous image
-- [ ] 6.7 Document `restart`, rollback and the interrupted-promotion states in README
+- [x] 6.1 Promotion never builds implicitly: a missing target stops before touching the gateway and names `piccolo image build`
+- [x] 6.2 Published ports unchanged across the candidate handover (verified: rename kept bindings; the parked container was stopped, so its port was free for the candidate)
+- [x] 6.3 No window with two running gateways — and no window with two writers to `/root/.picoclaw` either, since the previous gateway is stopped before the candidate starts
+- [x] 6.4 Sequencing unit-tested through the runner seam, daemon-free
+- [x] 6.5 `go build ./...`, `go vet ./...`, `go test ./...` green
+- [x] 6.6 Live sequence check: promote healthy → promote broken → automatic revert with diagnostics → rollback to the previous image → stray-`.prev` recovery
+- [x] 6.7 README documents `restart`, the gate, rollback and the interrupted-promotion states
+
+## Notes found during implementation
+
+- Two containers mounting the same `picoclaw/` directory collide on PicoClaw's singleton pid file: the launcher's gateway child exits with `singleton check failed: gateway is already running (PID: 17)`. That is what makes "stop before starting the candidate" mandatory rather than cosmetic — and it produced one false failure during testing when a debug container shared the mount.
+- `piccolo restart` no longer stops-and-removes first: doing that discarded the only revert target a failed promotion could use.

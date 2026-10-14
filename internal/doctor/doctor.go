@@ -20,6 +20,7 @@ import (
 	"github.com/kimus/piccolo/internal/manifest"
 	"github.com/kimus/piccolo/internal/picoclaw"
 	"github.com/kimus/piccolo/internal/runtimeimage"
+	"github.com/kimus/piccolo/internal/runtimeplan"
 	"github.com/kimus/piccolo/internal/workspace"
 )
 
@@ -27,6 +28,7 @@ import (
 type Engine interface {
 	Ping(ctx context.Context) error
 	ImageExists(ctx context.Context, image string) (bool, error)
+	ImageLabels(ctx context.Context, image string) (map[string]string, bool, error)
 	ContainerExists(ctx context.Context, name string) (bool, error)
 	ListByPrefix(ctx context.Context, prefix string) ([]string, error)
 }
@@ -120,8 +122,6 @@ func Run(ctx context.Context, opts Options) []Result {
 		missing := []string{}
 		for _, dir := range []struct{ label, path string }{
 			{"integrations/", layout.Integrations()},
-			{"runtime/devbox/", layout.RuntimeDevbox()},
-			{"runtime/nix/", layout.RuntimeNix()},
 			{"runtime/media/", layout.RuntimeMedia()},
 		} {
 			if st, err := os.Stat(dir.path); err != nil || !st.IsDir() {
@@ -136,8 +136,10 @@ func Run(ctx context.Context, opts Options) []Result {
 	}
 
 	// 3. Image presence (warning only).
+	imagePresent := true
 	if opts.Engine != nil {
 		present, err := opts.Engine.ImageExists(ctx, m.Container.Image)
+		imagePresent = present && err == nil
 		switch {
 		case err != nil:
 			add(WARN, "image check failed for %s: %v", m.Container.Image, err)
@@ -152,13 +154,28 @@ func Run(ctx context.Context, opts Options) []Result {
 		}
 	}
 
-	// 3b. Web console consistency: a published :18800 binding only makes sense
+	// 3b. Runtime image currency. The image in use must contain the toolchain and
+	// the integration versions the workspace describes. Doctor reports the drift
+	// and names the rebuild; it never starts one, because a stale image is not an
+	// error — adopting a rebuild is a user decision.
+	results = append(results, checkImageDrift(ctx, opts.Engine, m, imagePresent)...)
+
+	// 3c. An interrupted promotion leaves the previous gateway parked under the
+	// reserved name. The canonical name always belongs to what should be running,
+	// so this is the one abnormal state to look for.
+	if opts.Engine != nil {
+		if parked, err := opts.Engine.ContainerExists(ctx, docker.PreviousName(m.Container.Name)); err == nil && parked {
+			add(WARN, "parked promotion target %q exists — a previous restart was interrupted; 'piccolo serve' restores it", docker.PreviousName(m.Container.Name))
+		}
+	}
+
+	// 3d. Web console consistency: a published :18800 binding only makes sense
 	// with the launcher image (which serves the dashboard). A plain gateway
 	// image would publish a dead port with nothing listening behind it.
 	results = append(results, checkWebConsole(m)...)
 
-	// 3c. Runtime toolchain configuration (live command availability is reported
-	// by `piccolo runtime status/apply`; doctor remains daemon-free here).
+	// 3e. Runtime toolchain configuration (live command availability is reported
+	// by `piccolo runtime status`; doctor stays daemon-free here).
 	results = append(results, checkRuntimeToolchain(m)...)
 	results = append(results, checkIntegrations(m)...)
 
@@ -222,6 +239,41 @@ func Run(ctx context.Context, opts Options) []Result {
 	results = append(results, checkChannels(data)...)
 
 	return results
+}
+
+// checkImageDrift compares the image in use with the image the workspace
+// describes and names the reason. It is a warning, never a failure, and it never
+// builds: adopting a rebuild is the user's decision, and a doctor run must not
+// spend minutes building on someone's behalf.
+// checkImageDrift compares the image in use with the image the workspace
+// describes. imagePresent comes from the presence check: when the image is
+// simply not here, that check already said so, and repeating it as a content
+// complaint would be two warnings for one problem.
+func checkImageDrift(ctx context.Context, engine Engine, m *manifest.Manifest, imagePresent bool) []Result {
+	if engine == nil || !isPiccoloLocalRuntimeImage(m.Container.Image) || !imagePresent {
+		return nil
+	}
+	info, err := runtimeplan.Check(ctx, engine, m)
+	if err != nil {
+		return []Result{{Status: WARN, Message: fmt.Sprintf("runtime image currency: could not verify (%v)", err)}}
+	}
+	if !info.Verifiable {
+		return nil
+	}
+	switch info.Kind {
+	case runtimeplan.DriftNone:
+		return []Result{{Status: OK, Message: fmt.Sprintf("runtime image matches this workspace: %s", info.Current)}}
+	case runtimeplan.DriftTemplate:
+		// Content is right; the tag is only cosmetically behind. Reporting this as
+		// a problem would push the user toward a rebuild that changes nothing.
+		return []Result{{Status: OK, Message: fmt.Sprintf("runtime image content matches this workspace (%s); the tag predates a Piccolo recipe change (%s)", info.Current, info.Desired)}}
+	}
+	return []Result{{
+		Status: WARN,
+		Message: fmt.Sprintf(
+			"runtime image is stale: %s, wants %s (%s) — rebuild with 'piccolo image build --set && piccolo restart'; Piccolo never rebuilds implicitly",
+			info.Current, info.Desired, strings.Join(info.Reasons, "; ")),
+	}}
 }
 
 func checkRuntimeToolchain(m *manifest.Manifest) []Result {

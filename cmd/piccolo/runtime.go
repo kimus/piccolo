@@ -42,7 +42,7 @@ func newRuntimeStatusCmd() *cobra.Command {
 func newRuntimeApplyCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "apply",
-		Short: "Apply the configured runtime toolchain to the running gateway container",
+		Short: "Report whether the running gateway already has the configured toolchain",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runRuntimeApply(cmd)
 		},
@@ -119,6 +119,11 @@ func runRuntimeStatus(cmd *cobra.Command) error {
 	return nil
 }
 
+// runRuntimeApply no longer installs anything. The toolchain is baked into the
+// runtime image, so a package-list change is an IMAGE change: installing into a
+// running container would create a second source of truth for one Nix store and
+// leave the next start with nothing. Piccolo compares and points at the rebuild
+// instead of performing it — a config edit must not silently cost a build.
 func runRuntimeApply(cmd *cobra.Command) error {
 	out := cmd.OutOrStdout()
 	_, m, tc, err := runtimeManifest()
@@ -127,30 +132,28 @@ func runRuntimeApply(cmd *cobra.Command) error {
 	}
 	r := docker.New()
 	ctx := cmd.Context()
-	st, err := r.StateByName(ctx, m.Container.Name)
+
+	labels, found, err := r.ImageLabels(ctx, m.Container.Image)
 	if err != nil {
 		return err
 	}
-	if !st.Found || !st.Running {
-		return fmt.Errorf("container %q is not running — run 'piccolo serve' or 'piccolo restart' first", m.Container.Name)
+	if !found {
+		return fmt.Errorf("runtime image %s is not present locally — rebuild it: piccolo image build --set", m.Container.Image)
 	}
-	applyCtx, cancel := context.WithTimeout(ctx, devboxInstallTimeout)
-	defer cancel()
-	fmt.Fprintf(out, "Applying runtime toolchain to %s ...\n", m.Container.Name)
-	stdout, stderr, code, err := runtimeExecCapture(applyCtx, r, m.Container.Name, []string{runtimeimage.SetupScriptPath, strings.Join(tc.Packages, " "), strings.Join(tc.Commands, " ")})
-	if stdout != "" {
-		fmt.Fprint(out, stdout)
+	want := map[string]string{}
+	if plan, perr := desiredRuntimePlan(m); perr == nil {
+		want = plan.Labels()
 	}
-	if stderr != "" {
-		fmt.Fprint(out, stderr)
+	if got := labels[runtimeimage.LabelToolchain]; got != want[runtimeimage.LabelToolchain] {
+		fmt.Fprintf(out, "Runtime toolchain is NOT in the running image\n")
+		fmt.Fprintf(out, "  image:     %s (%s=%s)\n", m.Container.Image, runtimeimage.LabelToolchain, valueOrDash(got))
+		fmt.Fprintf(out, "  wanted:    %s\n", want[runtimeimage.LabelToolchain])
+		fmt.Fprintf(out, "  packages:  %s\n", strings.Join(tc.Packages, ", "))
+		fmt.Fprintf(out, "  commands:  %s\n", strings.Join(tc.Commands, ", "))
+		fmt.Fprintf(out, "\nToolchain changes are image changes. Rebuild when you choose:\n  piccolo image build --set && piccolo restart\n")
+		return fmt.Errorf("runtime toolchain does not match the running image")
 	}
-	if err != nil {
-		return err
-	}
-	if code != 0 {
-		return fmt.Errorf("runtime toolchain apply exited %d", code)
-	}
-	fmt.Fprintln(out, "✓ runtime tools ready")
+	fmt.Fprintf(out, "\u2713 running image %s matches the configured toolchain (%s)\n", m.Container.Image, want[runtimeimage.LabelToolchain])
 	return nil
 }
 
@@ -210,7 +213,7 @@ func runRuntimeResetCache(cmd *cobra.Command, f runtimeFlags) error {
 		}
 		fmt.Fprintf(out, "  reset %s\n", path)
 	}
-	fmt.Fprintln(out, "Runtime cache reset. Next 'piccolo serve' or 'piccolo restart' will reinstall the configured toolchain.")
+	fmt.Fprintln(out, "Runtime caches reset. The toolchain lives in the image now, so nothing needs reinstalling; the Devbox/Nix directories are leftovers from earlier layouts and Piccolo never deletes them on its own.")
 	return nil
 }
 

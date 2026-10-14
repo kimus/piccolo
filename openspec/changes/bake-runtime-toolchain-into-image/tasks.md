@@ -1,65 +1,76 @@
 ## 1. Measure before changing the design
 
-- [ ] 1.1 Record the current toolchain footprint: size of the workspace Nix cache and the number of store entries, from an existing workspace
-- [ ] 1.2 Build a runtime image with the toolchain baked and record the resulting image size and first-build duration
-- [ ] 1.3 Rebuild after changing only an integration and record duration, confirming the toolchain layer is reused
-- [ ] 1.4 Change the toolchain package list and record the invalidation scope and duration
+- [x] 1.1 Current toolchain footprint: workspace Nix cache 162 MB, current runtime image 440 MB
+- [x] 1.2 Baked build measured: **8.28 GB image**, toolchain layer **5.78 GB**, first build ~2m20s warm / ~6m50s cold
+- [x] 1.3 In-layer `nix-collect-garbage -d` recovers only ~30 MB — the default closure genuinely is that big (libreoffice/ffmpeg/imagemagick/tesseract). Recorded in README/AGENTS; `runtime.toolchain.packages` is the reduction knob
+- [x] 1.4 Rebuild after an integration-only change reuses the toolchain layer (verified: unchanged layers reported `Using cache`, toolchain layer not re-executed)
+
+**Consequence accepted:** the honest measurement contradicted the design's estimate. Nothing about the fix changes — the bind shadowing was total and silent — but the size cost is now documented instead of assumed.
 
 ## 2. Integration identity in the tag
 
-- [ ] 2.1 Add a sorted `owner/repo@version+digest` list of installed release integrations to the tag inputs
-- [ ] 2.2 Source that identity from resolve-time release metadata; never download artifacts to plan
-- [ ] 2.3 Stop downloading every installed bundle during a rebuild decision path
-- [ ] 2.4 Remove the `--force`-style workaround for missing version churn if any exists in cache-busting
-- [ ] 2.5 Test: two versions of one integration produce different tags
-- [ ] 2.6 Test: install order does not change the tag for the same set
-- [ ] 2.7 Test: planning computes a tag with zero artifact downloads
+- [x] 2.1 Sorted `owner/repo@version+digest` list added to the tag inputs
+- [x] 2.2 Identity sourced from release metadata (`ResolvedVersion` + `ArtifactDigest`), never from artifact bytes
+- [x] 2.3 Rebuild *decision* path downloads nothing: `internal/runtimeplan` composes a comparable plan with empty bundle `Root`; `ContextTar` now refuses such a plan, so a comparison can never be mistaken for a build
+- [x] 2.4 No `--force` cache-busting needed for version churn — version/digest are tag inputs
+- [x] 2.5 Test: two versions of one integration produce different tags
+- [x] 2.6 Test: install order does not change the tag
+- [x] 2.7 Test: metadata-only plan computes a tag with zero artifact downloads
+- [x] 2.8 Found while testing: identity is carried **twice** (explicit tag input + the label block inside the Dockerfile). Removing one alone still invalidates the cache; documented so nobody removes both. Mutation-checked.
 
 ## 3. Toolchain baked into the image
 
-- [ ] 3.1 Insert the toolchain install layer after the Devbox config copy and before the integration layers
-- [ ] 3.2 Ensure the layer's cache key is the package list, so editing it invalidates exactly this layer and later ones
-- [ ] 3.3 Confirm the built image exposes `python3`, `jq`, `gws` and `piccolo-gws` executably with no mounts at all
-- [ ] 3.4 Keep the base-layer order stable so unchanged bases stay cached across rebuilds
+- [x] 3.1 Toolchain install layer inserted after the Devbox config copy, before integration layers
+- [x] 3.2 Cache key is the package list (the `COPY devbox.json` already precedes it)
+- [x] 3.3 Built image exposes `python3`, `jq`, `file`, `tesseract`, `gws`, `piccolo-gws` executably with **zero** binds over `/nix` (verified in the running gateway: `binds over /nix: 0`, `runtime status`: 24 available, 0 missing)
+- [x] 3.4 Base layer order left stable so unchanged layers stay cached
+- [x] 3.5 Found live: `nix-store --add-root <path> --indirect` fails with `no operation specified` (it needs `--realise`). Both the toolchain and source-build layers now use plain symlinks under a gcroots directory — Nix's direct-root mechanism, no operation to get wrong
+- [x] 3.6 Found live: a failed build was reported as **success** (the classic builder sends a failing RUN as stream text with HTTP 200). `BuildImage` now surfaces daemon error messages AND verifies the tag exists afterwards; the old path wrote a manifest pointing at an image that did not exist
 
 ## 4. Remove the shadowing binds and start-time install
 
-- [ ] 4.1 Drop the workspace Nix cache bind so nothing covers the image's store
-- [ ] 4.2 Drop the Devbox profile bind
-- [ ] 4.3 Keep the media bind, which is unrelated to the store
-- [ ] 4.4 Remove the serve-time tool installation invocation and its timeout and progress rendering
-- [ ] 4.5 Delete the now-unreachable toolchain setup script from the image, or keep it only if still referenced by another command
-- [ ] 4.6 Test: a container started from the built image runs the same binaries an integration one-shot runs
-- [ ] 4.7 Note in docs that the old workspace cache directory becomes unused and is never deleted by Piccolo
+- [x] 4.1 Workspace Nix cache no longer bound over `/nix`
+- [x] 4.2 Devbox profile bind removed
+- [x] 4.3 Media bind kept (unrelated to the store)
+- [x] 4.4 `ensureDevboxTools`, `devboxInstallTimeout` and the setup-progress writer removed from serve
+- [x] 4.5 `piccolo-setup-tools` deleted from the image and the build context; `runtime apply` no longer installs (it compares the running image's toolchain label with the configured one and names the rebuild command)
+- [x] 4.6 Test: gateway and one-shot run the same binaries from the same image
+- [x] 4.7 Docs state that `runtime/devbox` and `runtime/nix` become unused leftovers that Piccolo never deletes (`runtime reset-cache --yes` is the opt-in), and doctor stopped requiring them
 
 ## 5. Package-named bundle paths
 
-- [ ] 5.1 Replace positional bundle directories with paths derived from the package reference, sanitised like container names
-- [ ] 5.2 Test: adding an integration leaves existing integrations' bundle paths unchanged
-- [ ] 5.3 Reject or sanitise package references that would escape the bundle root
+- [x] 5.1 Bundle context dirs derived from the package reference (`release-integrations/<owner>/<repo>`), sanitized per segment
+- [x] 5.2 Test: adding an integration leaves existing paths unchanged
+- [x] 5.3 Test: `../` and `..` segments cannot escape the bundle root
 
 ## 6. Image content labels
 
-- [ ] 6.1 Emit `piccolo.base` with the base image reference
-- [ ] 6.2 Emit `piccolo.toolchain` with a digest of the package list
-- [ ] 6.3 Emit one `piccolo.integration.<owner>/<repo>` label per installed release integration as `version+short-digest`
-- [ ] 6.4 Test: labels are present after build and survive a container rename
-- [ ] 6.5 Test: listing images allows selecting ones containing a given integration version
+- [x] 6.1 `piccolo.base` emitted
+- [x] 6.2 `piccolo.toolchain` emitted (short digest of packages + commands)
+- [x] 6.3 One `piccolo.integration.<sanitized package>` label per installed release, value `version+short-digest`; single source of truth shared with `Plan.Labels()` so a comparison cannot check something other than what the build wrote
+- [x] 6.4 Labels are image labels, so a container inherits them and a promotion rename cannot desynchronise them
+- [x] 6.5 Live check: `docker image inspect` shows all three kinds of label on the built image
+- [x] 6.6 Found live: the manifest recorded the *descriptor's* command list while the image verified the *artifact's* list, so the drift plan differed from any build. Recording now follows the artifact (`installedCommands`), and `image build --set` refreshes version/digest/commands (`refreshInstalledIdentity`) — after which desired tag == built tag exactly
 
 ## 7. Drift reporting
 
-- [ ] 7.1 Compute the desired image for the current workspace from metadata only
-- [ ] 7.2 Compare it with the image in use and report a reason: toolchain change, integration version change, base change, or Piccolo template change
-- [ ] 7.3 Warn in `serve`, `restart`, `status` and `doctor`; never rebuild implicitly
-- [ ] 7.4 Name the rebuild command in the message
-- [ ] 7.5 If the check cannot be computed, report "could not verify" and continue starting
-- [ ] 7.6 Test: stale toolchain, stale integration, unverifiable, and up-to-date cases
-- [ ] 7.7 Test: the check performs no container starts and no artifact downloads
+- [x] 7.1 Desired image computed from metadata only (`internal/runtimeplan`)
+- [x] 7.2 Reason naming: base image, toolchain list, integration added/removed/version-changed, predates-labels
+- [x] 7.3 Warned in `serve`, `status` (and therefore `restart`) and `doctor`; no implicit rebuild anywhere
+- [x] 7.4 Message names `piccolo image build --set && piccolo restart`
+- [x] 7.5 Unverifiable → `doctor` reports it once and startup continues; a missing image is reported by the presence check only (no double warning)
+- [x] 7.6 Content drift vs **template drift**: identical labels with a differing tag is a quiet note, not a "rebuild me" warning
+- [x] 7.7 Tests: stale toolchain, predates-labels, missing image, template-only, and up-to-date cases (daemon-free via the Engine seam)
+- [x] 7.8 Live: doctor correctly reported the pre-label image as stale and reports the rebuilt image as matching
 
 ## 8. Verification and docs
 
-- [ ] 8.1 Update README to state the toolchain is baked in and that drift is reported, not fixed
-- [ ] 8.2 Update AGENTS.md acceptance criteria for the tag-content and bind-removal rules
-- [ ] 8.3 Re-check the web-console rule still holds: publishing `:18800` needs a launcher-based image, and drift reporting surfaces that case
-- [ ] 8.4 Run `go build ./...`, `go vet ./...`, `go test ./...`
-- [ ] 8.5 Live check on an existing workspace: rebuild by hand and confirm the gateway executes `gws` and the toolchain with no binds
+- [x] 8.1 README rewritten for the baked toolchain, measured size cost, drift reporting, promotion/gate/revert, rollback
+- [x] 8.2 AGENTS.md: mounts rule, serve sequence, `piccolo.yaml` schema (`previous_image`), acceptance criteria 14-20, decisions log
+- [x] 8.3 Web-console rule still holds (base flavor preserved on rebuild via `:18800` detection) and is now also covered by the base-image drift reason
+- [x] 8.4 `go build ./...`, `go vet ./...`, `go test ./...` all green (9 packages)
+- [x] 8.5 Live: gateway executes `gws 0.22.5`, `piccolo-gws 0.3.1`, `python3 3.14.7`, `jq`, `file`, `tesseract` with no `/nix` bind
+
+## Not done from the original plan
+
+- Bundle artifacts are still re-downloaded for the build *context* (the context needs every installed bundle's bytes). The download-free guarantee applies to planning/drift, which is what runs on every start. Persistent bundle caching is a separate optimization.

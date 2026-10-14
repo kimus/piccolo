@@ -21,6 +21,11 @@ Piccolo SHALL install the configured runtime toolchain into the runtime image du
 - **WHEN** the workspace toolchain package list changes and the runtime image is rebuilt
 - **THEN** the toolchain layer is rebuilt together with the layers that follow it
 
+#### Scenario: A configured command the packages do not provide
+
+- **WHEN** the workspace lists a toolchain command that no configured package provides
+- **THEN** the image build fails rather than producing an image that advertises a tool it cannot run
+
 ### Requirement: Image store must not be shadowed at runtime
 
 Piccolo SHALL NOT bind-mount any host directory over the container's Nix store, so the store baked into the image remains visible to every container started from it.
@@ -35,6 +40,16 @@ Piccolo SHALL NOT bind-mount any host directory over the container's Nix store, 
 
 - **WHEN** Piccolo compares an integration one-shot container and the gateway container built from the same image
 - **THEN** both can execute the same integration binaries
+
+### Requirement: A failed image build fails the command
+
+Piccolo SHALL report an image build as failed when the build does not produce the requested tag, and SHALL NOT record or adopt an image that was not created.
+
+#### Scenario: A build step fails but the daemon reports success
+
+- **WHEN** a layer fails during an image build and the daemon's build stream otherwise completes without an explicit error
+- **THEN** the build command exits non-zero
+- **AND** no workspace configuration is updated to reference an image that does not exist
 
 ### Requirement: Runtime image tag includes installed integration identity
 
@@ -69,7 +84,13 @@ Piccolo SHALL place each release integration's bundle in the build context under
 
 ### Requirement: Image content recorded as labels
 
-Piccolo SHALL label each locally built runtime image with its base image, its toolchain, and one entry per installed integration at resolved version and artifact digest.
+Piccolo SHALL label each locally built runtime image with its base image, its toolchain, and one entry per installed release integration at resolved version and artifact digest.
+
+#### Scenario: The recorded identity is what the build verified
+
+- **WHEN** an integration release is installed, or an image is rebuilt and adopted
+- **THEN** the workspace record for that integration carries the version, artifact digest and command list the image was actually built from
+- **AND** recomputing the desired image from that record yields the tag that was just built
 
 #### Scenario: Image identifies what it contains
 
@@ -85,3 +106,19 @@ Piccolo SHALL label each locally built runtime image with its base image, its to
 
 - **WHEN** a container is started from a labelled runtime image and later renamed
 - **THEN** the container still reports the same content labels as its image
+
+### Requirement: Rebuild command composes the whole workspace image
+
+Piccolo's image build SHALL produce the image the workspace describes — toolchain plus every installed integration — so that the command a staleness warning names is the command that actually resolves it.
+
+#### Scenario: Rebuilding an integration workspace
+
+- **WHEN** a user runs the image build in a workspace with installed integrations
+- **THEN** the built image contains the configured toolchain and every installed integration
+- **AND** the build reports the base, tag, toolchain summary and each integration identity it is baking
+
+#### Scenario: Rebuild leaves the workspace configuration alone unless adopted
+
+- **WHEN** an image build succeeds and the user did not ask to adopt it
+- **THEN** `piccolo.yaml` still references the previous image
+- **AND** Piccolo prints the value to adopt

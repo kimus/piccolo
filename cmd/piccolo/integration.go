@@ -58,7 +58,7 @@ var newIntegrationRunner = func() integrationRunner { return docker.New() }
 
 func newIntegrationCmd() *cobra.Command {
 	cmd := &cobra.Command{Use: "integration", Short: "Install and set up containerized integrations"}
-	cmd.AddCommand(newIntegrationAddCmd(), newIntegrationBuildCmd(), newIntegrationListCmd(), newIntegrationSetupCmd(), newIntegrationUpgradeCmd(), newIntegrationStatusCmd())
+	cmd.AddCommand(newIntegrationAddCmd(), newIntegrationBuildCmd(), newIntegrationListCmd(), newIntegrationSetupCmd(), newIntegrationUpgradeCmd(), newIntegrationStatusCmd(), newIntegrationRollbackCmd())
 	return cmd
 }
 
@@ -292,17 +292,21 @@ func runIntegrationAdd(cmd *cobra.Command, input string, f integrationFlags) err
 	statePath := pkg.StatePath()
 	containerState := pkg.ContainerStatePath()
 	item := manifest.Integration{
-		Package:           pkg.Package(),
-		Requested:         input,
-		Source:            string(picintegration.SourceRelease),
-		Channel:           string(pkg.Channel()),
-		Selector:          pkg.EffectiveSelector(),
-		ResolvedVersion:   fetched.Version,
-		ArtifactDigest:    fetched.Digest,
-		StatePath:         statePath,
-		Name:              desc.Name,
-		DisplayName:       desc.DisplayName,
-		Commands:          []string(desc.Commands),
+		Package:         pkg.Package(),
+		Requested:       input,
+		Source:          string(picintegration.SourceRelease),
+		Channel:         string(pkg.Channel()),
+		Selector:        pkg.EffectiveSelector(),
+		ResolvedVersion: fetched.Version,
+		ArtifactDigest:  fetched.Digest,
+		StatePath:       statePath,
+		Name:            desc.Name,
+		DisplayName:     desc.DisplayName,
+		// Record the commands the IMAGE verifies, which is the artifact release
+		// manifest's list. Recording the descriptor's list instead makes the
+		// recorded identity differ from what was built, so the drift check would
+		// report a difference forever and a rebuild could never clear it.
+		Commands:          installedCommands(fetched.Bundle.Commands, desc.Commands),
 		DescriptorCommand: descCmd,
 		SetupCommand:      rewriteStateArgs(desc.Setup.Command, containerState),
 		StatusCommand:     rewriteStateArgs(desc.StatusCommand, containerState),
@@ -763,7 +767,7 @@ func runIntegrationUpgrade(cmd *cobra.Command, name string, f integrationUpgrade
 			StatePath:         pkg.StatePath(),
 			Name:              desc.Name,
 			DisplayName:       desc.DisplayName,
-			Commands:          []string(desc.Commands),
+			Commands:          installedCommands(fetched.Bundle.Commands, desc.Commands),
 			DescriptorCommand: descCmd,
 			SetupCommand:      rewriteStateArgs(desc.Setup.Command, containerState),
 			StatusCommand:     rewriteStateArgs(desc.StatusCommand, containerState),
@@ -1078,6 +1082,18 @@ func sanitizeForName(name string) string {
 		return "integration"
 	}
 	return sanitized
+}
+
+// installedCommands returns the command list to record for an installed release
+// integration. The image verifies the artifact release manifest's list, so that
+// is the list the record must carry — anything else leaves the drift check
+// comparing a plan the build could never produce, and no rebuild would clear it.
+// The descriptor's list is the fallback for artifacts that declare none.
+func installedCommands(bundleCommands []string, descriptorCommands picintegration.CommandList) []string {
+	if len(bundleCommands) > 0 {
+		return append([]string(nil), bundleCommands...)
+	}
+	return append([]string(nil), descriptorCommands...)
 }
 
 func displayIntegration(in manifest.Integration) string {

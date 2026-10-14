@@ -35,7 +35,19 @@ import (
 const (
 	LabelManaged   = "piccolo.managed"
 	LabelWorkspace = "piccolo.workspace"
+
+	// PreviousSuffix is appended to the configured gateway name for the
+	// container parked as a promotion's revert target. Container roles travel
+	// by NAME, not label: this SDK can set labels only at create time and
+	// ContainerUpdate cannot change them, so a label could never be cleared
+	// when the candidate wins. The canonical name always belongs to the
+	// container that should be running, which leaves exactly one abnormal
+	// state to detect after an interrupted promotion.
+	PreviousSuffix = ".prev"
 )
+
+// PreviousName is the reserved name of a promotion's revert target.
+func PreviousName(name string) string { return name + PreviousSuffix }
 
 // DefaultShutdownGrace is the wait for a natural exit before forcing stop.
 const DefaultShutdownGrace = 10 * time.Second
@@ -186,14 +198,34 @@ func (r *Runner) BuildImage(ctx context.Context, buildContext io.Reader, opts Im
 		return err
 	}
 	defer res.Body.Close()
+	var streamErr error
 	if out == nil {
-		_, err = io.Copy(io.Discard, res.Body)
+		_, streamErr = io.Copy(io.Discard, res.Body)
+	} else {
+		streamErr = writeBuildOutput(res.Body, out)
+	}
+
+	// A failed build must fail the command. The classic builder reports a failing
+	// RUN step as an ordinary stream line and answers HTTP 200, so the stream can
+	// look fine while no image was produced. Without this check, callers wrote a
+	// manifest pointing at a tag that does not exist and the next serve pulled
+	// nothing — a silent failure in the path that decides whether to rebuild.
+	if _, err := cli.ImageInspect(ctx, opts.Tag); err != nil {
+		if errdefs.IsNotFound(err) || strings.Contains(err.Error(), "No such image") {
+			if streamErr != nil {
+				return streamErr
+			}
+			return fmt.Errorf("image build failed: tag %s was not created", opts.Tag)
+		}
 		return err
 	}
-	return writeBuildOutput(res.Body, out)
+	return streamErr
 }
 
+// writeBuildOutput forwards the daemon's build messages and surfaces the first
+// terminal error the daemon reported.
 func writeBuildOutput(r io.Reader, out io.Writer) error {
+	var buildErr error
 	s := bufio.NewScanner(r)
 	// Build lines can include long progress entries; allow more than Scanner's
 	// default 64 KiB token limit while keeping memory bounded.
@@ -214,10 +246,13 @@ func writeBuildOutput(r io.Reader, out io.Writer) error {
 			continue
 		}
 		if msg.Error != "" || msg.ErrorDetail.Message != "" {
-			if msg.ErrorDetail.Message != "" {
-				fmt.Fprintln(out, msg.ErrorDetail.Message)
-			} else {
-				fmt.Fprintln(out, msg.Error)
+			message := msg.ErrorDetail.Message
+			if message == "" {
+				message = msg.Error
+			}
+			fmt.Fprintln(out, message)
+			if buildErr == nil {
+				buildErr = errors.New("image build failed: " + message)
 			}
 			continue
 		}
@@ -233,7 +268,10 @@ func writeBuildOutput(r io.Reader, out io.Writer) error {
 			}
 		}
 	}
-	return s.Err()
+	if err := s.Err(); err != nil && buildErr == nil {
+		return err
+	}
+	return buildErr
 }
 
 // ContainerExists reports whether a container with the given name exists
@@ -413,6 +451,10 @@ type State struct {
 	Running  bool
 	Status   string
 	ExitCode int
+	// Image is the symbolic reference the container was created from (tag or
+	// digest as given), which is what piccolo.yaml records and what a
+	// promotion compares against.
+	Image string
 }
 
 // StateByName inspects a container by name.
@@ -436,6 +478,9 @@ func (r *Runner) StateByName(ctx context.Context, name string) (State, error) {
 		return State{}, err
 	}
 	st := State{Found: true}
+	if res.Container.Config != nil {
+		st.Image = res.Container.Config.Image
+	}
 	if res.Container.State != nil {
 		st.Status = string(res.Container.State.Status)
 		st.Running = res.Container.State.Running
@@ -475,6 +520,132 @@ func (r *Runner) StopByName(ctx context.Context, name string, grace time.Duratio
 		return true, fmt.Errorf("remove container: %w", err)
 	}
 	return true, nil
+}
+
+// StopKeptByName stops a container but KEEPS it. A promotion uses this to park
+// the running gateway as its revert target: the container retains its image,
+// mounts, env and published port configuration, so restoring it later is
+// `docker start` on a known-good spec rather than a rebuild from current
+// settings that may have drifted since.
+func (r *Runner) StopKeptByName(ctx context.Context, name string, grace time.Duration) (bool, error) {
+	cli, err := r.newClient(ctx)
+	if err != nil {
+		return false, err
+	}
+	id, found, err := containerIDByName(ctx, cli, name)
+	if err != nil || !found {
+		return found, err
+	}
+	if grace <= 0 {
+		grace = DefaultShutdownGrace
+	}
+	timeout := int(grace / time.Second)
+	if timeout < 1 {
+		timeout = 1
+	}
+	if _, err := cli.ContainerStop(ctx, id, mobyclient.ContainerStopOptions{Timeout: &timeout}); err != nil && !errdefs.IsNotFound(err) {
+		return true, fmt.Errorf("stop container: %w", err)
+	}
+	return true, nil
+}
+
+// RemoveByName stops (if needed) and removes a container by name.
+func (r *Runner) RemoveByName(ctx context.Context, name string, force bool) (bool, error) {
+	cli, err := r.newClient(ctx)
+	if err != nil {
+		return false, err
+	}
+	id, found, err := containerIDByName(ctx, cli, name)
+	if err != nil || !found {
+		return found, err
+	}
+	if _, err := cli.ContainerRemove(ctx, id, mobyclient.ContainerRemoveOptions{Force: force}); err != nil && !errdefs.IsNotFound(err) {
+		return true, fmt.Errorf("remove container: %w", err)
+	}
+	return true, nil
+}
+
+// StartByName starts an existing container. The revert path uses it to bring
+// back the previous gateway with the exact configuration it was running.
+func (r *Runner) StartByName(ctx context.Context, name string) (bool, error) {
+	cli, err := r.newClient(ctx)
+	if err != nil {
+		return false, err
+	}
+	id, found, err := containerIDByName(ctx, cli, name)
+	if err != nil || !found {
+		return found, err
+	}
+	if _, err := cli.ContainerStart(ctx, id, mobyclient.ContainerStartOptions{}); err != nil {
+		return true, fmt.Errorf("start container %q: %w", name, err)
+	}
+	return true, nil
+}
+
+// RenameContainer renames a container. It works on a RUNNING container and
+// keeps its published port bindings, which is why promotion can hand the
+// canonical name over without a second outage. Renaming also frees the old name
+// for the replacement, which a stopped container would otherwise keep holding.
+func (r *Runner) RenameContainer(ctx context.Context, from, to string) error {
+	to = strings.TrimSpace(to)
+	if to == "" {
+		return errors.New("container rename needs a target name")
+	}
+	cli, err := r.newClient(ctx)
+	if err != nil {
+		return err
+	}
+	id, found, err := containerIDByName(ctx, cli, from)
+	if err != nil {
+		return err
+	}
+	if !found {
+		return fmt.Errorf("container %q not found", from)
+	}
+	if _, err := cli.ContainerRename(ctx, id, mobyclient.ContainerRenameOptions{NewName: to}); err != nil {
+		return fmt.Errorf("rename container %q to %q: %w", from, to, err)
+	}
+	return nil
+}
+
+// ImageLabels reports the content labels recorded on a local image at build
+// time. This is what makes a drift warning able to name the REASON (base,
+// toolchain, or which integration version) instead of only saying "different",
+// and it is how rollback can describe the image it is about to adopt.
+func (r *Runner) ImageLabels(ctx context.Context, image string) (map[string]string, bool, error) {
+	cli, err := r.newClient(ctx)
+	if err != nil {
+		return nil, false, err
+	}
+	res, err := cli.ImageInspect(ctx, image)
+	if err != nil {
+		if errdefs.IsNotFound(err) || strings.Contains(err.Error(), "No such image") {
+			return nil, false, nil
+		}
+		return nil, false, err
+	}
+	if res.Config == nil {
+		return map[string]string{}, true, nil
+	}
+	return res.Config.Labels, true, nil
+}
+
+// containerIDByName resolves a container name to its id.
+func containerIDByName(ctx context.Context, cli client.SDKClient, name string) (string, bool, error) {
+	if strings.TrimSpace(name) == "" {
+		return "", false, nil
+	}
+	found, err := cli.FindContainerByName(ctx, name)
+	if err != nil {
+		if errdefs.IsNotFound(err) {
+			return "", false, nil
+		}
+		return "", false, err
+	}
+	if found == nil {
+		return "", false, nil
+	}
+	return found.ID, true, nil
 }
 
 // Logs streams container logs. The returned reader carries docker stream

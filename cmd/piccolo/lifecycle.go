@@ -64,6 +64,15 @@ func newStatusCmd() *cobra.Command {
 			}
 			fmt.Fprintf(out, "container: %s (%s, running: %s, exit code: %d)\n",
 				name, state.Status, running, state.ExitCode)
+			if state.Image != "" {
+				fmt.Fprintf(out, "image:     %s\n", state.Image)
+			}
+
+			// A parked revert target means a previous promotion was interrupted.
+			if parked, perr := runner.StateByName(ctx, docker.PreviousName(name)); perr == nil && parked.Found {
+				fmt.Fprintf(out, "parked:    %s (%s, image %s) — a promotion was interrupted; 'piccolo serve' restores it\n",
+					docker.PreviousName(name), orUnknown(parked.Status), orUnknown(parked.Image))
+			}
 
 			if !state.Running {
 				return nil
@@ -81,6 +90,12 @@ func newStatusCmd() *cobra.Command {
 			if m, merr := manifest.Load(workspace.NewLayout(dir).Manifest()); merr == nil {
 				if webURL := webConsoleURL(m); webURL != "" {
 					fmt.Fprintf(out, "web:       %s\n", webURL)
+				}
+				// Staleness is reported here too: status is where a user looks when
+				// something is not as expected.
+				warnImageDrift(ctx, out, runner, m)
+				if m.Container.PreviousImage != "" {
+					fmt.Fprintf(out, "rollback:  %s (piccolo integration rollback)\n", m.Container.PreviousImage)
 				}
 			}
 			return nil

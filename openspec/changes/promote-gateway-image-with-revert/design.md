@@ -44,20 +44,25 @@ so anything that keeps a revert target must not be sitting on that name. And ren
 
 ## Decisions
 
-### Sequence, with the old container never renamed
+### Sequence, with the old container never renamed — as implemented
+
+The written plan named the candidate `.next` and renamed the winner into the canonical name. Implementation used the mirror form: the candidate takes the canonical name immediately and the old container is parked as `<name>.prev`.
+
+Both work at the daemon level, and one invariant makes the second easier to reason about: **the canonical name always belongs to the container that should be running.** After a crash there is exactly one abnormal state to detect — `.prev` exists while nothing holds the canonical name — instead of two candidate names to compare. It also sidesteps `Start`'s stale-name removal, which deletes anything sitting on the configured name.
+
+Container roles could not be labels: this Docker SDK sets labels at create time only and `ContainerUpdateOptions` has no `Label` field, so a `piccolo.role=candidate` label would be permanent on a healthy gateway after promotion. The name is the role.
 
 ```text
-1. resolve target image
-2. stop  <name>                 → releases published ports; keep the container as the revert target
-3. rename <name> → <name>.prev  → frees the canonical name without destroying anything
-4. start <name> from target image, labelled piccolo.role=candidate
-5. gate:  /health  AND  docker exec <name> <integration binary> <probe> per installed integration
-6a. pass  → remove <name>.prev; strip the candidate label
-6b. fail  → capture diagnostics, stop+remove the failed container,
+1. repair an interrupted promotion first (see below)
+2. resolve target image
+3. stop  <name>                 → releases published ports; keep the container
+4. rename <name> → <name>.prev  → frees the canonical name without destroying anything
+5. start <name> from the target image (detached, default entrypoint)
+6. gate:  /health  AND  docker exec <name> <integration status argv> per installed integration
+7a. pass  → remove <name>.prev; record the replaced image as the rollback target
+7b. fail  → print gate diagnostics + candidate logs, stop+remove the candidate,
             rename <name>.prev → <name>, start it, report non-zero
 ```
-
-The alternative — start the new container under a temporary name while the old one is stopped, then rename — was considered and is equivalent at the daemon level, and the first version of this document proposed it. The `.prev` form is chosen because it keeps one invariant that matters for the crash path: **the canonical name always belongs to the container that should be running.** After a crash, "nothing is running on `<name>`" is the only abnormal state to detect, instead of two candidate names to reason about.
 
 ### Gate executes, and reports what it ran
 
@@ -86,6 +91,7 @@ If a promote is interrupted, the next `serve` looks for `<name>.prev`: if it exi
 ## Risks / Trade-offs
 
 - **A few seconds of unavailability** between stop and healthy. Accepted; the alternative is a parallel candidate with its own port and name collisions.
+- **Two containers must never share `picoclaw/` while one is starting.** Verified the hard way: PicoClaw's gateway child enforces a singleton pid file, so a second container mounting the same home exits with `singleton check failed: gateway is already running (PID: 17)` — and the launcher's own health probe then reports `[::1]:18790 connection refused`. Stopping the previous gateway before starting the candidate is therefore required, not merely tidy.
 - **Both containers write the same `/root/.picoclaw`** only in the window where the candidate is up and the old one is stopped, not running — so no double writer.
 - **Kept `.prev` containers pin their image layers.** Disk grows by one container per promote, not by an image copy; the removal on success bounds it at one.
 - **Revert can itself fail** — if the user pruned the image, if the ports are now stolen by another process, or if the old failure was environmental. Then Piccolo must say plainly that both the new and the previous image are unavailable and name what to run next. A "rolled back" line that is not true would be worse than the outage.
@@ -99,5 +105,5 @@ None, by project policy. This change only alters how `restart`/`serve`/`rollback
 
 ## Open Questions
 
-- Should the promote gate also verify that reported integration versions match the image labels — cheap drift proof, but it makes the gate depend on metadata quality rather than behaviour?
-- Should `piccolo integration rollback` accept an explicit version by resolving it to a locally present labelled image (rebuilding if absent), or stay strictly a previous-image switch for now?
+- Should the gate ALSO assert that reported integration versions match the image labels — cheap drift proof, but it makes the gate depend on metadata quality rather than behaviour?
+- Should `piccolo integration rollback` accept an explicit version by resolving it to a locally present labelled image (rebuilding if absent), or stay strictly a previous-image switch for now? (`--to <image>` exists, but it takes a local reference, not a version selector.)

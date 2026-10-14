@@ -54,10 +54,13 @@ func (l Layout) IntegrationBind() string {
 	return l.Integrations() + ":" + ContainerIntegrations + ":rw"
 }
 
+// RuntimeBinds returns the host caches mounted into the gateway. Only the media
+// mirror belongs here: the Devbox/Nix toolchain is baked into the image, and
+// mounting the workspace Nix cache over /nix HIDES the image's own store —
+// which left gws, piccolo-gws, python3 and jq unexecutable in a container
+// started from an image that contained all of them.
 func (l Layout) RuntimeBinds() []string {
 	return []string{
-		l.RuntimeDevbox() + ":" + ContainerDevbox + ":rw",
-		l.RuntimeNix() + ":" + ContainerNix + ":rw",
 		l.RuntimeMedia() + ":" + ContainerMedia + ":rw",
 	}
 }

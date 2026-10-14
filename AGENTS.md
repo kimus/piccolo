@@ -33,7 +33,7 @@ Verified against `github.com/sipeed/picoclaw@v0.3.1` source (present in the Go m
 
 - Workspace = the target directory itself (default: cwd; `-D/--dir` flag overrides). `piccolo.yaml` lives at the root; PicoClaw-owned files live under `picoclaw/`; integration state under `integrations/`; runtime caches under `runtime/`.
 - Workspace resolution rule is shared by ALL commands: `-D/--dir` flag, else cwd. `serve`/`doctor` fail with `no piccolo workspace found — run 'piccolo init' first` when `piccolo.yaml` is absent.
-- Mounts: `<workspace>/picoclaw` → `/root/.picoclaw`, `<workspace>/integrations` → `/root/.piccolo/integrations`, and local runtime cache binds from `<workspace>/runtime/{devbox,nix,media}`.
+- Mounts: `<workspace>/picoclaw` → `/root/.picoclaw`, `<workspace>/integrations` → `/root/.piccolo/integrations`, and `<workspace>/runtime/media` → `/tmp/picoclaw_media` plus per-agent media mirrors. Nothing SHALL be bind-mounted over `/nix` or the Devbox global dir: the toolchain is image content, and shadowing the image's store makes its own binaries unexecutable in the running gateway while one-shot containers (which take no such bind) still work.
 - All `workspace` paths in `config.json` SHALL be container-side paths, e.g. `~/.picoclaw/agents/main` (image runs with `HOME=/root`; upstream defaults use `~`, tilde expansion supported).
 
 ### `piccolo.yaml` schema
@@ -46,6 +46,7 @@ container:
   network: bridge                           # none | bridge | host
   ports: []                                 # web console enabled: ["127.0.0.1:18800:18800"]
   env: {}                                   # literal or "env:HOST_VAR" (resolved at serve time)
+  previous_image: ""                        # single rollback slot, recorded on promote
 setup:                                      # optional non-secret setup metadata
   channels:
     discord:
@@ -114,16 +115,23 @@ Output: `[OK]`/`[WARN]`/`[FAIL]` status lines (see README for the exact format).
 
 ### `piccolo serve`
 
-Starts the gateway container **detached** and health-gates the command:
+Starts the gateway container **detached** and gates the command:
 
 1. Critical doctor subset first (daemon reachable, both config files present + parseable). Fail fast, actionable messages.
 2. Derive the gateway port from `config.json` `gateway.port` (default 18790).
-3. Compose the launch spec: image/name/network/ports/env from `piccolo.yaml`; auto-publish `127.0.0.1:<gwPort>:<gwPort>` when the manifest doesn't already map that container port (skip for `network: host`); inject `PICOCLAW_GATEWAY_HOST=0.0.0.0` unless the manifest env already sets it; labels `piccolo.managed=true`, `piccolo.workspace=<abs path>`.
-4. Remove stale container by name, create (pull once on `No such image`), start detached (`Init: true`, default entrypoint, no stdio attach).
-5. Poll `http://127.0.0.1:<gwPort>/health` (1s interval, 90s budget). Fail early if the container exits. On timeout/failure: print error + last ~30 log lines, leave the container for debugging, exit non-zero.
-6. On success: print the health URL, web console URL when a `:18800` binding exists, and next-step hints (`chat`, `logs -f`, `status`, `stop`). Exit 0.
+3. Recover an interrupted promotion first: if `<name>.prev` exists while nothing holds the canonical name, rename it back, start it, and report the interruption. The canonical name SHALL always belong to the container that should be running.
+4. Report runtime-image drift as a warning with the reason (read from the current image's content labels) and the rebuild command. Piccolo SHALL never rebuild implicitly, and an unverifiable check SHALL NOT block startup.
+5. Compose the launch spec: image/name/network/ports/env from `piccolo.yaml`; auto-publish `127.0.0.1:<gwPort>:<gwPort>` when the manifest doesn't already map that container port (skip for `network: host`); inject `PICOCLAW_GATEWAY_HOST=0.0.0.0` unless the manifest env already sets it; labels `piccolo.managed=true`, `piccolo.workspace=<abs path>`.
+6. **Promote when the existing container runs a different image**: stop the current gateway keeping it (`ContainerStop`, no remove), rename it to `<container.name>.prev` (frees the canonical name, releases the published port), then create/start the target image under the canonical name. Same image → plain replace, no parking.
+7. Gate: poll `http://127.0.0.1:<gwPort>/health` (1s interval, 90s budget), then **execute** every installed integration's recorded status command through `docker exec` in the gateway. Readiness requires that the binary runs, not that it is configured: exit 126/127, an exec error, or silent-with-failure output is a gate failure; a non-zero exit that produced a status payload is a pass (setup gap, not broken image). No integrations → health alone.
+8. Gate passes: remove the parked target, record the replaced image as `container.previous_image`, print health + console + next-step hints, exit 0.
+9. Gate fails: print the stage, the failing probe command and its output, plus the candidate's last log lines **before** removing it; then stop/remove the candidate, rename the parked target back, start it, and exit non-zero. If the restore itself fails, say plainly that neither gateway is running — never report a rollback that did not restore service. No revert target exists → keep the container for debugging as before.
 
-`--foreground/-f` keeps the attached behavior: pump stdio, forward SIGINT/SIGTERM to a graceful stop, remove the container, propagate its exit code.
+`piccolo restart` delegates to serve (it no longer stops-and-removes first: that discarded the revert target). `--foreground/-f` keeps the attached behavior — pump stdio, forward SIGINT/SIGTERM to a graceful stop, remove the container, propagate its exit code — and runs the same park/gate/commit-or-revert around the attached run.
+
+`piccolo integration rollback` switches `container.image` back to `container.previous_image` (or `--to`) and reuses this promotion path. It SHALL verify the target exists locally before touching the running gateway, and SHALL restore the manifest setting if the gate rejects it.
+
+Container roles travel by **name**, not label: this Docker SDK sets labels only at create time and `ContainerUpdateOptions` has no `Label` field, so a candidate label could never be cleared when it won.
 
 The Docker SDK SHALL be isolated behind an internal `Runner`/`Process` interface so SDK types never leak and unit tests run daemon-free.
 
@@ -214,8 +222,24 @@ Reduced tool allowlists (research: `web_search`, `web_fetch`, `read_file`; coder
 11. `piccolo.yaml` contains no duplicated PicoClaw runtime configuration; only launch settings and non-secret Piccolo setup metadata.
 12. Generated `AGENT.md` files have valid frontmatter and useful role instructions.
 13. Unit tests: manifest strict parsing, config generation determinism, doctor checks (daemon-free via interface), init non-destructive behavior, container spec composition (mounts/env/ports/labels), health-port/gateway-host injection helpers.
+14. The runtime image contains the toolchain: a gateway started from a locally built image executes every configured `runtime.toolchain.commands` entry and every installed integration binary with **no** host bind mounts beyond media/integrations/`picoclaw`, and no start-time install step runs.
+15. Two different versions (or digests) of one installed integration produce different runtime image tags, and the tag is computable from `piccolo.yaml` metadata alone — a drift check downloads no artifact and starts no container.
+16. A locally built image carries `piccolo.base`, `piccolo.toolchain`, and one `piccolo.integration.<owner>/<repo>` label per installed release; drift reporting uses them to name what moved.
+17. A stale runtime image produces a warning naming the reason and `piccolo image build --set`; it never triggers a build, and an unverifiable check never blocks `serve`.
+18. Promotion parks the running gateway as `<name>.prev`, gates the candidate on health **plus executed integration binaries**, and reverts (with captured diagnostics) when the gate fails, exiting non-zero; success removes the parked container and records `container.previous_image`.
+19. An interrupted promotion (parked target, nothing on the canonical name) is detected and restored by the next `serve`, and reported by `doctor`/`status`.
+20. `piccolo integration rollback` adopts the recorded previous image through the same gate, and refuses with the gateway untouched when that image is not present locally.
 
 ## Decisions Log
+
+- **Toolchain is image content, not runtime state.** The Devbox/Nix toolchain installs in the image build (its own layer, before integration layers) instead of at container start, and the `/nix` + Devbox binds plus the `piccolo-setup-tools` script were deleted. Mounting the workspace Nix cache over `/nix` hid the image's own store — measured: 1464 store entries in the image, 68 visible in the running gateway, so `gws`, `piccolo-gws`, `python3` and `jq` were all on `PATH` and none executable. The bake costs disk and that is measured too: 440 MB → ~8.3 GB for the default package list (toolchain layer alone 5.78 GB, in-layer `nix-collect-garbage` recovers only ~30 MB because the closure genuinely is that size). `runtime.toolchain.packages` is the knob for workspaces that do not need office/media tooling.
+- **Image identity lives in the tag AND the labels.** The tag covers `owner/repo@version+digest` per installed release (also carried in the Dockerfile's label block, so removing one mechanism still cannot reuse a stale layer) and is computable from metadata only. Labels answer "what is in this image?" and name the reason for a rebuild; the tag stays the cache identity. Content labels are also why a running container's identity survives a promotion rename.
+- **Health is not readiness; presence is not proof.** The promote gate executes each installed integration's status command inside the gateway. A container where `command -v piccolo-gws` succeeded and `piccolo-gws state` printed "not found" is the exact failure this catches. A non-zero exit that produced a payload PASSES (unconfigured is a setup gap, not a broken image).
+- **Promotion keeps a revert target, and roles travel by name.** `<name>.prev` holds the stopped previous gateway; the canonical name always belongs to what should be running, which leaves one abnormal state to detect. Container labels cannot be used for this: this Docker SDK sets labels only at create time and `ContainerUpdateOptions` has no `Label` field, so a "candidate" label could never be cleared on the winner.
+- **Drift is content, not tags.** Identical content labels with a differing tag means only Piccolo's build recipe moved (`DriftTemplate`), reported as a quiet note — asking for a rebuild there would train users to ignore the warning. Rebuilding remains explicitly user-initiated.
+- **`piccolo restart` no longer stops first.** Stopping-and-removing before knowing whether the replacement works turned a bad image into an outage with nothing to fall back to; serve owns the park/gate/commit-or-revert sequence.
+- **`image build` composes the whole workspace image** (toolchain + every installed integration), because a rebuild command that silently drops integrations is worse than no rebuild command; it is what the drift warning names. On adopt it also refreshes the recorded version/digest/commands from the artifacts it actually placed in the image — otherwise the record and the image diverge and no rebuild ever clears the warning.
+- **`runtime apply` became a check, not an installer.** Installing into a running container would recreate the two-sources-of-truth problem the bake removes.
 
 - **Runtime delivery**: Docker container via Go SDK — no `picoclaw` on `$PATH`.
 - **Config split**: `piccolo.yaml` = Piccolo-owned launch settings + non-secret setup metadata; `config.json` = PicoClaw runtime behavior, generated once, user-owned forever. No duplicated runtime configuration.

@@ -11,17 +11,17 @@ Piccolo SHALL promote a gateway image by stopping the running gateway, keeping i
 - **AND** the gateway keeps running on the canonical name with its published ports unchanged
 - **AND** no container remains under the reserved previous name
 
-#### Scenario: Canonical name is freed without discarding the previous gateway
+#### Scenario: The canonical name is freed without discarding the previous gateway
 
 - **WHEN** Piccolo stops the current gateway in order to promote a replacement
 - **THEN** the stopped container is retained under a reserved name rather than removed
 - **AND** the replacement is started under the canonical name
 
-#### Scenario: Promotion renames a running container
+#### Scenario: A retained gateway is moved aside, not recreated
 
-- **WHEN** a promoted gateway container has passed the gate and must take the canonical name
-- **THEN** it is renamed while running
-- **AND** its published port bindings and identity remain unchanged by the rename
+- **WHEN** Piccolo renames the parked container to free or restore the canonical name
+- **THEN** the container keeps its image, mounts, environment and published port configuration
+- **AND** starting it later restores exactly that known-good configuration
 
 ### Requirement: Readiness gate executes the integration binaries
 
@@ -50,8 +50,7 @@ When a promotion fails, Piccolo SHALL capture the diagnostics of the failed atte
 #### Scenario: Automatic revert after a failed gate
 
 - **WHEN** the candidate gateway fails the readiness gate
-- **THEN** the candidate is stopped and removed
-- **AND** the previously running container is restored under the canonical name and started
+- **THEN** the candidate is stopped and removed, and the reserved container is renamed back to the canonical name and started
 - **AND** Piccolo reports the failure with a non-zero exit status
 
 #### Scenario: Diagnostics outlive the failed container
