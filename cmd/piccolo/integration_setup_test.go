@@ -123,7 +123,7 @@ func TestStageHostFileCopiesWithOwnerOnlyMode(t *testing.T) {
 	stateRoot := filepath.Join(dir, "integrations", "kimus", "piccolo-gws")
 	containerState := "/root/.piccolo/integrations/kimus/piccolo-gws"
 
-	target, cont, err := stageHostFile(host, stateRoot, "auth/client_secret.json", containerState)
+	target, cont, err := stageHostFile(host, stateRoot, "auth/client_secret.json", containerState, autoYes)
 	if err != nil {
 		t.Fatalf("stage: %v", err)
 	}
@@ -162,7 +162,7 @@ func TestStageHostFileRejections(t *testing.T) {
 		{"traversal destination", file, "../outside.json"},
 	}
 	for _, c := range cases {
-		if _, _, err := stageHostFile(c.src, stateRoot, c.dst, "/root/x"); err == nil {
+		if _, _, err := stageHostFile(c.src, stateRoot, c.dst, "/root/x", autoYes); err == nil {
 			t.Fatalf("%s: expected rejection", c.name)
 		}
 	}
@@ -180,7 +180,7 @@ func TestStageHostFileRefusesEscapeViaSymlinkedRoot(t *testing.T) {
 		t.Fatal(err)
 	}
 	// A nested destination stays inside the state root.
-	target, _, err := stageHostFile(file, stateRoot, "deep/nested/x.json", "/c")
+	target, _, err := stageHostFile(file, stateRoot, "deep/nested/x.json", "/c", autoYes)
 	if err != nil {
 		t.Fatalf("stage: %v", err)
 	}
@@ -388,5 +388,50 @@ func TestRelayCallbackBuildsLoopbackCurlInsideContainer(t *testing.T) {
 	}
 	if err == nil {
 		t.Fatal("expected the fake exec to surface an error")
+	}
+}
+
+func autoYes(string) (bool, error) { return true, nil }
+func autoNo(string) (bool, error)  { return false, nil }
+
+func TestStageHostFileConfirmsBeforeOverwritingExisting(t *testing.T) {
+	dir := t.TempDir()
+	source := filepath.Join(dir, "new.json")
+	if err := os.WriteFile(source, []byte(`{"new":true}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	stateRoot := filepath.Join(dir, "state")
+	dst := "auth/client_secret.json"
+	if err := os.MkdirAll(filepath.Join(stateRoot, "auth"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	existing := filepath.Join(stateRoot, "auth", "client_secret.json")
+	if err := os.WriteFile(existing, []byte(`{"old":true}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Declining must leave the current credentials untouched.
+	if _, _, err := stageHostFile(source, stateRoot, dst, "/c", autoNo); err == nil {
+		t.Fatal("declining the overwrite must abort")
+	}
+	if data, _ := os.ReadFile(existing); !strings.Contains(string(data), "old") {
+		t.Fatalf("existing file was overwritten after a refusal: %s", data)
+	}
+
+	// Confirming replaces it, and the replacement keeps owner-only mode.
+	if _, _, err := stageHostFile(source, stateRoot, dst, "/c", autoYes); err != nil {
+		t.Fatalf("confirmed overwrite failed: %v", err)
+	}
+	data, err := os.ReadFile(existing)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), "new") {
+		t.Fatalf("file not replaced: %s", data)
+	}
+
+	// No confirmation channel at all must also refuse rather than clobber.
+	if _, _, err := stageHostFile(source, stateRoot, dst, "/c", nil); err == nil {
+		t.Fatal("nil confirm must refuse to overwrite")
 	}
 }

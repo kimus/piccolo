@@ -38,7 +38,7 @@
 
 - [x] 5.1 Support `path` inputs via huh's file picker on the host filesystem
 - [x] 5.2 Copy the selected file to the declared destination under the integration state directory with mode `0600`
-- [ ] 5.3 Confirm before overwriting an existing staged file
+- [x] 5.3 Confirm before overwriting an existing staged file
 - [x] 5.4 Pass the container-side path to the action, never the host path
 - [x] 5.5 Reject missing, directory, or unreadable selections without staging
 

@@ -119,7 +119,10 @@ func callbackPath(rawQuery string) string {
 // stageHostFile copies a user-selected host file into the integration state
 // tree at the action-declared destination with owner-only permissions, and
 // returns both the host path and the container-side path to hand back.
-func stageHostFile(hostPath, stateDirRoot, destination, containerState string) (host string, cont string, err error) {
+//
+// confirm is asked before replacing an existing staged file: credentials are
+// easy to overwrite by accident and the previous value is unrecoverable.
+func stageHostFile(hostPath, stateDirRoot, destination, containerState string, confirm func(target string) (bool, error)) (host string, cont string, err error) {
 	hostPath = strings.TrimSpace(hostPath)
 	destination = strings.TrimSpace(destination)
 	if hostPath == "" {
@@ -141,6 +144,18 @@ func stageHostFile(hostPath, stateDirRoot, destination, containerState string) (
 	target := filepath.Join(stateDirRoot, filepath.FromSlash(destination))
 	if !strings.HasPrefix(target, filepath.Clean(stateDirRoot)+string(os.PathSeparator)) {
 		return "", "", fmt.Errorf("destination %q escapes the integration state directory", destination)
+	}
+	if _, statErr := os.Stat(target); statErr == nil {
+		if confirm == nil {
+			return "", "", fmt.Errorf("%s already exists; refusing to overwrite it without confirmation", filepath.Base(target))
+		}
+		ok, cerr := confirm(target)
+		if cerr != nil {
+			return "", "", cerr
+		}
+		if !ok {
+			return "", "", fmt.Errorf("keeping the existing %s; nothing was changed", filepath.Base(target))
+		}
 	}
 	if err := os.MkdirAll(filepath.Dir(target), 0o700); err != nil {
 		return "", "", err
@@ -340,7 +355,7 @@ func renderActionInputs(action picintegration.Action, hostStateDir, containerSta
 			}
 			// Staging is Piccolo's job: it owns the mount that makes a host
 			// file visible inside the container.
-			_, cont, err := stageHostFile(h.text, hostStateDir, h.input.Destination, containerState)
+			_, cont, err := stageHostFile(h.text, hostStateDir, h.input.Destination, containerState, confirmOverwrite)
 			if err != nil {
 				return nil, err
 			}
@@ -370,6 +385,27 @@ func multiOptions(opts []string, target *[]string) []huh.Option[string] {
 		out = append(out, huh.NewOption(o, o))
 	}
 	return out
+}
+
+// confirmOverwrite is the interactive gate used when a staged credential would
+// replace an existing file.
+func confirmOverwrite(target string) (bool, error) {
+	if !term.IsTerminal(int(os.Stdin.Fd())) {
+		return false, fmt.Errorf("%s already exists and no terminal is available to confirm replacing it", filepath.Base(target))
+	}
+	agree := false
+	form := huh.NewForm(huh.NewGroup(
+		huh.NewConfirm().
+			Title(fmt.Sprintf("Replace the existing %s?", filepath.Base(target))).
+			Description("the current credentials for this integration will be overwritten").
+			Affirmative("Yes, replace").
+			Negative("No, keep the current file").
+			Value(&agree),
+	))
+	if err := form.Run(); err != nil {
+		return false, err
+	}
+	return agree, nil
 }
 
 // homeOr falls back to the user's home directory when a preferred starting
