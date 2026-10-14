@@ -248,10 +248,10 @@ type integrationCallRequest struct {
 // interruptible: a hung action must never be able to pin this call, because the
 // whole point of the per-action budget is that Piccolo, not the integration,
 // decides when an attempt is abandoned.
-func runIntegrationAction(ctx context.Context, runner integrationRunner, req integrationCallRequest, out io.Writer, onEvent func(picintegration.Event)) (*picintegration.EventReader, error) {
+func runIntegrationAction(ctx context.Context, runner integrationRunner, req integrationCallRequest, out io.Writer, onEvent func(picintegration.Event)) (*picintegration.EventReader, actionOutcome, error) {
 	proc, err := runner.Run(ctx, req.Spec)
 	if err != nil {
-		return nil, err
+		return nil, outcomeCrashed, err
 	}
 	defer func() { _ = proc.Shutdown(0) }()
 
@@ -290,31 +290,94 @@ func runIntegrationAction(ctx context.Context, runner integrationRunner, req int
 		case <-readDone:
 			code, waitErr := proc.Wait(ctx)
 			if waitErr != nil {
-				return er, waitErr
+				return er, outcomeCrashed, waitErr
 			}
 			lastExit = code
-			if e := er.ErrEvent(); e != nil {
-				return er, fmt.Errorf("integration action failed: %s (%s)", e.Message, e.Code)
-			}
-			if code != 0 {
-				return er, fmt.Errorf("integration action exited %d without reporting a result", code)
-			}
-			return er, nil
+			// A reported failure and a crash are different events, and the exit
+			// code decides between them only when the stream stayed silent.
+			return er, classifyAction(er.ErrEvent(), code, nil), nil
 		case <-ctx.Done():
 			// Force the reader goroutine to stop by tearing the container down.
 			_ = proc.Shutdown(0)
 			<-readDone
 			if lastExit == 0 {
-				return er, nil
+				return er, outcomeSucceeded, nil
 			}
-			if errors.Is(ctx.Err(), context.Canceled) {
-				// Cancelled by signal (or by the courier giving up): cleanup ran,
-				// so say so instead of implying a timeout.
-				return er, errors.New("action interrupted; the setup container was stopped and removed")
-			}
-			return er, fmt.Errorf("action did not finish within its time budget (%s); the setup container was stopped and removed", actionWaitBudget)
+			// Piccolo ended this attempt, not the integration. Blaming the
+			// integration for a cancel it never agreed to is how a user learns to
+			// disbelieve every message.
+			return er, classifyAction(nil, lastExit, ctx.Err()), nil
 		}
 	}
+}
+
+// actionOutcome is what an action's ending means to the menu loop.
+type actionOutcome int
+
+const (
+	outcomeSucceeded actionOutcome = iota
+	// outcomeReported: the integration said what happened and meant it. The
+	// action failed; Piccolo did not.
+	outcomeReported
+	// outcomeCrashed: a non-zero exit with no terminal event. Piccolo cannot know
+	// whether side effects landed, so this is the one ending that is not data.
+	outcomeCrashed
+	// outcomeCancelled: the user or the courier gave up. Nobody's fault.
+	outcomeCancelled
+	// outcomeTimedOut: Piccolo's own budget expired. Also nobody's fault, but it
+	// is worth saying the deadline out loud.
+	outcomeTimedOut
+)
+
+func (o actionOutcome) String() string {
+	switch o {
+	case outcomeSucceeded:
+		return "succeeded"
+	case outcomeReported:
+		return "reported failure"
+	case outcomeCrashed:
+		return "crashed"
+	case outcomeCancelled:
+		return "cancelled"
+	case outcomeTimedOut:
+		return "timed out"
+	}
+	return "unknown"
+}
+
+// terminal reports whether the outcome belongs in a closing summary as something
+// the user should still know about. A cancel is excluded: the user chose it.
+func (o actionOutcome) terminal() bool {
+	return o == outcomeReported || o == outcomeCrashed || o == outcomeTimedOut
+}
+
+// classifyAction decides what an ending means.
+//
+// The order is the whole point: a terminal event outranks the exit code, because
+// gws (and any integration following the protocol) exits non-zero deliberately
+// after reporting. So `error` event plus exit 11 is a report, exit 101 with no
+// event is a death, and a context we cancelled is neither.
+func classifyAction(errEvent *picintegration.Event, exitCode int, ctxErr error) actionOutcome {
+	switch {
+	case errors.Is(ctxErr, context.DeadlineExceeded):
+		return outcomeTimedOut
+	case ctxErr != nil:
+		return outcomeCancelled
+	case errEvent != nil:
+		return outcomeReported
+	case exitCode != 0:
+		return outcomeCrashed
+	default:
+		return outcomeSucceeded
+	}
+}
+
+// actionReport is one action's result as the loop needs to see it.
+type actionReport struct {
+	action  string
+	outcome actionOutcome
+	patch   json.RawMessage
+	summary string
 }
 
 // relayCallbackIntoContainer delivers the captured query string into the still
@@ -747,6 +810,7 @@ func runDeclarativeSetup(ctx context.Context, out io.Writer, runner integrationR
 		runner:          runner,
 		layout:          layout,
 		out:             out,
+		style:           newStyler(out),
 		integrationName: found.Name,
 		description:     strings.TrimSpace(desc.Description),
 		setupCommand:    found.SetupCommand,
@@ -776,6 +840,8 @@ func runDeclarativeSetup(ctx context.Context, out io.Writer, runner integrationR
 	// available and what is left to do change with them. That is what lets each
 	// action do exactly one thing instead of shipping composite entries.
 	var pendingPatch json.RawMessage
+	var reported []actionReport
+	crashes := map[string]int{}
 	for {
 		state, err := s.state(ctx)
 		if err != nil {
@@ -797,7 +863,7 @@ func runDeclarativeSetup(ctx context.Context, out io.Writer, runner integrationR
 		if done {
 			break
 		}
-		patch, err := s.runAction(ctx, chosen, state)
+		rep, err := s.runAction(ctx, chosen, state)
 		if err != nil {
 			if errors.Is(err, errActionAborted) {
 				// Backing out of a form saves nothing for that action and keeps any
@@ -806,14 +872,47 @@ func runDeclarativeSetup(ctx context.Context, out io.Writer, runner integrationR
 			}
 			return err
 		}
-		if len(patch) > 0 {
-			pendingPatch = patch
+		if len(rep.patch) > 0 {
+			pendingPatch = rep.patch
 		}
+		if rep.outcome.terminal() {
+			reported = append(reported, *rep)
+			if rep.outcome == outcomeCrashed {
+				crashes[rep.action]++
+				if crashes[rep.action] == 2 {
+					fmt.Fprintln(s.out, s.style.Crashf("  %s has died twice without reporting; stop retrying it and check the state below", rep.action))
+				}
+			}
+		}
+		// A reported failure is data, not an exception: the loop continues and the
+		// next iteration re-reads state, so a partial save becomes visible instead
+		// of the session ending on top of it.
 	}
+	s.summarize(reported)
 	if len(pendingPatch) == 0 {
 		return nil
 	}
 	return applyIntegrationPatch(s.out, s.layout.Config(), pendingPatch, integrationServerKey(*found, desc), confirmApplyConfig)
+}
+
+// summarize prints what the session ended with. Severity lives here, in colour
+// and words, so the command itself can exit 0: a diagnostic that correctly
+// reports a disabled API is not a failed command, and making it one is how every
+// message later gets ignored.
+func (s *setupSession) summarize(reported []actionReport) {
+	if len(reported) == 0 {
+		return
+	}
+	fmt.Fprintln(s.out, s.style.heading("\nSome actions did not complete"))
+	for _, r := range reported {
+		line := fmt.Sprintf("  %s: %s", r.action, r.outcome)
+		if r.outcome == outcomeCrashed || r.outcome == outcomeTimedOut {
+			fmt.Fprintln(s.out, s.style.Crashf("%s", line))
+			continue
+		}
+		fmt.Fprintln(s.out, s.style.Failf("%s", line))
+	}
+	fmt.Fprintln(s.out, s.style.Mutedf("  run 'piccolo integration status' for what is in place now, or rerun an action from the menu"))
 }
 
 // setupSession carries the wiring an interactive flow needs, so the loop body
@@ -822,6 +921,7 @@ type setupSession struct {
 	runner          integrationRunner
 	layout          workspace.Layout
 	out             io.Writer
+	style           styler
 	integrationName string
 	// description is the integration's own line, shown under the menu title so
 	// Piccolo never has to describe a provider it does not know.
@@ -983,7 +1083,7 @@ func inputsFor(action picintegration.Action, state picintegration.State) []picin
 // runAction executes one chosen action. `state` is the same snapshot the menu was
 // built from, so availability and the values shown for pre-fill come from one read
 // per iteration — no window where the two disagree, and no extra container start.
-func (s *setupSession) runAction(ctx context.Context, entry *menuEntry, state picintegration.State) (json.RawMessage, error) {
+func (s *setupSession) runAction(ctx context.Context, entry *menuEntry, state picintegration.State) (*actionReport, error) {
 	action := entry.Action
 	inputs := inputsFor(action, state)
 	values, err := renderActionInputs(action, inputs, state, s.hostStateDir, s.contState, s.tty)
@@ -1028,7 +1128,9 @@ func (s *setupSession) runAction(ctx context.Context, entry *menuEntry, state pi
 	onEvent := func(ev picintegration.Event) {
 		switch ev.Type {
 		case picintegration.EventStep:
-			fmt.Fprintf(s.out, "  [%s] %s: %s\n", ev.Status, ev.ID, ev.Message)
+			// The colour follows ev.Status (protocol data), never the message text:
+			// a reported failure is amber, and only Piccolo's own faults go red.
+			fmt.Fprintf(s.out, "  %s\n", s.style.severity(ev.Status, fmt.Sprintf("[%s] %s: %s", ev.Status, ev.ID, ev.Message)))
 		case picintegration.EventOpenURL:
 			fmt.Fprintf(s.out, "\n%s\n", host.browserHint(ev.URL))
 			if host.shouldLaunchBrowser() {
@@ -1067,7 +1169,7 @@ func (s *setupSession) runAction(ctx context.Context, entry *menuEntry, state pi
 				cancelAct()
 			}
 		case picintegration.EventError:
-			fmt.Fprintf(s.out, "  x %s\n", ev.Message)
+			fmt.Fprintln(s.out, s.style.Failf("  x %s", ev.Message))
 			if ev.Remediation != "" {
 				fmt.Fprintf(s.out, "    -> %s\n", ev.Remediation)
 			}
@@ -1077,24 +1179,46 @@ func (s *setupSession) runAction(ctx context.Context, entry *menuEntry, state pi
 		}
 	}
 
-	reader, err := runIntegrationAction(actCtx, s.runner, integrationCallRequest{
+	reader, outcome, err := runIntegrationAction(actCtx, s.runner, integrationCallRequest{
 		Answers:   answers,
 		Container: spec.Name,
 		Spec:      spec,
 	}, s.out, onEvent)
-	if courierErr != nil {
-		// A cancel is a decision the user made, not a fault: say what happened and
-		// what state we are in, instead of leaking "context canceled".
-		return nil, errors.New(courierFailureNote(courierErr))
-	}
 	if err != nil {
+		// Piccolo could not run the action at all (container, daemon, transport).
+		// That is the one class of failure that still ends the session, because
+		// nothing sensible can be redrawn without a working daemon.
 		return nil, err
 	}
-	res := reader.Result()
-	if res == nil || res.Result == nil {
-		return nil, nil
+	if courierErr != nil && outcome == outcomeSucceeded {
+		outcome = outcomeReported
 	}
-	return res.Result.ConfigPatch, nil
+	rep := &actionReport{action: action.ID, outcome: outcome}
+	switch outcome {
+	case outcomeCancelled, outcomeTimedOut:
+		// Piccolo ended this attempt; saying "failed" here would teach the user to
+		// distrust the message.
+		note := courierErr
+		if note == nil {
+			if outcome == outcomeTimedOut {
+				note = context.DeadlineExceeded
+			} else {
+				note = context.Canceled
+			}
+		}
+		fmt.Fprintln(s.out, s.style.Mutedf("  %s", courierFailureNote(note)))
+	case outcomeCrashed:
+		fmt.Fprintln(s.out, s.style.Crashf("  x %s exited without reporting a result", action.ID))
+		fmt.Fprintln(s.out, "    it may have partially applied changes; the menu below reflects what is on disk now")
+	case outcomeReported:
+		// Already rendered from the event stream, with remediation.
+	}
+	if outcome == outcomeSucceeded {
+		if res := reader.Result(); res != nil && res.Result != nil {
+			rep.patch = res.Result.ConfigPatch
+		}
+	}
+	return rep, nil
 }
 
 // actionContainerName keeps one deterministic name per integration+action so an

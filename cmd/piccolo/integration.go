@@ -614,6 +614,16 @@ func renderIntegrationStatuses(out io.Writer, results []picintegration.StatusRes
 			if check.Remediation != "" {
 				fmt.Fprintf(out, "       %s\n", check.Remediation)
 			}
+			// The link was already parsed from the payload and printed by the
+			// setup flow; status silently dropped it, so a provider-supplied fix
+			// ("Enable it at <url>") arrived as prose the user must search for.
+			if check.RemediationURL != "" {
+				label := strings.TrimSpace(check.RemediationLabel)
+				if label == "" {
+					label = "More info"
+				}
+				fmt.Fprintf(out, "       %s: %s\n", label, check.RemediationURL)
+			}
 		}
 	}
 }

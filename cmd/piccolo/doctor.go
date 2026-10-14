@@ -29,8 +29,9 @@ func newDoctorCmd() *cobra.Command {
 				Engine:    docker.New(),
 			})
 			out := cmd.OutOrStdout()
+			style := newStyler(out)
 			for _, r := range results {
-				fmt.Fprintf(out, "%s %s\n", r.Status, r.Message)
+				fmt.Fprintf(out, "%s %s\n", style.doctorStatus(r.Status.String()), r.Message)
 			}
 			if doctor.Failed(results) {
 				cmd.SilenceErrors = true

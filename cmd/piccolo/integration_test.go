@@ -804,3 +804,27 @@ func TestExtractIntegrationArchiveIgnoresPackagingJunk(t *testing.T) {
 		t.Errorf("commands = %v, want only the real binary", commands)
 	}
 }
+
+// A remediation link that is parsed and never printed is worse than no field: the
+// integration did its job and Piccolo dropped the actionable half.
+func TestRenderStatusesPrintsRemediationLink(t *testing.T) {
+	var out bytes.Buffer
+	renderIntegrationStatuses(&out, []picintegration.StatusResult{{
+		Name: "gws", Status: "fail", Summary: "1 of 3 services unreachable",
+		Checks: []picintegration.StatusCheck{{
+			ID: "drive", Label: "Drive", Status: "fail",
+			Message:          "Google Drive API has not been used in project 192902532576",
+			Remediation:      "Enable the service in your Google Cloud project.",
+			RemediationLabel: "Open the API in Google Cloud Console",
+			RemediationURL:   "https://console.developers.google.com/apis/api/drive.googleapis.com/overview?project=192902532576",
+		}},
+	}})
+	got := out.String()
+	if !strings.Contains(got, "Open the API in Google Cloud Console: https://console.developers.google.com/apis/api/drive.googleapis.com") {
+		t.Errorf("remediation link dropped:\n%s", got)
+	}
+	// The prose must still be there: colour and links are emphasis, not meaning.
+	if !strings.Contains(got, "Enable the service in your Google Cloud project.") {
+		t.Errorf("remediation text lost:\n%s", got)
+	}
+}

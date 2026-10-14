@@ -676,7 +676,7 @@ func TestRunIntegrationActionTearsDownOnCancel(t *testing.T) {
 	}()
 
 	start := time.Now()
-	_, err := runIntegrationAction(ctx, runner, integrationCallRequest{
+	_, outcome, err := runIntegrationAction(ctx, runner, integrationCallRequest{
 		Answers:   []byte("{}"),
 		Container: "piccolo-setup-gws-login",
 		Spec:      docker.Spec{Name: "piccolo-setup-gws-login"},
@@ -684,11 +684,13 @@ func TestRunIntegrationActionTearsDownOnCancel(t *testing.T) {
 	if time.Since(start) > 10*time.Second {
 		t.Fatalf("cancel did not unblock the action (took %s)", time.Since(start))
 	}
-	if err == nil || !strings.Contains(err.Error(), "interrupted") {
-		t.Fatalf("expected an interrupt error, got %v", err)
+	// A cancel Piccolo initiated is not an error: it is an outcome, and the menu
+	// has to survive it so the user can retry the login.
+	if err != nil {
+		t.Fatalf("a user cancel must not surface as an error: %v", err)
 	}
-	if !strings.Contains(err.Error(), "stopped and removed") {
-		t.Fatalf("error must state that cleanup ran: %v", err)
+	if outcome != outcomeCancelled {
+		t.Fatalf("outcome = %v, want cancelled", outcome)
 	}
 	if proc.shutdowns == 0 {
 		t.Fatal("container was never shut down: Ctrl-C would leak it")
@@ -703,12 +705,15 @@ func TestRunIntegrationActionTearsDownOnDeadline(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancel()
 
-	_, err := runIntegrationAction(ctx, runner, integrationCallRequest{
+	_, outcome, err := runIntegrationAction(ctx, runner, integrationCallRequest{
 		Answers: []byte("{}"),
 		Spec:    docker.Spec{},
 	}, io.Discard, nil)
-	if err == nil || !strings.Contains(err.Error(), "time budget") {
-		t.Fatalf("expected a budget error, got %v", err)
+	if err != nil {
+		t.Fatalf("a timeout must not surface as an error: %v", err)
+	}
+	if outcome != outcomeTimedOut {
+		t.Fatalf("outcome = %v, want timed out", outcome)
 	}
 	if proc.shutdowns == 0 {
 		t.Fatal("timed-out action must still be stopped and removed")
@@ -808,5 +813,92 @@ func TestWaitRedirectHelpIsProviderNeutralAndSaysHowToAbort(t *testing.T) {
 	}
 	if !strings.Contains(joined, "ctrl-c") {
 		t.Errorf("the only way out of a browser wait must be stated: %q", joined)
+	}
+}
+
+// The distinction the whole resilience design rests on: a non-zero exit after an
+// `error` event is a report, and a non-zero exit in silence is a death. Keying on
+// the exit code alone would end the menu on the first and trust the second.
+func TestClassifyActionRanksEventAboveExitCode(t *testing.T) {
+	reported := &picintegration.Event{Type: picintegration.EventError, Code: "connectivity_failed"}
+	cases := []struct {
+		name     string
+		errEvent *picintegration.Event
+		exit     int
+		ctxErr   error
+		want     actionOutcome
+	}{
+		{"clean success", nil, 0, nil, outcomeSucceeded},
+		{"reported failure with non-zero exit", reported, 11, nil, outcomeReported},
+		{"reported failure that exited zero", reported, 0, nil, outcomeReported},
+		{"silent non-zero exit is a crash", nil, 101, nil, outcomeCrashed},
+		{"user cancel outranks everything", nil, -1, context.Canceled, outcomeCancelled},
+		{"timeout is not a crash", nil, -1, context.DeadlineExceeded, outcomeTimedOut},
+		{"cancel wins over a report we did receive", reported, 11, context.Canceled, outcomeCancelled},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := classifyAction(tc.errEvent, tc.exit, tc.ctxErr); got != tc.want {
+				t.Errorf("classifyAction(%v, %d, %v) = %v, want %v", tc.errEvent, tc.exit, tc.ctxErr, got, tc.want)
+			}
+		})
+	}
+}
+
+// A cancel is the user's own decision; putting it in a summary next to real
+// failures would make the summary lie about the session.
+func TestOutcomeTerminalExcludesCancel(t *testing.T) {
+	if outcomeCancelled.terminal() {
+		t.Error("a cancel the user chose must not appear as an unfinished action")
+	}
+	for _, o := range []actionOutcome{outcomeReported, outcomeCrashed, outcomeTimedOut} {
+		if !o.terminal() {
+			t.Errorf("%v must appear in the closing summary", o)
+		}
+	}
+	if outcomeSucceeded.terminal() {
+		t.Error("success belongs in no failure summary")
+	}
+}
+
+// Colour is emphasis, never the message: the text marker must survive every
+// disabled or enabled state, or a piped log loses the meaning.
+func TestStylerKeepsTextMarkersWhenColourIsOff(t *testing.T) {
+	off := styler{} // non-terminal writers get this
+	for _, tc := range []struct{ status, text string }{
+		{"fail", "[fail] drive: API not enabled"},
+		{"ok", "[ok] login: authorized"},
+	} {
+		if got := off.severity(tc.status, tc.text); got != tc.text {
+			t.Errorf("disabled styler altered the text: %q", got)
+		}
+		if got := off.Failf("x %s", "bad"); got != "x bad" {
+			t.Errorf("Failf must be plain without a terminal: %q", got)
+		}
+	}
+	on := styler{enabled: true}
+	got := on.severity("fail", "[fail] x")
+	// The text marker must survive *inside* the styling, never replace it.
+	if !strings.Contains(got, "[fail] x") {
+		t.Errorf("styling dropped the text marker: %q", got)
+	}
+	if !strings.HasPrefix(got, "\x1b[31m") || !strings.HasSuffix(got, "\x1b[0m") {
+		t.Errorf("fail must be coloured and reset: %q", got)
+	}
+	if on.severity("fail", "same") == on.severity("ok", "same") {
+		t.Error("fail and ok must not render identically when colour is on")
+	}
+}
+
+// newStyler must key on the writer, not on a global: tests and pipes get plain
+// text, a terminal gets colour, and NO_COLOR wins over both.
+func TestNewStylerOnlyColoursRealTerminals(t *testing.T) {
+	var buf bytes.Buffer
+	if s := newStyler(&buf); s.enabled {
+		t.Error("a buffer is not a terminal")
+	}
+	t.Setenv("NO_COLOR", "1")
+	if s := newStyler(os.Stdout); s.enabled {
+		t.Error("NO_COLOR must disable colour")
 	}
 }
