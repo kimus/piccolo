@@ -371,7 +371,16 @@ The build uses the configured pinned PicoClaw image as its base, generates a tem
 
 **The toolchain is baked into the image.** Nothing installs when the gateway starts, and Piccolo binds nothing over `/nix`. That is the fix for a failure mode that was silent and total: mounting the workspace Nix cache over `/nix` hid the image's own store (1464 entries in the image, 68 visible in the running container), so `gws`, `piccolo-gws`, `python3` and `jq` existed on `PATH` and still could not execute — the integration worked when Piccolo configured it and failed when Piccolo ran it.
 
-The cost is disk, and it is measured rather than estimated: with the default package list the runtime image goes from **440 MB to about 8.3 GB**, and the toolchain layer alone is **5.78 GB** (libreoffice, ffmpeg, imagemagick and tesseract dominate). Two things keep that from being worse: the layer is gc-rooted and pruned in place (collection recovered ~30 MB, because the closure genuinely is that size), and layer digests are shared across tags, so rebuilding for an integration change does not pay for it again. Trim `runtime.toolchain.packages` if the full office/media set is not needed.
+The cost is disk, and it is measured rather than assumed: with the default package list the runtime image goes from **440 MB to about 8.3 GB**, and the toolchain layer alone is **5.78 GB** (libreoffice, ffmpeg, imagemagick and tesseract dominate). Two things keep that from being worse: the layer is gc-rooted and pruned in place (collection recovered ~30 MB, because the closure genuinely is that size), and layer digests are shared across tags, so rebuilding for an integration change does not pay for it again — a `0.3.1 → 0.3.2` upgrade rebuilt in ~40s with the toolchain layer reporting `Using cache`. Trim `runtime.toolchain.packages` if the full office/media set is not needed.
+
+**Old images accumulate and Piccolo never deletes them.** Every distinct toolchain/integration/base configuration is a new ~8 GB tag, and the rollback slot (`container.previous_image`) deliberately keeps an older one reachable. Check what you have and reclaim what is not referenced:
+
+```sh
+docker images --format '{{.Repository}}:{{.Tag}} {{.Size}}' | grep picoclaw-runtime
+docker image prune          # dangling only; never removes a tagged image
+```
+
+Do not remove the tag `piccolo status` reports as `rollback:` unless you give up that rollback.
 
 ```yaml
 runtime:
