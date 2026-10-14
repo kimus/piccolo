@@ -19,9 +19,13 @@ const SchemaV1 = "piccolo.integration.v1"
 // unknown fields, and presence of Actions selects the declarative setup path,
 // so the schema identifier is never bumped.
 type Descriptor struct {
-	Schema        string                 `json:"schema"`
-	Name          string                 `json:"name"`
-	DisplayName   string                 `json:"displayName,omitempty"`
+	Schema      string `json:"schema"`
+	Name        string `json:"name"`
+	DisplayName string `json:"displayName,omitempty"`
+	// Description is the integration's own one-line explanation of what it does.
+	// Piccolo shows it in the setup menu: the alternative is Piccolo inventing
+	// provider-specific copy for a generic screen, which it used to do.
+	Description   string                 `json:"description,omitempty"`
 	Commands      CommandList            `json:"commands,omitempty"`
 	CommandSpecs  map[string]CommandSpec `json:"-"`
 	Setup         SetupDescriptor        `json:"setup"`

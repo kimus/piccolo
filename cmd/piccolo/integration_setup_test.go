@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -711,5 +712,94 @@ func TestRunIntegrationActionTearsDownOnDeadline(t *testing.T) {
 	}
 	if proc.shutdowns == 0 {
 		t.Fatal("timed-out action must still be stopped and removed")
+	}
+}
+
+// The menu has to say which client an action will use. A pre-filled field that is
+// silently being kept is how a user ends up authorizing a stale client while
+// believing they replaced it — so the summary exists, and it must not be able to
+// carry a secret.
+func TestStoredSummaryNamesWhatIsKeptWithoutTouchingSecrets(t *testing.T) {
+	actions := []picintegration.Action{{
+		ID: "set_credentials",
+		Inputs: []picintegration.ActionInput{
+			{Key: "client_id", Type: "text", Required: true},
+			{Key: "client_secret", Type: "secret", Sensitive: true, Required: true},
+			{Key: "project_id", Type: "text"},
+		},
+	}}
+	state := picintegration.State{Values: map[string]picintegration.FieldState{
+		"client_id":     {Value: "192902532576-hq1abcdefghij01234567890.apps.googleusercontent.com", Set: true},
+		"client_secret": {Set: true},
+		"project_id":    {Value: "192902532576", Set: true},
+	}}
+
+	got := storedSummary(actions, state)
+	// The distinguishing part of a client ID is what comes after the project
+	// number; a summary that cuts it off identifies nothing.
+	if !strings.Contains(got, "client_id=192902532576-hq1") {
+		t.Errorf("summary must identify WHICH client will be used: %q", got)
+	}
+	if !strings.Contains(got, "project_id=192902532576") {
+		t.Errorf("summary lost a non-secret value: %q", got)
+	}
+	if strings.Contains(got, "client_secret") {
+		t.Errorf("a sensitive key must never appear in the summary: %q", got)
+	}
+	if len(got) > 120 {
+		t.Errorf("summary should stay short enough to sit under a menu: %d chars %q", len(got), got)
+	}
+
+	// Nothing stored → no line at all, rather than "stored:" with nothing after it.
+	if s := storedSummary(actions, picintegration.State{}); s != "" {
+		t.Errorf("empty state should produce no summary, got %q", s)
+	}
+}
+
+func TestElideKeepsEndsVisible(t *testing.T) {
+	long := "192902532576-hq1abcdefghij01234567890.apps.googleusercontent.com"
+	got := elide(long)
+	if !strings.HasPrefix(got, "192902532576") || !strings.HasSuffix(got, "com") && !strings.Contains(got, "oogle") {
+		t.Errorf("elided value must stay recognizable: %q", got)
+	}
+	if len([]rune(got)) > 27 {
+		t.Errorf("elided value too long: %q", got)
+	}
+	if elide("short") != "short" {
+		t.Error("short values must pass through")
+	}
+}
+
+// A cancel and a timeout are different events with different remedies, and neither
+// should surface as a Go error string.
+func TestCourierFailureNoteSeparatesCancelFromTimeout(t *testing.T) {
+	cancelled := courierFailureNote(context.Canceled)
+	if !strings.Contains(cancelled, "cancelled") || strings.Contains(cancelled, "context canceled") {
+		t.Errorf("cancel should read as the user's decision: %q", cancelled)
+	}
+	if !strings.Contains(cancelled, "nothing was changed") {
+		t.Errorf("cancel must state that nothing was saved: %q", cancelled)
+	}
+	timed := courierFailureNote(context.DeadlineExceeded)
+	if !strings.Contains(timed, "timed out") || !strings.Contains(timed, "nothing was changed") {
+		t.Errorf("timeout should say so and confirm nothing was saved: %q", timed)
+	}
+	other := courierFailureNote(errors.New("bind: address already in use"))
+	if !strings.Contains(other, "address already in use") {
+		t.Errorf("real faults must still be visible: %q", other)
+	}
+}
+
+// The wait screen is Piccolo's generic one: it must not name one provider's
+// console, and it must say how to get out — esc does nothing once no form is up.
+func TestWaitRedirectHelpIsProviderNeutralAndSaysHowToAbort(t *testing.T) {
+	joined := strings.Join(waitRedirectHelp, " ")
+	for _, banned := range []string{"Google", "gcloud", "Firebase"} {
+		if strings.Contains(joined, banned) {
+			t.Errorf("generic wait screen must not name a provider (%s): %q", banned, joined)
+		}
+	}
+	if !strings.Contains(joined, "ctrl-c") {
+		t.Errorf("the only way out of a browser wait must be stated: %q", joined)
 	}
 }

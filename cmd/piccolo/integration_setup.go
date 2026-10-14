@@ -337,6 +337,28 @@ func relayCallbackIntoContainer(ctx context.Context, runner integrationRunner, c
 	return nil
 }
 
+// waitRedirectHelp is provider-neutral on purpose: this is Piccolo's generic
+// wait screen, and naming one provider's console in it teaches users nothing who
+// are setting up a different integration.
+var waitRedirectHelp = []string{
+	"this port changes every attempt — do not register it with your provider;",
+	"a native/desktop client needs no registered redirect URI at all.",
+	"press ctrl-c to give up (esc does nothing here: no form is on screen).",
+}
+
+// courierFailureNote turns the two ways a browser wait ends badly into something a
+// user can act on. They are different problems: one is a decision, one is a clock.
+func courierFailureNote(err error) string {
+	switch {
+	case errors.Is(err, context.Canceled):
+		return "cancelled — the browser flow was abandoned and nothing was changed"
+	case errors.Is(err, context.DeadlineExceeded):
+		return fmt.Sprintf("timed out after %s — the browser flow never completed; nothing was changed", actionWaitBudget)
+	default:
+		return fmt.Sprintf("browser authorization did not complete: %v", err)
+	}
+}
+
 // errActionAborted signals that the user backed out of a rendered form. It is not
 // a failure: nothing is saved for that action, no container starts, and the menu
 // redraws — while a configuration proposal earned by an already-completed action
@@ -415,6 +437,11 @@ func renderActionInputs(action picintegration.Action, inputs []picintegration.Ac
 				if current.Set {
 					field = field.Description("Already set. Press enter to keep it, or type a value to replace it.")
 				}
+			} else if current.Value != "" {
+				// A pre-filled visible field is otherwise silent about the fact
+				// that pressing enter means KEEP. That silence is how a user ends
+				// up authorizing a stale client while believing they replaced it.
+				field = field.Description(fmt.Sprintf("Currently: %s — press enter to keep it, or edit to replace it.", elide(current.Value)))
 			}
 			if in.Required {
 				field = field.Validate(requiredValidator(in, h.blankKeeps))
@@ -721,6 +748,7 @@ func runDeclarativeSetup(ctx context.Context, out io.Writer, runner integrationR
 		layout:          layout,
 		out:             out,
 		integrationName: found.Name,
+		description:     strings.TrimSpace(desc.Description),
 		setupCommand:    found.SetupCommand,
 		hostStateDir:    layout.Integration(rel),
 		contState:       "/root/.piccolo/integrations/" + rel,
@@ -757,7 +785,7 @@ func runDeclarativeSetup(ctx context.Context, out io.Writer, runner integrationR
 		if len(menu) == 0 {
 			return fmt.Errorf("integration declares no usable setup actions")
 		}
-		chosen, done, err := s.chooseAction(displayIntegration(*found), menu)
+		chosen, done, err := s.chooseAction(displayIntegration(*found), menu, state)
 		if err != nil {
 			if errors.Is(err, huh.ErrUserAborted) {
 				// Quitting from the menu abandons the run: a proposal from a completed
@@ -795,13 +823,16 @@ type setupSession struct {
 	layout          workspace.Layout
 	out             io.Writer
 	integrationName string
-	stateArgv       []string
-	setupCommand    []string
-	specBase        docker.Spec
-	hostStateDir    string
-	contState       string
-	tty             bool
-	env             []string
+	// description is the integration's own line, shown under the menu title so
+	// Piccolo never has to describe a provider it does not know.
+	description  string
+	stateArgv    []string
+	setupCommand []string
+	specBase     docker.Spec
+	hostStateDir string
+	contState    string
+	tty          bool
+	env          []string
 }
 
 func (s *setupSession) state(ctx context.Context) (picintegration.State, error) {
@@ -822,7 +853,66 @@ func (s *setupSession) state(ctx context.Context) (picintegration.State, error) 
 
 func (s *setupSession) name() string { return s.integrationName }
 
-func (s *setupSession) chooseAction(title string, menu []menuEntry) (*menuEntry, bool, error) {
+// storedSummary names what is already on disk, so a user can see which client an
+// action is about to use BEFORE the browser opens. Without it, a pre-filled field
+// that is being kept silently is indistinguishable from one that was just typed —
+// which is exactly how a login ended up authorizing a stale client while the user
+// believed they had replaced it.
+//
+// Keys belonging to sensitive inputs are skipped outright. The protocol already
+// refuses to send secret values, and the display layer should not be the thing
+// that notices if an integration ever breaks that rule.
+func storedSummary(actions []picintegration.Action, state picintegration.State) string {
+	sensitive := map[string]bool{}
+	for _, a := range actions {
+		for _, in := range a.Inputs {
+			if in.SensitiveInput() {
+				sensitive[in.Key] = true
+			}
+		}
+	}
+	keys := make([]string, 0, len(state.Values))
+	for k, v := range state.Values {
+		if v.Set && v.Value != "" && !sensitive[k] {
+			keys = append(keys, k)
+		}
+	}
+	if len(keys) == 0 {
+		return ""
+	}
+	sort.Strings(keys)
+	parts := make([]string, 0, len(keys))
+	for _, k := range keys {
+		parts = append(parts, k+"="+elide(state.Values[k].Value))
+	}
+	return "stored: " + strings.Join(parts, "  ")
+}
+
+// elide shortens a stored value for display while keeping the part that
+// distinguishes it. Truncating both ends was the first attempt (12 + "…" + 6), and
+// it failed the only case that matters: two OAuth clients in the same project share
+// their first twelve characters, so both rendered as "192902532576…nt.com" — a
+// summary that looks informative and identifies nothing. Keep the head instead,
+// which is where the distinguishing part of a client ID lives.
+func elide(v string) string {
+	r := []rune(strings.TrimSpace(v))
+	if len(r) <= 26 {
+		return string(r)
+	}
+	return string(r[:26]) + "…"
+}
+
+// menuActions flattens the menu rows back into their declared actions, so display
+// helpers can reason about input sensitivity without re-deriving the menu.
+func menuActions(menu []menuEntry) []picintegration.Action {
+	out := make([]picintegration.Action, 0, len(menu))
+	for _, e := range menu {
+		out = append(out, e.Action)
+	}
+	return out
+}
+
+func (s *setupSession) chooseAction(title string, menu []menuEntry, state picintegration.State) (*menuEntry, bool, error) {
 	// Available actions come first so the user sees what is left to do; gated
 	// ones sink to the bottom with their reason, still visible and explanatory.
 	order := make([]int, 0, len(menu))
@@ -845,13 +935,22 @@ func (s *setupSession) chooseAction(title string, menu []menuEntry) (*menuEntry,
 	labels = append(labels, doneLabel)
 	indexes = append(indexes, -1)
 	var pick string
-	form := huh.NewForm(huh.NewGroup(
-		huh.NewSelect[string]().
-			Title(title + " — what do you want to do?").
-			Description("Credentials identify the app; login authorizes your Google account.").
-			Options(huh.NewOptions(labels...)...).
-			Value(&pick),
-	))
+	subtitle := s.description
+	if stored := storedSummary(menuActions(menu), state); stored != "" {
+		if subtitle != "" {
+			subtitle += "  ·  " + stored
+		} else {
+			subtitle = stored
+		}
+	}
+	selectField := huh.NewSelect[string]().
+		Title(title + " — what do you want to do?").
+		Options(huh.NewOptions(labels...)...).
+		Value(&pick)
+	if subtitle != "" {
+		selectField = selectField.Description(subtitle)
+	}
+	form := huh.NewForm(huh.NewGroup(selectField))
 	if err := form.Run(); err != nil {
 		return nil, false, err
 	}
@@ -953,8 +1052,9 @@ func (s *setupSession) runAction(ctx context.Context, entry *menuEntry, state pi
 			// impossible to keep working. A user who feels the need to add it is
 			// holding a Web-application client, which is the wrong type.
 			fmt.Fprintf(s.out, "  callback: %s (Piccolo is listening; nothing to open here)\n", c.callbackAddr())
-			fmt.Fprintf(s.out, "            this port changes every attempt — do not add it to Google's redirect URIs;\n")
-			fmt.Fprintf(s.out, "            a Desktop app client needs no registered redirect URI at all.\n")
+			for _, line := range waitRedirectHelp {
+				fmt.Fprintf(s.out, "            %s\n", line)
+			}
 			relay := func(rctx context.Context, q string) error {
 				return relayCallbackIntoContainer(rctx, s.runner, spec.Name, port, q)
 			}
@@ -983,7 +1083,9 @@ func (s *setupSession) runAction(ctx context.Context, entry *menuEntry, state pi
 		Spec:      spec,
 	}, s.out, onEvent)
 	if courierErr != nil {
-		return nil, fmt.Errorf("browser authorization did not complete: %w", courierErr)
+		// A cancel is a decision the user made, not a fault: say what happened and
+		// what state we are in, instead of leaking "context canceled".
+		return nil, errors.New(courierFailureNote(courierErr))
 	}
 	if err != nil {
 		return nil, err
