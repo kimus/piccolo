@@ -192,7 +192,7 @@ Containerized integrations are self-describing packages baked into the gateway i
 
 ```sh
 piccolo integration add kimus/piccolo-gws          # latest release
-piccolo integration add kimus/piccolo-gws@3.1.0   # exact release tag/selector
+piccolo integration add kimus/piccolo-gws@0.3.4   # exact release tag/selector
 piccolo integration add kimus/piccolo-gws --force # rebuild even if unchanged
 piccolo integration setup kimus/piccolo-gws
 piccolo restart
@@ -217,7 +217,7 @@ $ piccolo integration add kimus/piccolo-gws --yes
 
 When something *would* change, the confirmation lists it first — resolved version, artifact name and digest, base image, toolchain packages, and which integrations are unaffected — because the prompt previously asked "install or update?" with no information at all. Only after a yes does Piccolo download the (multi-megabyte) artifact and build. `--force` overrides the short-circuit; `--yes` skips the prompt but not the check.
 
-Package refs use `[provider:]owner/repo[@selector]`; the default provider is GitHub. Short aliases such as `gws` are not supported. The selector is provider/repository-owned and opaque, so `kimus/piccolo-gws@3.1.0` and `johndoe/piccolo-maker@v2.1.10` are both valid if those GitHub Release tags exist.
+Package refs use `[provider:]owner/repo[@selector]`; the default provider is GitHub. Short aliases such as `gws` are not supported. The selector is provider/repository-owned and opaque, so `kimus/piccolo-gws@0.3.4` and `johndoe/piccolo-maker@v2.1.10` are both valid if those GitHub Release tags exist.
 
 `add` installs or updates the selected release artifact, verifies its digest from `piccolo-integration-release.json`, runs the installed binary's `describe --json` in a container, and records Piccolo-owned integration metadata in `piccolo.yaml`. It preserves state and does **not** patch provider-specific `config.json` entries.
 
