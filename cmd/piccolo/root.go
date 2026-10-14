@@ -18,7 +18,7 @@ var dirFlag string
 // stale local binary has actually confused real usage: the running ./piccolo can
 // be older than the source it was built from.
 var (
-	version   = "0.1.0-poc"
+	version   = "0.2.0-dev"
 	buildDate = "unknown"
 )
 

@@ -76,8 +76,8 @@ Manual installs can download a release archive and `checksums.txt` from GitHub R
 `piccolo --version` reports the build date so a stale local binary is obvious:
 
 ```text
-piccolo version 0.1.1 (built 2026-10-14T12:00:18Z, go1.26.5)   # stamped release build
-piccolo version 0.1.0-poc (dev build, not stamped; ...)          # plain `go build`
+piccolo version 0.2.0 (built 2026-10-14T12:00:18Z, go1.26.5)   # stamped release build
+piccolo version 0.2.0-dev (dev build, not stamped; ...)          # plain `go build`
 ```
 - A reachable Docker daemon (Docker Desktop, colima, podman socket, ...). The `docker` CLI is **not** required — Piccolo talks to the daemon through the Docker Go SDK.
 
