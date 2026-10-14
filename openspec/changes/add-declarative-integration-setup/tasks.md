@@ -54,17 +54,17 @@
 
 ## 7. Piccolo-owned config application
 
-- [ ] 7.1 Define a fixed in-code allowlist for integration patches limited to the integration's own MCP server entry
-- [ ] 7.2 Validate a proposed patch against the allowlist before touching the file, refusing out-of-scope paths and naming them
+- [x] 7.1 Define a fixed in-code allowlist for integration patches limited to the integration's own MCP server entry
+- [x] 7.2 Validate a proposed patch against the allowlist before touching the file, refusing out-of-scope paths and naming them
 - [ ] 7.3 Apply accepted patches through the existing diff preview, confirmation, `config.json.bak` backup, and atomic write
 - [ ] 7.4 Make Piccolo the only writer of `config.json` for integration flows
-- [ ] 7.5 Never read, parse, or modify integration-owned state files
+- [x] 7.5 Never read, parse, or modify integration-owned state files
 
 ## 8. Verification
 
-- [ ] 8.1 Unit-test descriptor action parsing: valid, unknown role, unknown field, unknown input type, bad `requires` key
-- [ ] 8.2 Unit-test event parsing for each event type plus malformed lines
-- [ ] 8.3 Unit-test the allowlist refusal of an out-of-scope patch and acceptance of the MCP entry
+- [x] 8.1 Unit-test descriptor action parsing: valid, unknown role, unknown field, unknown input type, bad `requires` key
+- [x] 8.2 Unit-test event parsing for each event type plus malformed lines
+- [x] 8.3 Unit-test the allowlist refusal of an out-of-scope patch and acceptance of the MCP entry
 - [ ] 8.4 Test that answers never appear in container spec argv/env
 - [ ] 8.5 Test file staging: destination, mode `0600`, overwrite confirmation, container-path rewrite, rejection cases
 - [ ] 8.6 Test the courier: port derived from URL, single-request close, loopback-only, relay payload untouched
