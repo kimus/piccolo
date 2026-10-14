@@ -756,17 +756,24 @@ func TestStoredSummaryNamesWhatIsKeptWithoutTouchingSecrets(t *testing.T) {
 	}
 }
 
-func TestElideKeepsEndsVisible(t *testing.T) {
-	long := "192902532576-hq1abcdefghij01234567890.apps.googleusercontent.com"
-	got := elide(long)
-	if !strings.HasPrefix(got, "192902532576") || !strings.HasSuffix(got, "com") && !strings.Contains(got, "oogle") {
-		t.Errorf("elided value must stay recognizable: %q", got)
+// A summary exists to tell two clients of the same project apart, so the head is
+// the part that must survive and the fixed domain suffix is the part that may go.
+func TestElideKeepsTheDistinguishingHead(t *testing.T) {
+	a := elide("192902532576-hq1abcdefghij01234567890.apps.googleusercontent.com")
+	b := elide("192902532576-hegpu7ris5fpk53m75jkmerlj2o3e72b.apps.googleusercontent.com")
+	if a == b {
+		t.Fatalf("two different clients elided to the same string: %q == %q", a, b)
 	}
-	if len([]rune(got)) > 27 {
-		t.Errorf("elided value too long: %q", got)
+	for _, got := range []string{a, b} {
+		if !strings.HasPrefix(got, "192902532576-h") {
+			t.Errorf("must keep the project and the start of the client hash: %q", got)
+		}
+		if len([]rune(got)) > 27 {
+			t.Errorf("elided value too long for a menu line: %q", got)
+		}
 	}
-	if elide("short") != "short" {
-		t.Error("short values must pass through")
+	if elide("short") != "short" || elide("  spaced  ") != "spaced" {
+		t.Error("short values must pass through, trimmed")
 	}
 }
 
