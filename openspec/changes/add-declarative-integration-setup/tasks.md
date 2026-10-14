@@ -101,3 +101,11 @@
 - [x] 11.2 Factor `actionArgv` so the ordering contract is directly unit-tested
 - [x] 11.3 Assert the same ordering for the `state` derivation
 - [x] 11.4 Remove `--force` from `integration build`: source builds have no resolved version, so a short-circuit (and its override) does not apply; the flag was previously accepted but inert
+
+## 12. Cross-repo contract coverage
+
+- [x] 12.1 Add a tagged integration contract test that runs the real integration binary in the built runtime image using Piccolo-derived argv
+- [x] 12.2 Assert `state` and every setup action id parse (clap usage errors fail the test; gated action failures do not)
+- [x] 12.3 Verify the test catches the original ordering bug (fails with "unexpected argument" when the flag precedes the subcommand)
+- [x] 12.4 Keep the default daemon-free `go test ./...` unaffected (build tag + skip without PICCOLO_CONTRACT_IMAGE)
+- [ ] 12.5 Follow-up: run it in CI (needs a job that builds a runtime image; deliberately not wired here to avoid introducing flaky CI)
