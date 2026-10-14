@@ -29,6 +29,10 @@ type Descriptor struct {
 	Metadata      map[string]string      `json:"metadata,omitempty"`
 	Actions       []Action               `json:"actions,omitempty"`
 	StateKeys     []string               `json:"stateKeys,omitempty"`
+	// MCPServerKey names the single tools.mcp.servers.<key> entry this
+	// integration may propose to manage. Absent means Piccolo falls back to the
+	// integration name.
+	MCPServerKey string `json:"mcpServerKey,omitempty"`
 }
 
 type CommandSpec struct {

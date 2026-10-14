@@ -1,12 +1,15 @@
 package main
 
 import (
+	"bytes"
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	picintegration "github.com/kimus/piccolo/internal/integration"
+	"github.com/kimus/piccolo/internal/manifest"
 )
 
 func TestBuildMenuGatesOnStateFacts(t *testing.T) {
@@ -217,5 +220,173 @@ func TestAnswersJSONHandlesQuotesInValues(t *testing.T) {
 	}
 	if !strings.Contains(string(data), `\"`) || !strings.Contains(string(data), `\\`) {
 		t.Fatalf("value not escaped: %s", data)
+	}
+}
+
+func descriptorJSON(actions string, extra ...string) string {
+	if actions == "" {
+		return `{"schema":"piccolo.integration.v1","name":"gws","displayName":"Google Workspace","commands":{"setup":{"command":"piccolo-gws","args":["setup","--config-dir","/root/.piccolo/integrations/kimus/piccolo-gws"]},"status":{"command":"piccolo-gws","args":["status"]}},"setup":{"command":["piccolo-gws","setup","--config-dir","/root/.piccolo/integrations/kimus/piccolo-gws"]}}`
+	}
+	body := `{"schema":"piccolo.integration.v1","name":"gws","displayName":"Google Workspace","mcpServerKey":"google_workspace","stateKeys":["credentials","login"],"commands":{"setup":{"command":"piccolo-gws","args":["setup","--config-dir","/root/.piccolo/integrations/kimus/piccolo-gws"]}},"setup":{"command":["piccolo-gws","setup","--config-dir","/root/.piccolo/integrations/kimus/piccolo-gws"]},"actions":[` + actions + `]}`
+	return body
+}
+
+// A declarative integration must be routed to the Piccolo-rendered path. In a
+// non-TTY environment that path refuses before rendering, which is itself the
+// proof it took the declarative branch rather than the legacy attach.
+func TestIntegrationSetupRoutesToDeclarativePath(t *testing.T) {
+	dir := t.TempDir()
+	writeIntegrationManifest(t, dir, []manifest.Integration{{
+		Package: "github:kimus/piccolo-gws", Source: "release", Name: "gws", DisplayName: "Google Workspace",
+		StatePath:         "integrations/kimus/piccolo-gws",
+		DescriptorCommand: []string{"piccolo-gws", "describe", "--json"},
+		SetupCommand:      []string{"piccolo-gws", "setup", "--config-dir", "/root/.piccolo/integrations/kimus/piccolo-gws"},
+	}})
+	desc := descriptorJSON(`{"id":"import","role":"setup","title":"Import credentials"}`)
+	fake := &fakeIntegrationRunner{stdouts: []string{desc}}
+	old := newIntegrationRunner
+	newIntegrationRunner = func() integrationRunner { return fake }
+	defer func() { newIntegrationRunner = old }()
+	oldDir := dirFlag
+	dirFlag = dir
+	defer func() { dirFlag = oldDir }()
+
+	var out bytes.Buffer
+	err := runIntegrationSetup(testCommand(&out), "kimus/piccolo-gws")
+	if err == nil || !strings.Contains(err.Error(), "interactive terminal") {
+		t.Fatalf("expected declarative-path terminal refusal, got %v", err)
+	}
+	if len(fake.runs) != 1 {
+		t.Fatalf("expected only the describe run, got %d: %#v", len(fake.runs), fake.runs)
+	}
+	if strings.Join(fake.runs[0].Command, " ") != "describe --json" {
+		t.Fatalf("first run should be describe, got %v", fake.runs[0].Command)
+	}
+}
+
+// An integration without actions must take the legacy TTY attach path unchanged.
+func TestIntegrationSetupLegacyWithoutActions(t *testing.T) {
+	dir := t.TempDir()
+	writeIntegrationManifest(t, dir, []manifest.Integration{{
+		Package: "github:kimus/piccolo-gws", Source: "release", Name: "gws", DisplayName: "Google Workspace",
+		StatePath:         "integrations/kimus/piccolo-gws",
+		DescriptorCommand: []string{"piccolo-gws", "describe", "--json"},
+		SetupCommand:      []string{"piccolo-gws", "setup", "--config-dir", "/root/.piccolo/integrations/kimus/piccolo-gws"},
+	}})
+	fake := &fakeIntegrationRunner{stdouts: []string{descriptorJSON(""), ""}}
+	old := newIntegrationRunner
+	newIntegrationRunner = func() integrationRunner { return fake }
+	defer func() { newIntegrationRunner = old }()
+	oldDir := dirFlag
+	dirFlag = dir
+	defer func() { dirFlag = oldDir }()
+
+	var out bytes.Buffer
+	if err := runIntegrationSetup(testCommand(&out), "kimus/piccolo-gws"); err != nil {
+		t.Fatalf("legacy setup should run to completion without a TTY: %v", err)
+	}
+	if len(fake.runs) != 2 {
+		t.Fatalf("expected describe + legacy setup runs, got %d", len(fake.runs))
+	}
+	if strings.Join(fake.runs[1].Command, " ") != "setup --config-dir /root/.piccolo/integrations/kimus/piccolo-gws" {
+		t.Fatalf("legacy command = %v", fake.runs[1].Command)
+	}
+	if fake.runs[1].TTY {
+		t.Fatal("legacy path must not request a PTY when the host has no terminal")
+	}
+	if !strings.Contains(out.String(), "Running setup for Google Workspace") {
+		t.Fatalf("legacy output = %q", out.String())
+	}
+}
+
+// A broken describe must not block a legacy integration from being set up.
+func TestIntegrationSetupSurvivesUnreadableDescriptor(t *testing.T) {
+	dir := t.TempDir()
+	writeIntegrationManifest(t, dir, []manifest.Integration{{
+		Package: "github:kimus/piccolo-gws", Source: "release", Name: "gws",
+		StatePath:         "integrations/kimus/piccolo-gws",
+		DescriptorCommand: []string{"piccolo-gws", "describe", "--json"},
+		SetupCommand:      []string{"piccolo-gws", "setup"},
+	}})
+	fake := &fakeIntegrationRunner{stdouts: []string{"not json at all", ""}}
+	old := newIntegrationRunner
+	newIntegrationRunner = func() integrationRunner { return fake }
+	defer func() { newIntegrationRunner = old }()
+	oldDir := dirFlag
+	dirFlag = dir
+	defer func() { dirFlag = oldDir }()
+
+	if err := runIntegrationSetup(testCommand(&bytes.Buffer{}), "kimus/piccolo-gws"); err != nil {
+		t.Fatalf("must fall back to the legacy path: %v", err)
+	}
+	if len(fake.runs) != 2 {
+		t.Fatalf("runs = %d", len(fake.runs))
+	}
+}
+
+func TestDeriveArgvReusesConfigDirFlag(t *testing.T) {
+	setup := []string{"piccolo-gws", "setup", "--config-dir", "/root/.piccolo/integrations/kimus/piccolo-gws"}
+	got, err := deriveArgv(setup, "state")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "piccolo-gws state --config-dir /root/.piccolo/integrations/kimus/piccolo-gws"
+	if strings.Join(got, " ") != want {
+		t.Fatalf("argv = %q, want %q", strings.Join(got, " "), want)
+	}
+
+	got, err = deriveArgv(setup, "call", "login")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want = "piccolo-gws call login --config-dir /root/.piccolo/integrations/kimus/piccolo-gws"
+	if strings.Join(got, " ") != want {
+		t.Fatalf("argv = %q, want %q", strings.Join(got, " "), want)
+	}
+
+	if _, err := deriveArgv(nil, "state"); err == nil {
+		t.Fatal("expected error when nothing to derive from")
+	}
+}
+
+func TestConfigDirFlagToleratesAbsence(t *testing.T) {
+	if got := configDirFlag([]string{"piccolo-gws", "setup"}); got != nil {
+		t.Fatalf("expected nil, got %v", got)
+	}
+}
+
+func TestIntegrationServerKeyPrefersRecordedThenDescriptorThenName(t *testing.T) {
+	desc := picintegration.Descriptor{MCPServerKey: "from_descriptor"}
+	if got := integrationServerKey(manifest.Integration{Name: "gws"}, desc); got != "from_descriptor" {
+		t.Fatalf("desc key = %q", got)
+	}
+	if got := integrationServerKey(manifest.Integration{Name: "gws", MCPServerKey: "recorded"}, desc); got != "recorded" {
+		t.Fatalf("recorded key = %q", got)
+	}
+	if got := integrationServerKey(manifest.Integration{Name: "gws"}, picintegration.Descriptor{}); got != "gws" {
+		t.Fatalf("fallback key = %q", got)
+	}
+}
+
+func TestRelayCallbackBuildsLoopbackCurlInsideContainer(t *testing.T) {
+	fake := &fakeIntegrationRunner{}
+	old := newIntegrationRunner
+	newIntegrationRunner = func() integrationRunner { return fake }
+	defer func() { newIntegrationRunner = old }()
+
+	err := relayCallbackIntoContainer(context.Background(), fake, "piccolo-setup-gws", 35935, "code=abc&state=xyz")
+	// The fake has no live container, but the recorded argv proves the shape.
+	if len(fake.execs) != 1 {
+		t.Fatalf("execs = %#v", fake.execs)
+	}
+	got := strings.Join(fake.execs[0].cmd, " ")
+	if !strings.Contains(got, "http://localhost:35935/?code=abc&state=xyz") {
+		t.Fatalf("relay cmd = %q", got)
+	}
+	if fake.execs[0].name != "piccolo-setup-gws" {
+		t.Fatalf("relay target = %q", fake.execs[0].name)
+	}
+	if err == nil {
+		t.Fatal("expected the fake exec to surface an error")
 	}
 }

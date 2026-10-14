@@ -16,11 +16,14 @@ import (
 	"time"
 
 	"github.com/charmbracelet/huh"
+	"golang.org/x/term"
 
 	"github.com/kimus/piccolo/internal/configdoc"
 	"github.com/kimus/piccolo/internal/docker"
 	picintegration "github.com/kimus/piccolo/internal/integration"
+	"github.com/kimus/piccolo/internal/manifest"
 	"github.com/kimus/piccolo/internal/setup"
+	"github.com/kimus/piccolo/internal/workspace"
 )
 
 // menuEntry is one rendered menu row with its gating decision already applied.
@@ -498,4 +501,249 @@ func openInBrowser(ctx context.Context, rawURL string) error {
 		return fmt.Errorf("no browser launcher for %s", runtime.GOOS)
 	}
 	return cmd.Run()
+}
+
+// configDirFlag extracts the state-directory flag pair from a declared setup
+// command so derived `state`/`call` invocations address the same place the
+// integration already told Piccolo to use.
+func configDirFlag(setupCommand []string) []string {
+	for i := 0; i+1 < len(setupCommand); i++ {
+		if strings.HasPrefix(setupCommand[i], "-") && strings.Contains(strings.ToLower(setupCommand[i]), "config") {
+			return []string{setupCommand[i], setupCommand[i+1]}
+		}
+	}
+	return nil
+}
+
+// deriveArgv builds `<binary> <sub...> [config-dir pair]` from the integration's
+// own declared setup command, so Piccolo never hardcodes an integration's
+// binary name.
+func deriveArgv(setupCommand []string, sub ...string) ([]string, error) {
+	if len(setupCommand) == 0 {
+		return nil, fmt.Errorf("integration declares no setup command to derive from")
+	}
+	argv := []string{setupCommand[0]}
+	argv = append(argv, sub...)
+	argv = append(argv, configDirFlag(setupCommand)...)
+	return argv, nil
+}
+
+// runDeclarativeSetup drives an action-based integration: describe → state →
+// menu → inputs → call → events → proposed config patch.
+func runDeclarativeSetup(ctx context.Context, out io.Writer, runner integrationRunner, layout workspace.Layout, workspaceRoot string, m *manifest.Manifest, found *manifest.Integration, env []string, desc picintegration.Descriptor) error {
+	bind := integrationSetupBinds(layout)
+	source := layout.PicoclawHome()
+	stateHost := layout.Integration(found.StatePathRelative())
+	containerState := "/root/.piccolo/integrations/" + found.StatePathRelative()
+	stdinTTY := term.IsTerminal(int(os.Stdin.Fd()))
+	host := detectHostSession(envMapFromList(env), stdinTTY)
+	// Refuse before any container work: without a terminal the menu cannot be
+	// rendered, so fetching state first would only cost a cold start.
+	if !stdinTTY {
+		return fmt.Errorf("integration setup needs an interactive terminal — rerun from a shell with a TTY")
+	}
+
+	// 1. Live facts gate the menu.
+	stateArgv, err := deriveArgv(found.SetupCommand, "state")
+	if err != nil {
+		return err
+	}
+	entry, cmdArgs := splitEntrypointCommand(stateArgv)
+	stateSpec := docker.Spec{
+		Name:       statusContainerName(found.Name),
+		Image:      m.Container.Image,
+		Source:     source,
+		Volumes:    bind,
+		Entrypoint: entry,
+		Command:    cmdArgs,
+		Labels:     map[string]string{docker.LabelWorkspace: workspaceRoot},
+	}
+	stateData, err := runContainerCapture(ctx, runner, stateSpec)
+	if err != nil {
+		return fmt.Errorf("integration state lookup failed; refusing to render a menu from assumed facts: %w", err)
+	}
+	state, err := picintegration.ParseState(stateData)
+	if err != nil {
+		return err
+	}
+
+	// 2. Menu.
+	menu := buildMenu(desc.Actions, state)
+	if len(menu) == 0 {
+		return fmt.Errorf("integration declares no usable setup actions")
+	}
+	labels := make([]string, 0, len(menu))
+	for _, e := range menu {
+		labels = append(labels, e.Title())
+	}
+	var chosenLabel string
+	form := huh.NewForm(huh.NewGroup(
+		huh.NewSelect[string]().
+			Title(fmt.Sprintf("%s — what do you want to do?", displayIntegration(*found))).
+			Description("Credentials identify the app; login authorizes your Google account.").
+			Options(huh.NewOptions(labels...)...).
+			Value(&chosenLabel),
+	))
+	if err := form.Run(); err != nil {
+		return err
+	}
+	var chosen *menuEntry
+	for i := range menu {
+		if menu[i].Title() == chosenLabel {
+			chosen = &menu[i]
+			break
+		}
+	}
+	if chosen == nil {
+		return fmt.Errorf("menu selection %q no longer matches the integration's actions", chosenLabel)
+	}
+	if !chosen.Enabled {
+		return fmt.Errorf("action %q is unavailable: %s", chosen.Action.ID, chosen.Reason)
+	}
+
+	// 3. Inputs.
+	values, err := renderActionInputs(chosen.Action, stateHost, containerState, stdinTTY)
+	if err != nil {
+		return err
+	}
+	answers, err := answersJSON(chosen.Action.Inputs, values)
+	if err != nil {
+		return err
+	}
+
+	// 4. Invoke, streaming events.
+	callArgv, err := deriveArgv(found.SetupCommand, "call", chosen.Action.ID)
+	if err != nil {
+		return err
+	}
+	entry, cmdArgs = splitEntrypointCommand(callArgv)
+	container := setupContainerName(found.Name)
+	spec := docker.Spec{
+		Name:       container,
+		Image:      m.Container.Image,
+		Network:    m.Container.Network,
+		Source:     source,
+		Ports:      found.SetupPorts,
+		Env:        env,
+		Volumes:    bind,
+		Entrypoint: entry,
+		Command:    cmdArgs,
+		Labels:     map[string]string{docker.LabelWorkspace: workspaceRoot},
+	}
+	if removed, err := runner.RemoveByPrefix(ctx, docker.SetupContainerPrefix+sanitizeForName(found.Name)); err == nil && len(removed) > 0 {
+		fmt.Fprintf(out, "Removed %d abandoned integration container(s): %s\n", len(removed), strings.Join(removed, ", "))
+	}
+	fmt.Fprintf(out, "Running %s for %s...\n", chosen.Action.ID, displayIntegration(*found))
+
+	var courierErr error
+	deadline := time.Now().Add(actionWaitBudget)
+	onEvent := func(ev picintegration.Event) {
+		switch ev.Type {
+		case picintegration.EventStep:
+			fmt.Fprintf(out, "  [%s] %s: %s\n", ev.Status, ev.ID, ev.Message)
+		case picintegration.EventOpenURL:
+			fmt.Fprintf(out, "\n%s\n", host.browserHint(ev.URL))
+			if host.shouldLaunchBrowser() {
+				if err := openInBrowser(ctx, ev.URL); err != nil {
+					fmt.Fprintf(out, "  (could not launch a browser: %v)\n", err)
+				}
+			}
+		case picintegration.EventWaitRedirect:
+			port, err := callbackPortFromURL(ev.URL)
+			if err != nil {
+				courierErr = err
+				return
+			}
+			c, err := newCourier(port)
+			if err != nil {
+				courierErr = err
+				return
+			}
+			remaining := time.Until(deadline)
+			if remaining < 0 {
+				remaining = time.Second
+			}
+			relay := func(rctx context.Context, q string) error {
+				return relayCallbackIntoContainer(rctx, runner, container, port, q)
+			}
+			if err := c.await(ctx, remaining, relay); err != nil {
+				courierErr = err
+			}
+		case picintegration.EventError:
+			fmt.Fprintf(out, "  ✗ %s\n", ev.Message)
+			if ev.Remediation != "" {
+				fmt.Fprintf(out, "    → %s\n", ev.Remediation)
+			}
+			if ev.RemediationURL != "" {
+				fmt.Fprintf(out, "      %s %s\n", ev.Label, ev.RemediationURL)
+			}
+		}
+	}
+
+	reader, err := runIntegrationAction(ctx, runner, integrationCallRequest{
+		Answers:   answers,
+		Container: container,
+		Spec:      spec,
+	}, out, onEvent)
+	if courierErr != nil {
+		return fmt.Errorf("browser authorization did not complete: %w", courierErr)
+	}
+	if err != nil {
+		return err
+	}
+
+	// 5. Configuration: the integration proposed, Piccolo applies.
+	res := reader.Result()
+	if res == nil || res.Result == nil {
+		return nil
+	}
+	serverKey := integrationServerKey(*found, desc)
+	confirm := func() (bool, error) { return confirmApplyConfig(out) }
+	return applyIntegrationPatch(out, layout.Config(), res.Result.ConfigPatch, serverKey, confirm)
+}
+
+// integrationServerKey derives the MCP server key an integration owns, so the
+// allowlist can pin the patch to exactly that entry and nothing else.
+func integrationServerKey(in manifest.Integration, desc picintegration.Descriptor) string {
+	if key := strings.TrimSpace(in.MCPServerKey); key != "" {
+		return key
+	}
+	if key := strings.TrimSpace(desc.MCPServerKey); key != "" {
+		return key
+	}
+	return in.Name
+}
+
+// confirmApplyConfig is the single confirmation gate for writing the
+// user-owned config.json.
+func confirmApplyConfig(out io.Writer) (bool, error) {
+	confirm := false
+	form := huh.NewForm(huh.NewGroup(
+		huh.NewConfirm().
+			Title("Apply this change to config.json?").
+			Description("your previous config.json is kept as config.json.bak").
+			Affirmative("Yes, write it").
+			Negative("No, discard").
+			Value(&confirm),
+	))
+	if err := form.Run(); err != nil {
+		return false, err
+	}
+	return confirm, nil
+}
+
+func envMapFromList(env []string) map[string]string {
+	out := map[string]string{}
+	for _, pair := range env {
+		if i := strings.Index(pair, "="); i > 0 {
+			out[pair[:i]] = pair[i+1:]
+		}
+	}
+	// The host environment is what actually decides browser/SSH policy.
+	for _, key := range []string{"SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY", "DISPLAY", "WAYLAND_DISPLAY"} {
+		if v := os.Getenv(key); v != "" {
+			out[key] = v
+		}
+	}
+	return out
 }

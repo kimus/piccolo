@@ -11,28 +11,28 @@
 
 ## 2. Menu rendering and dispatch
 
-- [ ] 2.1 Render the action menu with huh from descriptor actions plus live state facts
-- [ ] 2.2 Gate entries on unmet required facts, explaining the missing prerequisite and which actions satisfy it
+- [x] 2.1 Render the action menu with huh from descriptor actions plus live state facts
+- [x] 2.2 Gate entries on unmet required facts, explaining the missing prerequisite and which actions satisfy it
 - [ ] 2.3 Render action inputs as huh widgets (input, masked secret, file picker, select, multiselect, confirm)
-- [ ] 2.4 Refuse to render when no interactive terminal is available, with guidance to run setup interactively
-- [ ] 2.5 Keep the legacy `setup.command` TTY path working when a descriptor declares no actions
+- [x] 2.4 Refuse to render when no interactive terminal is available, with guidance to run setup interactively
+- [x] 2.5 Keep the legacy `setup.command` TTY path working when a descriptor declares no actions
 
 ## 3. Action invocation transport
 
-- [ ] 3.1 Invoke `<binary> call <action-id>` over the existing attach path
-- [ ] 3.2 Write collected answers as one JSON document to the action's stdin
+- [x] 3.1 Invoke `<binary> call <action-id>` over the existing attach path
+- [x] 3.2 Write collected answers as one JSON document to the action's stdin
 - [x] 3.3 Assert no answer value reaches argv or container env, including for secrets
 - [ ] 3.4 Stream the action's stderr to the user as human logs
-- [ ] 3.5 Preserve one-shot naming, signal cleanup, and abandoned-container reclaim during long-running actions
+- [x] 3.5 Preserve one-shot naming, signal cleanup, and abandoned-container reclaim during long-running actions
 
 ## 4. Event consumption and rendering
 
-- [ ] 4.1 Render `step` events as progress lines while the action runs
+- [x] 4.1 Render `step` events as progress lines while the action runs
 - [x] 4.2 Surface non-JSON stdout lines as logs without aborting the action
-- [ ] 4.3 Render `open_url` with its label, printing the raw URL always
+- [x] 4.3 Render `open_url` with its label, printing the raw URL always
 - [x] 4.4 Skip browser launching when the session is headless or remote
-- [ ] 4.5 Treat `result` as the only source of configuration proposals
-- [ ] 4.6 Report `error` events with code, message, remediation, and optional link without applying config
+- [x] 4.5 Treat `result` as the only source of configuration proposals
+- [x] 4.6 Report `error` events with code, message, remediation, and optional link without applying config
 
 ## 5. File brokering
 
@@ -56,8 +56,8 @@
 
 - [x] 7.1 Define a fixed in-code allowlist for integration patches limited to the integration's own MCP server entry
 - [x] 7.2 Validate a proposed patch against the allowlist before touching the file, refusing out-of-scope paths and naming them
-- [ ] 7.3 Apply accepted patches through the existing diff preview, confirmation, `config.json.bak` backup, and atomic write
-- [ ] 7.4 Make Piccolo the only writer of `config.json` for integration flows
+- [x] 7.3 Apply accepted patches through the existing diff preview, confirmation, `config.json.bak` backup, and atomic write
+- [x] 7.4 Make Piccolo the only writer of `config.json` for integration flows
 - [x] 7.5 Never read, parse, or modify integration-owned state files
 
 ## 8. Verification
@@ -69,8 +69,8 @@
 - [x] 8.5 Test file staging: destination, mode `0600`, overwrite confirmation, container-path rewrite, rejection cases
 - [x] 8.6 Test the courier: port derived from URL, single-request close, loopback-only, relay payload untouched
 - [x] 8.7 Test menu gating from state facts and the no-terminal refusal
-- [ ] 8.8 Test that a descriptor without actions still uses the legacy TTY path
-- [ ] 8.9 Run `go build ./...`, `go vet ./...`, `go test ./...`
+- [x] 8.8 Test that a descriptor without actions still uses the legacy TTY path
+- [x] 8.9 Run `go build ./...`, `go vet ./...`, `go test ./...`
 - [ ] 8.10 Live verify with `piccolo-gws`: add → setup menu → import credentials via file picker → browser login via courier → confirmed config diff → `status` green
 - [ ] 8.11 Update README for Piccolo-owned setup UI and the action/state/call contract, and AGENTS.md for the descriptor seam
 - [ ] 8.12 Document the contract surface for integration authors (actions, state keys, event envelope, patch scope)

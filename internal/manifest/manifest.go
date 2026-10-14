@@ -60,7 +60,23 @@ type Integration struct {
 	StatusCommand     []string `yaml:"status_command,omitempty" json:"statusCommand,omitempty"`
 	SetupRequiresTTY  bool     `yaml:"setup_requires_tty,omitempty" json:"setupRequiresTty,omitempty"`
 	SetupPorts        []string `yaml:"setup_ports,omitempty" json:"setupPorts,omitempty"`
+	// MCPServerKey is the one config.json path this integration may manage:
+	// tools.mcp.servers.<MCPServerKey>. Piccolo enforces it; the integration
+	// cannot widen it.
+	MCPServerKey string `yaml:"mcp_server_key,omitempty" json:"mcpServerKey,omitempty"`
 }
+
+// StatePathRelative returns the integration state directory name beneath the
+// workspace `integrations/` root, e.g. "kimus/piccolo-gws".
+func (i Integration) StatePathRelative() string {
+	trimmed := strings.TrimSpace(i.StatePath)
+	if trimmed == "" {
+		return i.Name
+	}
+	return strings.TrimPrefix(strings.Trim(trimmed, "/"), workspaceIntegrationsPrefix)
+}
+
+const workspaceIntegrationsPrefix = "integrations/"
 
 // Setup holds non-secret Piccolo setup metadata that is useful across setup
 // runs but is not consumed by PicoClaw at runtime.

@@ -276,6 +276,7 @@ func runIntegrationAdd(cmd *cobra.Command, input string, f integrationFlags) err
 		StatusCommand:     rewriteStateArgs(desc.StatusCommand, containerState),
 		SetupRequiresTTY:  desc.Setup.RequiresTTY,
 		SetupPorts:        desc.Setup.Ports,
+		MCPServerKey:      desc.MCPServerKey,
 	}
 	m.Container.Image = plan.Tag
 	m.Runtime.Integrations = upsertManifestIntegration(m.Runtime.Integrations, item)
@@ -391,6 +392,7 @@ func runIntegrationBuild(cmd *cobra.Command, input string, f integrationFlags) e
 		StatusCommand:     rewriteStateArgs(desc.StatusCommand, pkg.ContainerStatePath()),
 		SetupRequiresTTY:  desc.Setup.RequiresTTY,
 		SetupPorts:        desc.Setup.Ports,
+		MCPServerKey:      desc.MCPServerKey,
 	})
 	if err := m.Write(manifestPath); err != nil {
 		return fmt.Errorf("update %s: %w", workspace.ManifestName, err)
@@ -714,6 +716,7 @@ func runIntegrationUpgrade(cmd *cobra.Command, name string, f integrationUpgrade
 			StatusCommand:     rewriteStateArgs(desc.StatusCommand, containerState),
 			SetupRequiresTTY:  desc.Setup.RequiresTTY,
 			SetupPorts:        desc.Setup.Ports,
+			MCPServerKey:      desc.MCPServerKey,
 		}
 	}
 	m.Container.Image = plan.Tag
@@ -767,6 +770,26 @@ func runIntegrationSetup(cmd *cobra.Command, name string) error {
 	defer cancel()
 	if err := runner.Ping(pingCtx); err != nil {
 		return fmt.Errorf("docker daemon not reachable: %w", err)
+	}
+	// Declarative integrations are driven by Piccolo's own UI: describe first,
+	// then dispatch on whether the integration declares actions. Presence of
+	// actions is the selector, so an integration without them takes exactly the
+	// legacy TTY path below, unchanged.
+	if len(found.DescriptorCommand) > 0 {
+		descEntrypoint, descCommand := splitEntrypointCommand(found.DescriptorCommand)
+		descData, derr := runContainerCapture(ctx, runner, docker.Spec{
+			Image:      m.Container.Image,
+			Source:     layout.PicoclawHome(),
+			Volumes:    integrationSetupBinds(layout),
+			Entrypoint: descEntrypoint,
+			Command:    descCommand,
+			Labels:     map[string]string{docker.LabelWorkspace: dir},
+		})
+		if derr == nil {
+			if desc, perr := picintegration.ParseDescriptor(descData); perr == nil && desc.Declarative() {
+				return runDeclarativeSetup(ctx, out, runner, layout, dir, m, found, env, desc)
+			}
+		}
 	}
 	fmt.Fprintf(out, "Running setup for %s in a temporary container...\n", displayIntegration(*found))
 	// Only request a container PTY when the host really has a terminal. With a
