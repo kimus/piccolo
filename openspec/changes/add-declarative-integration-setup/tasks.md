@@ -2,12 +2,12 @@
 
 ## 1. Descriptor and payload parsing
 
-- [ ] 1.1 Parse optional `actions[]` from the descriptor (id, role, title, inputs, requires) keeping the schema identifier check unchanged
-- [ ] 1.2 Validate `inputs[].type` against the closed set (`text`, `secret`, `path`, `select`, `multiselect`, `confirm`) and `requires` against the integration's declared state keys
-- [ ] 1.3 Ignore unknown roles and unknown descriptor fields without erroring
-- [ ] 1.4 Parse the state payload (`piccolo.integration.state.v1`) into a fact set
-- [ ] 1.5 Parse NDJSON action events into typed step/open_url/wait_redirect/result/error values
-- [ ] 1.6 Accept an optional `{label, url}` on status check remediation and render it
+- [x] 1.1 Parse optional `actions[]` from the descriptor (id, role, title, inputs, requires) keeping the schema identifier check unchanged
+- [x] 1.2 Validate `inputs[].type` against the closed set (`text`, `secret`, `path`, `select`, `multiselect`, `confirm`) and `requires` against the integration's declared state keys
+- [x] 1.3 Ignore unknown roles and unknown descriptor fields without erroring
+- [x] 1.4 Parse the state payload (`piccolo.integration.state.v1`) into a fact set
+- [x] 1.5 Parse NDJSON action events into typed step/open_url/wait_redirect/result/error values
+- [x] 1.6 Accept an optional `{label, url}` on status check remediation and render it
 
 ## 2. Menu rendering and dispatch
 

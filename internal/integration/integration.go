@@ -15,6 +15,9 @@ import (
 const SchemaV1 = "piccolo.integration.v1"
 
 // Descriptor is returned by an installed integration's `describe --json` command.
+// Actions/StateKeys are additive to schema v1: older Piccolo builds ignore
+// unknown fields, and presence of Actions selects the declarative setup path,
+// so the schema identifier is never bumped.
 type Descriptor struct {
 	Schema        string                 `json:"schema"`
 	Name          string                 `json:"name"`
@@ -24,6 +27,8 @@ type Descriptor struct {
 	Setup         SetupDescriptor        `json:"setup"`
 	StatusCommand []string               `json:"-"`
 	Metadata      map[string]string      `json:"metadata,omitempty"`
+	Actions       []Action               `json:"actions,omitempty"`
+	StateKeys     []string               `json:"stateKeys,omitempty"`
 }
 
 type CommandSpec struct {
@@ -93,8 +98,19 @@ func (d Descriptor) Validate() error {
 			return fmt.Errorf("command %q invalid", c)
 		}
 	}
+	// Declarative setup is optional; validate it only when declared, so a
+	// legacy action-less descriptor keeps parsing exactly as before.
+	if len(d.Actions) > 0 {
+		if err := d.ValidateActions(); err != nil {
+			return err
+		}
+	}
 	return nil
 }
+
+// Declarative reports whether this integration exposes an action menu. When
+// false, Piccolo must use the legacy setup.command TTY path unchanged.
+func (d Descriptor) Declarative() bool { return len(d.Actions) > 0 }
 
 func (d *Descriptor) UnmarshalJSON(data []byte) error {
 	type alias Descriptor

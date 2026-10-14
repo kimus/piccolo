@@ -22,6 +22,10 @@ type StatusCheck struct {
 	Status      string `json:"status"`
 	Message     string `json:"message,omitempty"`
 	Remediation string `json:"remediation,omitempty"`
+	// Optional link that accompanies the remediation text. Purely additive:
+	// checks that supply only Remediation render exactly as before.
+	RemediationLabel string `json:"remediationLabel,omitempty"`
+	RemediationURL   string `json:"remediationUrl,omitempty"`
 }
 
 func ParseStatus(data []byte) (StatusResult, error) {
