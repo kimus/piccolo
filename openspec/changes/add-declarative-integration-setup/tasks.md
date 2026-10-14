@@ -13,7 +13,7 @@
 
 - [x] 2.1 Render the action menu with huh from descriptor actions plus live state facts
 - [x] 2.2 Gate entries on unmet required facts, explaining the missing prerequisite and which actions satisfy it
-- [ ] 2.3 Render action inputs as huh widgets (input, masked secret, file picker, select, multiselect, confirm)
+- [x] 2.3 Render action inputs as huh widgets (input, masked secret, file picker, select, multiselect, confirm)
 - [x] 2.4 Refuse to render when no interactive terminal is available, with guidance to run setup interactively
 - [x] 2.5 Keep the legacy `setup.command` TTY path working when a descriptor declares no actions
 
@@ -22,7 +22,7 @@
 - [x] 3.1 Invoke `<binary> call <action-id>` over the existing attach path
 - [x] 3.2 Write collected answers as one JSON document to the action's stdin
 - [x] 3.3 Assert no answer value reaches argv or container env, including for secrets
-- [ ] 3.4 Stream the action's stderr to the user as human logs
+- [x] 3.4 Stream the action's stderr to the user as human logs
 - [x] 3.5 Preserve one-shot naming, signal cleanup, and abandoned-container reclaim during long-running actions
 
 ## 4. Event consumption and rendering
@@ -72,5 +72,5 @@
 - [x] 8.8 Test that a descriptor without actions still uses the legacy TTY path
 - [x] 8.9 Run `go build ./...`, `go vet ./...`, `go test ./...`
 - [ ] 8.10 Live verify with `piccolo-gws`: add → setup menu → import credentials via file picker → browser login via courier → confirmed config diff → `status` green
-- [ ] 8.11 Update README for Piccolo-owned setup UI and the action/state/call contract, and AGENTS.md for the descriptor seam
-- [ ] 8.12 Document the contract surface for integration authors (actions, state keys, event envelope, patch scope)
+- [x] 8.11 Update README for Piccolo-owned setup UI and the action/state/call contract, and AGENTS.md for the descriptor seam
+- [x] 8.12 Document the contract surface for integration authors (actions, state keys, event envelope, patch scope)

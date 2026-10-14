@@ -244,6 +244,38 @@ Integration authors publish release bundles plus provide an executable whose des
 
 Only use integrations you trust; integration packages install code into the assistant runtime image.
 
+### `piccolo integration setup`
+
+For integrations that declare actions, **Piccolo renders the setup menu** with the same
+`huh` widgets used by `piccolo init`/`piccolo setup`; the integration ships no terminal UI.
+
+```text
+piccolo integration setup kimus/piccolo-gws
+
+? Google Workspace — what do you want to do?
+  ▸ Set up Google Workspace access
+    Import credentials
+    Login / authorize Google account
+    Check Gmail, Calendar, and Drive connectivity
+```
+
+How it works:
+
+```text
+integration describe  → stable action menu (ids are opaque to Piccolo)
+piccolo runs: state   → live facts gate the menu (no doomed flows)
+piccolo runs: call X  → answers on STDIN · NDJSON events on STDOUT · logs on STDERR
+```
+
+- **Menu gating.** An action whose `requires` facts are false is shown as unavailable with the missing prerequisite named, and Piccolo refuses to invoke it.
+- **File imports.** A `path` input opens Piccolo's host file browser and stages the file at the action's declared destination with mode `0600`, then hands the integration the *container* path. Secrets travel on stdin only — argv is visible in `docker top`, env in `docker inspect`.
+- **Browser callbacks.** When an action emits `wait_redirect`, Piccolo binds the loopback port taken from that URL's own `redirect_uri`, captures exactly one request, and relays the raw query into the still-running container. Integrations publish no ports, and Piccolo never interprets or logs the credential material.
+- **Config writes are Piccolo's.** An integration *proposes* a `configPatch`; Piccolo validates it against a fixed allowlist (only that integration's `tools.mcp.servers.<key>` entry), shows a diff, asks for confirmation, then writes `config.json.bak` and the file atomically. A patch reaching any other path is refused.
+- **Headless** (no TTY, CI): Piccolo refuses rather than hanging, so setup stays deterministic.
+
+An integration that declares no actions keeps the previous TTY-attach behavior unchanged —
+the descriptor stays `piccolo.integration.v1`, so old integrations and old Piccolo builds both work.
+
 ### `piccolo setup`
 
 The editing counterpart of `init` for an existing workspace. `piccolo setup` opens an arrow-navigable home menu (↑/↓ move, enter open, q quit); deep-links work too: `piccolo setup channels`, `piccolo setup channels discord`, `piccolo setup models`, `piccolo setup tools`.
