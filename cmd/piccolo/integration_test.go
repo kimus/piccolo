@@ -34,6 +34,7 @@ type fakeIntegrationRunner struct {
 	code         int
 	removePrefix []string
 	removed      [][]string
+	execs        []execCall
 }
 
 func (f *fakeIntegrationRunner) Ping(context.Context) error { return f.pingErr }
@@ -79,6 +80,18 @@ func (f *fakeIntegrationRunner) RemoveByPrefix(_ context.Context, prefix string)
 	}
 	f.removed = append(f.removed, out)
 	return out, nil
+}
+
+// execCalls records relay attempts so the callback courier is observable in
+// tests without a daemon.
+func (f *fakeIntegrationRunner) Exec(_ context.Context, name string, cmd []string, _ bool) (*docker.ExecSession, error) {
+	f.execs = append(f.execs, execCall{name: name, cmd: append([]string(nil), cmd...)})
+	return nil, fmt.Errorf("fake exec has no live container")
+}
+
+type execCall struct {
+	name string
+	cmd  []string
 }
 
 type nopWriteCloser struct{ *bytes.Buffer }

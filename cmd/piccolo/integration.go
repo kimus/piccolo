@@ -46,6 +46,11 @@ type integrationRunner interface {
 	BuildImage(context.Context, io.Reader, docker.ImageBuildOptions, io.Writer) error
 	Run(context.Context, docker.Spec) (docker.Process, error)
 	RemoveByPrefix(context.Context, string) ([]string, error)
+	// Exec runs a command inside an already-running one-shot container, which
+	// is how Piccolo delivers a captured browser callback back onto the
+	// container's own loopback (the container's loopback is unreachable from
+	// the host, but its network namespace is reachable this way).
+	Exec(context.Context, string, []string, bool) (*docker.ExecSession, error)
 }
 
 var newIntegrationRunner = func() integrationRunner { return docker.New() }

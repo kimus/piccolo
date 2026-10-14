@@ -21,36 +21,36 @@
 
 - [ ] 3.1 Invoke `<binary> call <action-id>` over the existing attach path
 - [ ] 3.2 Write collected answers as one JSON document to the action's stdin
-- [ ] 3.3 Assert no answer value reaches argv or container env, including for secrets
+- [x] 3.3 Assert no answer value reaches argv or container env, including for secrets
 - [ ] 3.4 Stream the action's stderr to the user as human logs
 - [ ] 3.5 Preserve one-shot naming, signal cleanup, and abandoned-container reclaim during long-running actions
 
 ## 4. Event consumption and rendering
 
 - [ ] 4.1 Render `step` events as progress lines while the action runs
-- [ ] 4.2 Surface non-JSON stdout lines as logs without aborting the action
+- [x] 4.2 Surface non-JSON stdout lines as logs without aborting the action
 - [ ] 4.3 Render `open_url` with its label, printing the raw URL always
-- [ ] 4.4 Skip browser launching when the session is headless or remote
+- [x] 4.4 Skip browser launching when the session is headless or remote
 - [ ] 4.5 Treat `result` as the only source of configuration proposals
 - [ ] 4.6 Report `error` events with code, message, remediation, and optional link without applying config
 
 ## 5. File brokering
 
-- [ ] 5.1 Support `path` inputs via huh's file picker on the host filesystem
-- [ ] 5.2 Copy the selected file to the declared destination under the integration state directory with mode `0600`
+- [x] 5.1 Support `path` inputs via huh's file picker on the host filesystem
+- [x] 5.2 Copy the selected file to the declared destination under the integration state directory with mode `0600`
 - [ ] 5.3 Confirm before overwriting an existing staged file
-- [ ] 5.4 Pass the container-side path to the action, never the host path
-- [ ] 5.5 Reject missing, directory, or unreadable selections without staging
+- [x] 5.4 Pass the container-side path to the action, never the host path
+- [x] 5.5 Reject missing, directory, or unreadable selections without staging
 
 ## 6. Callback courier
 
-- [ ] 6.1 Derive the callback port from the event URL's `redirect_uri` and reject any other port or non-loopback address
-- [ ] 6.2 Bind `127.0.0.1:<port>`, serve exactly one request, then close
-- [ ] 6.3 Relay the raw request path and query into the running action container's loopback
-- [ ] 6.4 Never parse, log, or persist callback query material
-- [ ] 6.5 On bind conflict, report it and offer to retry rather than silently reusing another port
-- [ ] 6.6 On timeout with no callback, report that authorization did not complete
-- [ ] 6.7 Print a host-forward hint when the session is remote
+- [x] 6.1 Derive the callback port from the event URL's `redirect_uri` and reject any other port or non-loopback address
+- [x] 6.2 Bind `127.0.0.1:<port>`, serve exactly one request, then close
+- [x] 6.3 Relay the raw request path and query into the running action container's loopback
+- [x] 6.4 Never parse, log, or persist callback query material
+- [x] 6.5 On bind conflict, report it and offer to retry rather than silently reusing another port
+- [x] 6.6 On timeout with no callback, report that authorization did not complete
+- [x] 6.7 Print a host-forward hint when the session is remote
 
 ## 7. Piccolo-owned config application
 
@@ -65,10 +65,10 @@
 - [x] 8.1 Unit-test descriptor action parsing: valid, unknown role, unknown field, unknown input type, bad `requires` key
 - [x] 8.2 Unit-test event parsing for each event type plus malformed lines
 - [x] 8.3 Unit-test the allowlist refusal of an out-of-scope patch and acceptance of the MCP entry
-- [ ] 8.4 Test that answers never appear in container spec argv/env
-- [ ] 8.5 Test file staging: destination, mode `0600`, overwrite confirmation, container-path rewrite, rejection cases
-- [ ] 8.6 Test the courier: port derived from URL, single-request close, loopback-only, relay payload untouched
-- [ ] 8.7 Test menu gating from state facts and the no-terminal refusal
+- [x] 8.4 Test that answers never appear in container spec argv/env
+- [x] 8.5 Test file staging: destination, mode `0600`, overwrite confirmation, container-path rewrite, rejection cases
+- [x] 8.6 Test the courier: port derived from URL, single-request close, loopback-only, relay payload untouched
+- [x] 8.7 Test menu gating from state facts and the no-terminal refusal
 - [ ] 8.8 Test that a descriptor without actions still uses the legacy TTY path
 - [ ] 8.9 Run `go build ./...`, `go vet ./...`, `go test ./...`
 - [ ] 8.10 Live verify with `piccolo-gws`: add → setup menu → import credentials via file picker → browser login via courier → confirmed config diff → `status` green
