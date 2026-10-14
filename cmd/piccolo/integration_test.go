@@ -32,6 +32,8 @@ type fakeIntegrationRunner struct {
 	stdouts      []string
 	stderr       string
 	code         int
+	removePrefix []string
+	removed      [][]string
 }
 
 func (f *fakeIntegrationRunner) Ping(context.Context) error { return f.pingErr }
@@ -67,6 +69,17 @@ func (p *fakeProcess) Stderr() io.ReadCloser             { return io.NopCloser(s
 func (p *fakeProcess) Wait(context.Context) (int, error) { return p.code, nil }
 func (p *fakeProcess) Shutdown(time.Duration) error      { return nil }
 func (p *fakeProcess) ExitCode() int                     { return p.code }
+
+func (f *fakeIntegrationRunner) RemoveByPrefix(_ context.Context, prefix string) ([]string, error) {
+	var out []string
+	for _, name := range f.removePrefix {
+		if strings.HasPrefix(name, prefix) {
+			out = append(out, name)
+		}
+	}
+	f.removed = append(f.removed, out)
+	return out, nil
+}
 
 type nopWriteCloser struct{ *bytes.Buffer }
 
@@ -189,6 +202,63 @@ func TestIntegrationUpgradePinnedGuidance(t *testing.T) {
 	err := runIntegrationUpgrade(testCommand(&bytes.Buffer{}), "kimus/piccolo-gws", integrationUpgradeFlags{integrationFlags: integrationFlags{yes: true}})
 	if err == nil || !strings.Contains(err.Error(), "pinned") {
 		t.Fatalf("err=%v", err)
+	}
+}
+
+func TestIntegrationSetupReclaimsAbandonedContainers(t *testing.T) {
+	dir := t.TempDir()
+	writeIntegrationManifest(t, dir, []manifest.Integration{{Package: "github:kimus/piccolo-gws", Source: "release", Name: "gws", DisplayName: "Google Workspace", SetupCommand: []string{"piccolo-gws", "setup"}, SetupRequiresTTY: true}})
+	fake := &fakeIntegrationRunner{
+		// A legacy timestamped orphan plus the current deterministic name.
+		removePrefix: []string{"piccolo-setup-gws-1791932406936295000", "piccolo-setup-gws", "piccolo-gateway"},
+	}
+	old := newIntegrationRunner
+	newIntegrationRunner = func() integrationRunner { return fake }
+	defer func() { newIntegrationRunner = old }()
+	oldDir := dirFlag
+	dirFlag = dir
+	defer func() { dirFlag = oldDir }()
+
+	var out bytes.Buffer
+	if err := runIntegrationSetup(testCommand(&out), "kimus/piccolo-gws"); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+	if len(fake.runs) != 1 {
+		t.Fatalf("runs = %d", len(fake.runs))
+	}
+	if fake.runs[0].Name != "piccolo-setup-gws" {
+		t.Fatalf("container name = %q, want deterministic name", fake.runs[0].Name)
+	}
+	if !strings.Contains(out.String(), "abandoned setup container") || !strings.Contains(out.String(), "piccolo-setup-gws-1791932406936295000") {
+		t.Fatalf("orphan notice missing from output: %q", out.String())
+	}
+	if len(fake.removed) == 0 || len(fake.removed[0]) != 2 {
+		t.Fatalf("removed = %#v, want the two piccolo-setup containers only", fake.removed)
+	}
+	for _, name := range fake.removed[0] {
+		if name == "piccolo-gateway" {
+			t.Fatal("must never reclaim the gateway container")
+		}
+		if !strings.HasPrefix(name, docker.SetupContainerPrefix) {
+			t.Fatalf("unexpected reclaim target %q", name)
+		}
+	}
+}
+
+func TestSetupAndStatusContainerNamesAreDeterministic(t *testing.T) {
+	if got := setupContainerName("gws"); got != "piccolo-setup-gws" {
+		t.Fatalf("setupContainerName = %q", got)
+	}
+	if got := statusContainerName("gws"); got != "piccolo-setup-status-gws" {
+		t.Fatalf("statusContainerName = %q", got)
+	}
+	// Status must not reclaim a setup run and vice versa.
+	if strings.HasPrefix(statusContainerName("gws"), setupContainerName("gws")+"-") ||
+		strings.HasPrefix(setupContainerName("gws"), statusContainerName("gws")) {
+		t.Fatal("setup and status prefixes must not overlap")
+	}
+	if got := sanitizeForName("a b/c"); got != "a-b-c" {
+		t.Fatalf("sanitizeForName = %q", got)
 	}
 }
 

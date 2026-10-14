@@ -18,6 +18,7 @@ import (
 	"io"
 	"net"
 	"net/netip"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -645,6 +646,66 @@ func pullImage(ctx context.Context, cli client.SDKClient, image string) error {
 	return nil
 }
 
+// SetupContainerPrefix names Piccolo's short-lived one-shot containers
+// (integration setup/status). They must NOT embed a per-run unique suffix: a
+// deterministic prefix lets Piccolo detect and reclaim containers orphaned by
+// an interrupted or killed previous run, which otherwise squat on resources
+// (e.g. a published port) forever.
+const SetupContainerPrefix = "piccolo-setup-"
+
+// ListByPrefix returns the names of containers (running or stopped) whose name
+// starts with prefix. Names are returned without the leading slash.
+func (r *Runner) ListByPrefix(ctx context.Context, prefix string) ([]string, error) {
+	cli, err := r.newClient(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return listByPrefix(ctx, cli, prefix)
+}
+
+// RemoveByPrefix stops and removes every container whose name starts with
+// prefix and returns the removed names. Piccolo's one-shot names are specific
+// enough that this cannot touch unmanaged containers.
+func (r *Runner) RemoveByPrefix(ctx context.Context, prefix string) ([]string, error) {
+	cli, err := r.newClient(ctx)
+	if err != nil {
+		return nil, err
+	}
+	names, err := listByPrefix(ctx, cli, prefix)
+	if err != nil {
+		return nil, err
+	}
+	var removed []string
+	for _, name := range names {
+		found, err := cli.FindContainerByName(ctx, name)
+		if err != nil || found == nil {
+			continue
+		}
+		stopRemove(ctx, cli, found.ID)
+		removed = append(removed, name)
+	}
+	return removed, nil
+}
+
+func listByPrefix(ctx context.Context, cli client.SDKClient, prefix string) ([]string, error) {
+	res, err := cli.ContainerList(ctx, mobyclient.ContainerListOptions{All: true})
+	if err != nil {
+		return nil, err
+	}
+	var names []string
+	for _, item := range res.Items {
+		for _, raw := range item.Names {
+			name := strings.TrimPrefix(raw, "/")
+			if strings.HasPrefix(name, prefix) {
+				names = append(names, name)
+				break
+			}
+		}
+	}
+	sort.Strings(names)
+	return names, nil
+}
+
 func removeStaleByName(ctx context.Context, cli client.SDKClient, name string) {
 	found, err := cli.FindContainerByName(ctx, name)
 	if err != nil || found == nil {
@@ -827,6 +888,12 @@ func (p *containerProcess) Shutdown(grace time.Duration) error {
 func (p *containerProcess) inspectState(ctx context.Context) (bool, int, error) {
 	res, err := p.cli.ContainerInspect(ctx, p.id, mobyclient.ContainerInspectOptions{})
 	if err != nil {
+		// A vanished container means someone else removed it (a concurrent
+		// Piccolo reclaim, or manual `docker rm`). Report it as such instead of
+		// leaking the raw daemon error to the user.
+		if errdefs.IsNotFound(err) {
+			return false, -1, fmt.Errorf("container %s disappeared before it finished (another piccolo command or a manual removal reclaimed it)", shortID(p.id))
+		}
 		return false, -1, err
 	}
 	if res.Container.State == nil {

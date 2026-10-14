@@ -15,9 +15,10 @@ import (
 
 // fakeEngine is a daemon-free doctor.Engine for tests.
 type fakeEngine struct {
-	pingErr     error
-	imageExists bool
-	container   bool
+	pingErr      error
+	imageExists  bool
+	container    bool
+	setupOrphans []string
 }
 
 func (f fakeEngine) Ping(context.Context) error { return f.pingErr }
@@ -26,6 +27,15 @@ func (f fakeEngine) ImageExists(context.Context, string) (bool, error) {
 }
 func (f fakeEngine) ContainerExists(context.Context, string) (bool, error) {
 	return f.container, nil
+}
+func (f fakeEngine) ListByPrefix(_ context.Context, prefix string) ([]string, error) {
+	var out []string
+	for _, name := range f.setupOrphans {
+		if strings.HasPrefix(name, prefix) {
+			out = append(out, name)
+		}
+	}
+	return out, nil
 }
 
 // initWorkspace generates a full valid workspace and returns its dir.
@@ -127,6 +137,30 @@ func TestDoctorFreshWorkspaceAllOK(t *testing.T) {
 		if find(results, want) == nil {
 			t.Errorf("missing OK check %q in %v", want, results)
 		}
+	}
+}
+
+func TestDoctorWarnsAbandonedSetupContainers(t *testing.T) {
+	dir := initWorkspace(t)
+	results := Run(context.Background(), Options{
+		Workspace: dir,
+		Engine: fakeEngine{
+			imageExists:  true,
+			setupOrphans: []string{"piccolo-setup-gws-1791932406936295000"},
+		},
+		LookupEnv: func(string) (string, bool) { return "", false },
+	})
+	if Failed(results) {
+		t.Fatalf("abandoned one-shot containers must only warn: %v", results)
+	}
+	found := false
+	for _, r := range results {
+		if r.Status == WARN && strings.Contains(r.Message, "abandoned integration one-shot") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected orphan warning in %v", results)
 	}
 }
 

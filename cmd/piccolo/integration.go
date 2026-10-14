@@ -9,7 +9,9 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -43,6 +45,7 @@ type integrationRunner interface {
 	Ping(context.Context) error
 	BuildImage(context.Context, io.Reader, docker.ImageBuildOptions, io.Writer) error
 	Run(context.Context, docker.Spec) (docker.Process, error)
+	RemoveByPrefix(context.Context, string) ([]string, error)
 }
 
 var newIntegrationRunner = func() integrationRunner { return docker.New() }
@@ -517,7 +520,7 @@ func integrationStatusResult(ctx context.Context, runner integrationRunner, layo
 		}, nil
 	}
 	entrypoint, command := splitEntrypointCommand(item.StatusCommand)
-	stdout, stderr, code, err := runContainerCaptureWithExitCode(ctx, runner, docker.Spec{Image: image, Source: layout.PicoclawHome(), Volumes: integrationSetupBinds(layout), Entrypoint: entrypoint, Command: command, Env: nil, Labels: map[string]string{docker.LabelWorkspace: workspaceRoot}})
+	stdout, stderr, code, err := runContainerCaptureWithExitCode(ctx, runner, docker.Spec{Name: statusContainerName(item.Name), Image: image, Source: layout.PicoclawHome(), Volumes: integrationSetupBinds(layout), Entrypoint: entrypoint, Command: command, Env: nil, Labels: map[string]string{docker.LabelWorkspace: workspaceRoot}})
 	if err != nil {
 		return picintegration.StatusResult{}, fmt.Errorf("status integration %s: %w", item.Name, err)
 	}
@@ -761,9 +764,21 @@ func runIntegrationSetup(cmd *cobra.Command, name string) error {
 		return fmt.Errorf("docker daemon not reachable: %w", err)
 	}
 	fmt.Fprintf(out, "Running setup for %s in a temporary container...\n", displayIntegration(*found))
+	// Only request a container PTY when the host really has a terminal. With a
+	// PTY the wizard reads from /dev/tty, so closing the attach stream on piped
+	// stdin does NOT deliver EOF: the one-shot would block forever and leak the
+	// container (holding its published ports). Without a host TTY we run the
+	// integration's non-interactive path instead, which exits promptly.
+	wantTTY := found.SetupRequiresTTY && term.IsTerminal(int(os.Stdin.Fd()))
+	if found.SetupRequiresTTY && !wantTTY {
+		fmt.Fprintf(out, "No terminal attached; running setup non-interactively.\n")
+	}
+	if removed, err := runner.RemoveByPrefix(ctx, docker.SetupContainerPrefix+sanitizeForName(found.Name)); err == nil && len(removed) > 0 {
+		fmt.Fprintf(out, "Removed %d abandoned setup container(s): %s\n", len(removed), strings.Join(removed, ", "))
+	}
 	setupEntrypoint, setupCommand := splitEntrypointCommand(found.SetupCommand)
 	spec := docker.Spec{
-		Name:       temporarySetupContainerName(found.Name),
+		Name:       setupContainerName(found.Name),
 		Image:      m.Container.Image,
 		Network:    m.Container.Network,
 		Source:     layout.PicoclawHome(),
@@ -772,10 +787,10 @@ func runIntegrationSetup(cmd *cobra.Command, name string) error {
 		Volumes:    integrationSetupBinds(layout),
 		Entrypoint: setupEntrypoint,
 		Command:    setupCommand,
-		TTY:        found.SetupRequiresTTY,
+		TTY:        wantTTY,
 		Labels:     map[string]string{docker.LabelWorkspace: dir},
 	}
-	tty, err := enterInteractiveTerminal(spec.TTY)
+	tty, err := enterInteractiveTerminal(wantTTY)
 	if err != nil {
 		return fmt.Errorf("prepare terminal for interactive setup: %w", err)
 	}
@@ -787,10 +802,14 @@ func runIntegrationSetup(cmd *cobra.Command, name string) error {
 	}
 	stopSync := syncPTYSize(ctx, proc, tty)
 	defer stopSync()
+	// Interrupts must cancel the wait so the one-shot is stopped and removed
+	// rather than left running (it would otherwise squat on its ports forever).
+	sigCtx, stopSignals := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
+	defer stopSignals()
 	go func() { _, _ = io.Copy(proc.Stdin(), cmd.InOrStdin()); _ = proc.Stdin().Close() }()
 	go func() { _, _ = io.Copy(out, proc.Stdout()) }()
 	go func() { _, _ = io.Copy(cmd.ErrOrStderr(), proc.Stderr()) }()
-	code, waitErr := proc.Wait(ctx)
+	code, waitErr := proc.Wait(sigCtx)
 	// Restore the host terminal before printing anything else, so the
 	// follow-up hints render through the normal line discipline.
 	tty.Restore()
@@ -832,10 +851,13 @@ func runContainerCaptureWithExitCode(ctx context.Context, runner integrationRunn
 	var stdout, stderr bytes.Buffer
 	stdoutDone := make(chan struct{})
 	stderrDone := make(chan struct{})
+	// Cancel the wait on interrupt so the one-shot is always removed.
+	sigCtx, stopSignals := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
+	defer stopSignals()
 	go func() { _, _ = io.Copy(&stdout, proc.Stdout()); close(stdoutDone) }()
 	go func() { _, _ = io.Copy(&stderr, proc.Stderr()); close(stderrDone) }()
 	_ = proc.Stdin().Close()
-	code, waitErr := proc.Wait(ctx)
+	code, waitErr := proc.Wait(sigCtx)
 	<-stdoutDone
 	<-stderrDone
 	shutdownErr := proc.Shutdown(0)
@@ -950,8 +972,31 @@ func upsertBuildIntegration(in []runtimeimage.Integration, item runtimeimage.Int
 	return append(in, item)
 }
 
-func temporarySetupContainerName(name string) string {
-	return fmt.Sprintf("piccolo-setup-%s-%d", name, time.Now().UnixNano())
+// setupContainerName is deterministic per integration (no per-run timestamp).
+// A stable name is what lets Piccolo detect and reclaim a one-shot container
+// orphaned by an interrupted previous run instead of failing on resource
+// conflicts forever.
+func setupContainerName(name string) string {
+	return docker.SetupContainerPrefix + sanitizeForName(name)
+}
+
+// statusContainerName follows the same deterministic rule for status one-shots,
+// under its own sub-prefix so a status run never reclaims a setup run.
+func statusContainerName(name string) string {
+	return docker.SetupContainerPrefix + "status-" + sanitizeForName(name)
+}
+
+func sanitizeForName(name string) string {
+	sanitized := strings.Map(func(r rune) rune {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' || r == '_' {
+			return r
+		}
+		return '-'
+	}, strings.TrimSpace(name))
+	if sanitized == "" {
+		return "integration"
+	}
+	return sanitized
 }
 
 func displayIntegration(in manifest.Integration) string {

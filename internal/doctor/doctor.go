@@ -15,6 +15,7 @@ import (
 
 	"gopkg.in/yaml.v3"
 
+	"github.com/kimus/piccolo/internal/docker"
 	"github.com/kimus/piccolo/internal/generate"
 	"github.com/kimus/piccolo/internal/manifest"
 	"github.com/kimus/piccolo/internal/picoclaw"
@@ -27,6 +28,7 @@ type Engine interface {
 	Ping(ctx context.Context) error
 	ImageExists(ctx context.Context, image string) (bool, error)
 	ContainerExists(ctx context.Context, name string) (bool, error)
+	ListByPrefix(ctx context.Context, prefix string) ([]string, error)
 }
 
 // Status is the severity of one check result.
@@ -175,6 +177,11 @@ func Run(ctx context.Context, opts Options) []Result {
 	if opts.Engine != nil {
 		if exists, err := opts.Engine.ContainerExists(ctx, m.Container.Name); err == nil && exists {
 			add(WARN, "stale container %q exists (serve will replace it)", m.Container.Name)
+		}
+		// One-shot setup/status containers are reclaimed automatically before
+		// the next run, but a leftover means a previous attempt was interrupted.
+		if names, err := opts.Engine.ListByPrefix(ctx, docker.SetupContainerPrefix); err == nil && len(names) > 0 {
+			add(WARN, "%d abandoned integration one-shot container(s): %s (removed on the next setup/status run)", len(names), strings.Join(names, ", "))
 		}
 	}
 
