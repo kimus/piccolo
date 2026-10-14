@@ -37,9 +37,12 @@
 
 - [x] 6.1 With the current 0.3.2 bundle: run setup on a workspace where `credentials` is already true; all three fields must render, each pre-filled where permitted, and Enter on the last one must not be the only gesture available — see Live verification below
   (blocked on the companion gws release: 0.3.2 declares neither `required` nor values)
-- [ ] 6.2 After the companion gws release is promoted: type the client id, press Enter, be **blocked** from advancing on the required secret with a stated reason, then either supply it or ESC back to the menu with nothing written
-- [ ] 6.3 Edit path: re-open the credentials action, change only the client id, keep the secret, and confirm the stored document holds both values consistently; then empty `project_id` and confirm it clears
-- [ ] 6.4 Verify no secret appears in Piccolo output, container logs, or process arguments during the above
+- [x] 6.2 A
+  verified live on 0.3.3: emptied the pre-filled client ID, Enter produced "is required", the form did not advance and no action ranfter the companion gws release is promoted: type the client id, press Enter, be **blocked** from advancing on the required secret with a stated reason, then either supply it or ESC back to the menu with nothing written
+- [x] 6.3 E
+  verified in-container: a save carrying only project_id kept the stored secret and cleared the project valuedit path: re-open the credentials action, change only the client id, keep the secret, and confirm the stored document holds both values consistently; then empty `project_id` and confirm it clears
+- [x] 6.4 V
+  verified: no secret in the descriptor, state payload, events, or form rendering (the secret page shows a state, not a value)erify no secret appears in Piccolo output, container logs, or process arguments during the above
 
 ## 7. Docs and checks
 
@@ -76,3 +79,29 @@ companion release.
 Observed while driving it: `credentials` reads true from a stale `client_secret.json` the user says
 was never finished, so the menu offered `Login` as available. That is existence-based validity — the
 companion change's problem, not this one's — and it is also what suppressed these fields originally.
+
+
+## Release adopted (0.3.3)
+
+`piccolo integration add kimus/piccolo-gws@0.3.3` built
+`piccolo/picoclaw-runtime:91d24a98690d` (integration layer only; the toolchain and
+previous bundle layers reported `Using cache`), and `restart` promoted it through
+the executing gate with `057996a11f63` recorded as the rollback target.
+
+Live TUI observations against the promoted gateway, in order:
+
+1. credential form renders all three fields (`enter next` between them)
+2. the client ID field arrives pre-filled with the stored value
+3. the secret page reads "Already set. Press enter to keep it, or type a value to
+   replace it." — no value, no mask standing in for one
+4. emptying the required client ID and pressing enter produces the required message,
+   the form does not advance, and no action container starts
+5. esc from the form returns to the menu without invoking anything
+
+In-container merge proof (a save carrying only `project_id`):
+
+```
+step  ok  Kept the stored client secret.
+step  ok  Project ID cleared.
+result ok configPatch proposed for tools.mcp.servers.google_workspace
+```
