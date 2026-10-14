@@ -62,7 +62,7 @@ curl -fsSL https://kimus.github.io/piccolo/install.sh | sh
 Install a specific version:
 
 ```sh
-curl -fsSL https://kimus.github.io/piccolo/install.sh | sh -s -- --version 3.1.0
+curl -fsSL https://kimus.github.io/piccolo/install.sh | sh -s -- --version 0.2.0
 ```
 
 The installer downloads the matching GitHub Release archive, verifies `checksums.txt`, and installs only the host `piccolo` CLI. It does not install Docker, PicoClaw, Devbox/Nix, or integrations.
