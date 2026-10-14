@@ -527,6 +527,19 @@ func (sc *serveContext) recordPreviousImage(image string) {
 
 type setupProgressWriter struct{}
 
+// drainPump gives the stdio pump a moment to finish, then stops waiting for it.
+// The pump blocks reading os.Stdin and nothing here closes that descriptor, so a
+// session whose stdin stays open -- a pipe from `tail -f`, a supervisor, a
+// terminal with no Ctrl-D -- could otherwise keep `restart --foreground` running
+// forever after the gateway had already been reverted or stopped. A hung
+// command after a successful revert is strictly worse than an unflushed line.
+func drainPump(done <-chan struct{}) {
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+	}
+}
+
 // dumpLogs prints the last N log lines of the container to stderr.
 func dumpLogs(ctx context.Context, sc *serveContext, tail string) {
 	rc, err := sc.runner.Logs(ctx, sc.spec.Name, false, tail)
@@ -641,8 +654,11 @@ func runServeForeground(cmd *cobra.Command) error {
 			}
 			break
 		}
-		fmt.Fprintf(sc.stdout, "\nPromotion gate failed while attached; stopping the candidate ...\n")
-		_ = proc.Shutdown(stopGrace)
+		// Deliberately NOT proc.Shutdown here: Shutdown removes the container,
+		// and revert prints the candidate's logs before deleting it. Stopping it
+		// first would leave the failure report saying "logs unavailable" and
+		// destroy the only evidence of why the promotion failed. revert removes
+		// the candidate itself, after capturing.
 		restored, rerr := sc.swap.revert(ctx, failure, func(ctx context.Context, tail string) string {
 			return captureLogs(ctx, sc, tail)
 		})
@@ -650,7 +666,7 @@ func runServeForeground(cmd *cobra.Command) error {
 			return rerr
 		}
 		fmt.Fprintf(sc.stdout, "\n\u2713 previous gateway restored (%s) — the promoted image was not adopted\n", restored)
-		<-pumpDone
+		drainPump(pumpDone)
 		cmd.SilenceErrors = true
 		return fmt.Errorf("gateway promotion failed")
 	}
@@ -661,7 +677,7 @@ func runServeForeground(cmd *cobra.Command) error {
 	if code := proc.ExitCode(); code > 0 {
 		exitCode = code
 	}
-	<-pumpDone
+	drainPump(pumpDone)
 	if exitCode != 0 {
 		cmd.SilenceErrors = true
 		os.Exit(exitCode)

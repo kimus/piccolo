@@ -234,3 +234,18 @@ func TestBundleSegmentCannotEscapeContext(t *testing.T) {
 		}
 	}
 }
+
+// The install loop must skip packaging residue too: commands may be recorded
+// correctly while the files still get copied into the bundle, and installing
+// ._x into /usr/local/bin would ship a resource fork as a "tool".
+func TestBundleInstallBlockSkipsPackagingResidue(t *testing.T) {
+	plan, err := BuildPlan(Options{BaseImage: "b", Bundles: []IntegrationBundle{{Package: "kimus/x", Version: "1", Digest: "sha256:aaaa", Commands: []string{"x"}}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"._*) continue", ".DS_Store) continue"} {
+		if !strings.Contains(plan.Dockerfile, want) {
+			t.Errorf("bundle install block missing residue guard %q:\n%s", want, plan.Dockerfile)
+		}
+	}
+}

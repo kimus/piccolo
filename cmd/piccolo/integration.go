@@ -558,7 +558,7 @@ func integrationStatusResult(ctx context.Context, runner integrationRunner, layo
 				Label:       "Status command",
 				Status:      "unknown",
 				Message:     "integration descriptor did not declare a status command",
-				Remediation: "Run 'piccolo integration upgrade " + item.Name + "' after installing a version that supports status.",
+				Remediation: "Run 'piccolo integration upgrade " + upgradeHint(item) + "' after installing a version that supports status.",
 			}},
 		}, nil
 	}
@@ -1094,6 +1094,19 @@ func installedCommands(bundleCommands []string, descriptorCommands picintegratio
 		return append([]string(nil), bundleCommands...)
 	}
 	return append([]string(nil), descriptorCommands...)
+}
+
+// upgradeHint names an integration the way every other user-facing command does
+// -- by package reference, never by its short internal name -- so a remediation
+// line cannot suggest a form Piccolo's own docs rule out.
+func upgradeHint(in manifest.Integration) string {
+	if pkg := strings.TrimSpace(in.Package); pkg != "" {
+		return strings.TrimPrefix(pkg, "github:")
+	}
+	if ref := strings.TrimSpace(in.Ref); ref != "" {
+		return ref
+	}
+	return in.Name
 }
 
 func displayIntegration(in manifest.Integration) string {

@@ -511,7 +511,7 @@ func renderBundleInstallBlock(bundles []IntegrationBundle) string {
 		b.WriteString(fmt.Sprintf("COPY %s/ /opt/piccolo/%s/\n", dir, dir))
 		b.WriteString(fmt.Sprintf("RUN set -eu; src=/opt/piccolo/%s; \\\n", dir))
 		b.WriteString(" if [ -d \"$src/nix/store\" ]; then mkdir -p /nix/store; cp -a \"$src/nix/store/.\" /nix/store/; fi; \\\n")
-		b.WriteString(" if [ -d \"$src/bin\" ]; then for bin in \"$src\"/bin/*; do [ -f \"$bin\" ] || continue; install -m 0755 \"$bin\" /usr/local/bin/\"$(basename \"$bin\")\"; done; fi")
+		b.WriteString(" if [ -d \"$src/bin\" ]; then for bin in \"$src\"/bin/*; do [ -f \"$bin\" ] || continue; case \"$(basename \"$bin\")\" in ._*) continue;; .DS_Store) continue;; esac; install -m 0755 \"$bin\" /usr/local/bin/\"$(basename \"$bin\")\"; done; fi")
 		for _, cmd := range commands {
 			b.WriteString(fmt.Sprintf("; command -v %s >/dev/null", shellQuote(cmd)))
 		}

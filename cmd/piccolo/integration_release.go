@@ -226,7 +226,7 @@ func extractIntegrationArchive(data []byte) (string, []string, error) {
 	}
 	var commands []string
 	for _, e := range entries {
-		if !e.IsDir() {
+		if !e.IsDir() && !isBundleJunk(e.Name()) {
 			commands = append(commands, e.Name())
 		}
 	}
@@ -235,4 +235,18 @@ func extractIntegrationArchive(data []byte) (string, []string, error) {
 		return "", nil, fmt.Errorf("integration archive contains no bin commands")
 	}
 	return root, commands, nil
+}
+
+// isBundleJunk reports archive residue that is not an integration binary.
+// macOS tar writes an AppleDouble sidecar (._x) for every file carrying
+// extended attributes, and those land in bin/ next to the real programs. Without
+// this filter a bundle packaged on a Mac gains phantom "commands" that the image
+// then installs into /usr/local/bin and verifies -- so the build fails on a
+// resource fork, or worse, succeeds carrying it.
+func isBundleJunk(name string) bool {
+	switch {
+	case strings.HasPrefix(name, "._"), strings.HasPrefix(name, ".DS_Store"), name == "Thumbs.db":
+		return true
+	}
+	return false
 }

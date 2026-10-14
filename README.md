@@ -505,6 +505,8 @@ All commands resolve the workspace the same way: `-D/--dir` flag, else the curre
 - No PicoClaw binary bundling/downloading — the container image is the runtime
 - No custom TUI — `piccolo chat` reuses PicoClaw's own terminal client
 - No `add-agent` command — edit `config.json` + create the workspace dir by hand; `doctor` catches mistakes
+- No `integration remove` command — uninstalling means deleting the entry from `runtime.integrations` in `piccolo.yaml` and rebuilding (`piccolo image build --set && piccolo restart`). Integration *state* under `integrations/<owner>/<repo>` is yours to keep or delete
+- No private integration repositories — the release fetcher sends no credentials, so `piccolo integration add` of a private `owner/repo` fails with 404 rather than a permission error. Publish integration releases publicly for now
 - No full channel automation — setup can guide credentials and links, but provider-side app/server installation is still done in Discord/Telegram/Slack
 
 ## Acknowledgements

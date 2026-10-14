@@ -776,3 +776,31 @@ func TestRefreshInstalledIdentityAlignsTheRecord(t *testing.T) {
 		t.Errorf("recomputing the plan changed the tag: %s vs %s", again.Tag, plan.Tag)
 	}
 }
+
+// A bundle packaged on macOS carries an AppleDouble sidecar for every file with
+// extended attributes. Those are not integration binaries: counting them as
+// commands makes the image install resource forks onto PATH and then verify
+// them, so the build fails on -- or ships -- junk like ._piccolo-math.
+func TestExtractIntegrationArchiveIgnoresPackagingJunk(t *testing.T) {
+	var buf bytes.Buffer
+	zw := gzip.NewWriter(&buf)
+	tw := tar.NewWriter(zw)
+	write := func(name, body string, mode int64) {
+		_ = tw.WriteHeader(&tar.Header{Name: name, Typeflag: tar.TypeReg, Mode: mode, Size: int64(len(body))})
+		_, _ = tw.Write([]byte(body))
+	}
+	write("./bin/piccolo-math", "#!/bin/sh\n", 0o755)
+	write("./bin/._piccolo-math", "macos resource fork", 0o644)
+	write("./bin/.DS_Store", "finder metadata", 0o644)
+	_ = tw.Close()
+	_ = zw.Close()
+
+	root, commands, err := extractIntegrationArchive(buf.Bytes())
+	if err != nil {
+		t.Fatalf("extract: %v", err)
+	}
+	defer os.RemoveAll(root)
+	if strings.Join(commands, ",") != "piccolo-math" {
+		t.Errorf("commands = %v, want only the real binary", commands)
+	}
+}
