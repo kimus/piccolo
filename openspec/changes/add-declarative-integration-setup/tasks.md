@@ -72,6 +72,7 @@
 - [x] 8.8 Test that a descriptor without actions still uses the legacy TTY path
 - [x] 8.9 Run `go build ./...`, `go vet ./...`, `go test ./...`
 - [ ] 8.10 Live verify with `piccolo-gws`: add → setup menu → import credentials via file picker → browser login via courier → confirmed config diff → `status` green
+  PARTIAL: routing, menu rendering, per-file confirm, the courier relay against a live `gws` loopback, and the non-interactive refusal path are verified. The full browser-login run needs the user's Desktop-app OAuth client and is the next live test.
 - [x] 8.11 Update README for Piccolo-owned setup UI and the action/state/call contract, and AGENTS.md for the descriptor seam
 - [x] 8.12 Document the contract surface for integration authors (actions, state keys, event envelope, patch scope)
 
@@ -109,6 +110,7 @@
 - [x] 12.3 Verify the test catches the original ordering bug (fails with "unexpected argument" when the flag precedes the subcommand)
 - [x] 12.4 Keep the default daemon-free `go test ./...` unaffected (build tag + skip without PICCOLO_CONTRACT_IMAGE)
 - [ ] 12.5 Follow-up: run it in CI (needs a job that builds a runtime image; deliberately not wired here to avoid introducing flaky CI)
+  TRACKED: now `wire-integration-contract-test-in-ci`, which builds a minimal runtime image instead of the 8.3 GB default one.
 
 ## 13. Interrupt-safe, bounded actions
 

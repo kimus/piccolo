@@ -1,5 +1,4 @@
 ## ADDED Requirements
-
 ### Requirement: Runtime status reports toolchain state
 Piccolo SHALL provide a runtime status view that summarizes configured packages, configured commands, exposed-command availability, and persisted runtime volume/cache information when available.
 
@@ -18,34 +17,23 @@ Piccolo SHALL provide a runtime status view that summarizes configured packages,
 - **THEN** runtime status still reports the configured packages and commands from `piccolo.yaml`
 - **AND** reports that live command availability could not be checked
 
-### Requirement: Runtime apply reconciles the configured toolchain
-Piccolo SHALL provide an explicit command to apply the configured runtime toolchain to a running gateway container without requiring a full image rebuild.
+### Requirement: Runtime apply reports whether the image provides the toolchain
 
-#### Scenario: Apply updates running container
-- **WHEN** the gateway container is running
-- **AND** the user runs the runtime apply command
-- **THEN** Piccolo installs/reconciles configured packages
-- **AND** updates Piccolo-owned command symlinks in the container
+Piccolo SHALL compare the toolchain the workspace configures with the toolchain the running image records, report a mismatch with the reason, and name the rebuild command. Piccolo SHALL NOT install packages into a running container: the toolchain is image content, and installing at runtime would recreate the two-sources-of-truth problem the image-owned toolchain removes.
 
-#### Scenario: Apply reports missing container
-- **WHEN** the gateway container is not running
-- **AND** the user runs the runtime apply command
-- **THEN** Piccolo reports that `serve` or `restart` is needed before applying to a container
+#### Scenario: Toolchain does not match the running image
 
-### Requirement: Runtime cleanup is explicit
-Piccolo SHALL distinguish safe toolchain apply from cache cleanup and destructive volume reset.
+- **WHEN** the configured toolchain differs from what the running image recorded
+- **THEN** Piccolo reports the mismatch and names the rebuild command
+- **AND** it starts no package installation
+- **AND** it performs no build on the user's behalf
 
-#### Scenario: Apply does not delete cache by default
-- **WHEN** a package is removed from `runtime.toolchain.packages`
-- **AND** the toolchain is applied
-- **THEN** Piccolo does not delete persisted Nix store data by default
+#### Scenario: Toolchain matches
 
-#### Scenario: Prune is explicit
-- **WHEN** the user invokes runtime prune
-- **THEN** Piccolo attempts supported Devbox/Nix garbage collection or reports that pruning is unsupported
-- **AND** it does not remove the runtime volumes wholesale
+- **WHEN** the configured toolchain equals what the running image records
+- **THEN** Piccolo reports that the running image matches the configuration
 
-#### Scenario: Reset cache is explicit and destructive
-- **WHEN** the user invokes runtime reset-cache and confirms the operation
-- **THEN** Piccolo removes the persisted Devbox/Nix runtime volumes used for toolchain state
-- **AND** the next `serve` or `restart` reinstalls the configured toolchain from scratch
+#### Scenario: Image is not available locally
+
+- **WHEN** the configured runtime image is not present locally
+- **THEN** Piccolo refuses and names the command that builds it

@@ -31,19 +31,24 @@ The system SHALL document the Piccolo workspace directory layout in `README.md`,
 - **THEN** it documents that `picoclaw/` mounts to `/root/.picoclaw`, `integrations/` mounts to `/root/.piccolo/integrations`, and runtime cache directories mount to their container paths
 
 ### Requirement: Mount structured directories into container
-The system SHALL mount structured workspace directories into the gateway and setup containers at stable in-container paths.
+
+Piccolo SHALL mount the workspace's PicoClaw home and integration state into the gateway container at their container-side locations, and SHALL mount only the media cache. No host directory SHALL be mounted over the container's Nix store, because doing so hides the store baked into the runtime image.
 
 #### Scenario: PicoClaw home mount
+
 - **WHEN** Piccolo starts the gateway container
 - **THEN** it bind-mounts `<workspace>/picoclaw` to `/root/.picoclaw`
 
 #### Scenario: Integration state mount
-- **WHEN** Piccolo starts a gateway or integration setup container
+
+- **WHEN** Piccolo starts the gateway container
 - **THEN** it bind-mounts `<workspace>/integrations` to `/root/.piccolo/integrations`
 
-#### Scenario: Runtime cache mounts
-- **WHEN** Piccolo starts a local runtime image
-- **THEN** it bind-mounts `<workspace>/runtime/devbox` to `/root/.local/share/devbox/global/default`, `<workspace>/runtime/nix` to `/nix`, and `<workspace>/runtime/media` to `/tmp/picoclaw_media`
+#### Scenario: Media mirror mount
+
+- **WHEN** Piccolo starts a gateway container from a locally built runtime image
+- **THEN** it bind-mounts `<workspace>/runtime/media` to `/tmp/picoclaw_media` and to each agent workspace's `media/`
+- **AND** it mounts nothing over `/nix`
 
 ### Requirement: Keep integration state outside PicoClaw home on host
 The system SHALL store integration durable state under the top-level `integrations/` directory on the host, using a child directory whose name matches the integration descriptor name.
@@ -60,16 +65,25 @@ The system SHALL store integration durable state under the top-level `integratio
 - **WHEN** the `gws` integration uses `/root/.piccolo/integrations/gws` inside the container
 - **THEN** it reads and writes the host path `<workspace>/integrations/gws`
 
-### Requirement: Keep runtime cache visible and gitignored
-The system SHALL store runtime cache/state under top-level `runtime/` and ensure it is not committed to source control by default.
+### Requirement: Keep the media cache visible and gitignored
+
+Piccolo SHALL create only the runtime cache it actually mounts, and SHALL keep it git-ignored. The Devbox profile and Nix cache directories are not created: the toolchain is image content, and those caches existed only to be mounted over `/nix`.
 
 #### Scenario: Runtime cache directories
-- **WHEN** a workspace is initialized or migrated
-- **THEN** Piccolo creates or expects `runtime/devbox`, `runtime/nix`, and `runtime/media`
+
+- **WHEN** Piccolo creates or migrates a workspace
+- **THEN** it creates `runtime/media` under the workspace
+- **AND** it does not create `runtime/devbox` or `runtime/nix`
 
 #### Scenario: Gitignore runtime cache
-- **WHEN** Piccolo creates or updates `.gitignore`
-- **THEN** it ignores `runtime/` cache contents and integration auth state
+
+- **WHEN** the generated `.gitignore` is written or updated
+- **THEN** `runtime/` content is ignored so caches and secrets never enter version control
+
+#### Scenario: Older workspaces keep their leftovers
+
+- **WHEN** a workspace still contains `runtime/devbox` or `runtime/nix` from an earlier layout
+- **THEN** Piccolo neither mounts nor deletes them
 
 ### Requirement: Migrate flat workspaces
 The system SHALL provide an explicit migration path from the previous flat workspace layout to the structured layout.

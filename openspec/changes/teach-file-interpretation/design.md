@@ -1,5 +1,12 @@
 ## Context
 
+> **Partially superseded by `bake-runtime-toolchain-into-image`.** "Missing file-handling tools are
+> installed on demand" is false: the toolchain is image content and no installer exists in the
+> container. The requirement was rewritten to "reported, not installed", which is also what the
+> generated skill text now says. Everything else here still stands.
+
+
+
 Piccolo generates PicoClaw workspaces once and then treats `config.json` and agent files as user-owned. Generated agents currently include role guidance and tool allowlists, and Piccolo already supports image understanding through `load_image` plus `agents.defaults.image_model`. However, image understanding is not the same as exact decoding: a vision model can recognize a QR code but should not be expected to extract its payload reliably.
 
 The desired behavior is instructional rather than architectural. The agent should learn a reusable PicoClaw skill for common files and images: use vision for visual understanding, but use deterministic tools through `exec` when exact decoding, text extraction, metadata, or structured parsing is required. In Piccolo's Docker runtime, missing Debian/Ubuntu tools may be installed on demand when exec is available; the install is allowed to be ephemeral because the container environment is disposable.

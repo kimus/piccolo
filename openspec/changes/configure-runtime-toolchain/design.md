@@ -1,5 +1,16 @@
 ## Context
 
+> **Partially superseded by `bake-runtime-toolchain-into-image`.** Three requirements this change
+> shipped are no longer true and were removed from its spec delta so the capability baseline cannot
+> record them: "Runtime image remains a generic Devbox-capable base" and "Serve applies runtime
+> toolchain after health" (the toolchain is baked into the image and nothing installs at start), and
+> "Runtime cleanup is explicit" (`runtime prune` and `runtime reset-cache` were deleted with the
+> caches they maintained). "Runtime apply reconciles the configured toolchain" was rewritten to what
+> `apply` does now: compare and point at the rebuild. What still stands: the `runtime.toolchain`
+> manifest section, its defaults, and `runtime status` reporting live command availability.
+
+
+
 Piccolo now builds a Devbox-capable PicoClaw runtime image and runs `piccolo-setup-tools` after the gateway is healthy. The current setup script installs a fixed package list and symlinks a fixed command list into `/usr/local/bin` by resolving real `/nix/store` binaries through `devbox shellenv`.
 
 Live use exposed the next boundary:

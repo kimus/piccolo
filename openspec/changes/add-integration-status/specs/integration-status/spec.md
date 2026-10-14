@@ -75,7 +75,7 @@ The system SHALL run status commands in a temporary container with the structure
 
 #### Scenario: Status container preserves image Nix store
 - **WHEN** Piccolo runs an integration status command
-- **THEN** the status container does not mount `<workspace>/runtime/nix` over `/nix`
+- **THEN** the status container mounts no host directory over `/nix`
 
 ### Requirement: Exit code reflects status
 The system SHALL return a non-zero exit code when any checked integration reports an overall `fail` status or when status execution/parsing fails.

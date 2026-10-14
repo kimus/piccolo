@@ -45,4 +45,4 @@
 
 - [x] 7.1 Run `go test ./...`.
 - [x] 7.2 Validate `restructure-workspace-layout` OpenSpec artifacts.
-- [ ] 7.3 Smoke-test a migrated `.data` workspace through `doctor`, `integration setup`, `restart`, and `chat -m` where Docker is available.
+- [x] 7.3 Smoke-test a migrated `.data` workspace through `doctor`, `integration setup`, `restart`, and `chat -m` where Docker is available. (done: doctor clean, restart promoted a new image, `chat -m` ran a turn, `integration status` ran one-shots)

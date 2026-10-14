@@ -1,5 +1,13 @@
 ## Context
 
+> **Partially superseded by `bake-runtime-toolchain-into-image`.** Two requirements named
+> `runtime/devbox` and `runtime/nix` as mounted/created directories. Mounting a host Nix cache over
+> `/nix` is the defect that made image binaries unexecutable, so those requirements were rewritten:
+> `runtime/media` is the only cache Piccolo creates or mounts, and leftovers in older workspaces are
+> neither mounted nor deleted.
+
+
+
 Piccolo's original PoC used the workspace directory itself as PicoClaw home and mounted it directly to `/root/.picoclaw`. That kept the implementation small, but it mixed Piccolo launch config, PicoClaw runtime files, integration state, uploaded media, Devbox state, and Nix cache concerns in one place or in opaque Docker volumes.
 
 The containerized integration work made this confusing: users expect Google Workspace state under an integration-name-based path such as `integrations/gws`, and they expect runtime caches such as Nix/Devbox to have visible, understandable locations. The project now needs a clearer workspace contract even though it is a breaking layout change from the original hard constraint.

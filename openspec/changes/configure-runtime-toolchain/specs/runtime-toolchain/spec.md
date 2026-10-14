@@ -1,5 +1,4 @@
 ## ADDED Requirements
-
 ### Requirement: Manifest declares runtime toolchain packages and commands
 Piccolo SHALL support a Piccolo-owned `runtime.toolchain` section in `piccolo.yaml` containing Devbox/Nix package names and command names to expose on the container PATH.
 
@@ -16,30 +15,6 @@ Piccolo SHALL support a Piccolo-owned `runtime.toolchain` section in `piccolo.ya
 #### Scenario: Missing toolchain remains compatible
 - **WHEN** an existing workspace lacks `runtime.toolchain`
 - **THEN** Piccolo treats the toolchain as the current generated default unless the user explicitly writes a custom list
-
-### Requirement: Toolchain application exposes configured commands
-Piccolo SHALL apply the configured runtime toolchain by installing configured packages with Devbox and symlinking configured commands' resolved real binaries into `/usr/local/bin`.
-
-#### Scenario: Serve applies configured toolchain
-- **WHEN** `piccolo serve` or `piccolo restart` starts a gateway container successfully
-- **THEN** Piccolo applies the configured runtime toolchain after the health check
-- **AND** configured commands are available on PATH inside the container
-
-#### Scenario: Command provided by existing package is exposed
-- **WHEN** `runtime.toolchain.packages` includes `poppler-utils`
-- **AND** `runtime.toolchain.commands` includes `pdfinfo`, `pdftoppm`, and `pdftocairo`
-- **THEN** applying the toolchain symlinks those commands into `/usr/local/bin` when Devbox exposes them
-
-#### Scenario: Removed command stops being exposed
-- **WHEN** a command previously exposed by Piccolo is removed from `runtime.toolchain.commands`
-- **AND** the toolchain is applied again
-- **THEN** Piccolo removes the Piccolo-owned `/usr/local/bin/<command>` symlink
-- **AND** it does not delete unrelated container binaries
-
-#### Scenario: Missing configured command is reported
-- **WHEN** a configured command cannot be resolved after package installation
-- **THEN** Piccolo reports the missing command as a warning or error in apply/serve output
-- **AND** doctor reports the command as unavailable
 
 ### Requirement: Strong media and office defaults
 The default runtime toolchain SHALL include deterministic media and office utilities sufficient for common file upload workflows.

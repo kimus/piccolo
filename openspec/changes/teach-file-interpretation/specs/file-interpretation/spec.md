@@ -13,19 +13,21 @@ Piccolo SHALL include file and image interpretation guidance as a generated Pico
 - **WHEN** the generated skill discusses exact payloads, URLs, identifiers, numbers, tables, metadata, or structured data
 - **THEN** it tells the agent to prefer deterministic command-line tools over guessing from vision or prose inspection
 
-### Requirement: Missing file-handling tools are installed on demand
-Piccolo SHALL teach generated agents that routine missing decoder, parser, extractor, OCR, metadata, and inspection tools can be installed on demand when shell execution is available.
+### Requirement: Missing file-handling tools are reported, not installed
+
+Piccolo SHALL teach generated agents that the file-handling toolchain is fixed by the runtime image, so a missing decoder, parser, extractor, OCR, metadata, or inspection tool is a condition to report rather than to install.
 
 #### Scenario: Routine file tool missing
-- **WHEN** a requested file-handling task requires a deterministic command-line tool
-- **AND** the command is missing
-- **AND** shell execution is available
-- **THEN** the generated file-handling skill tells the agent to install the relevant routine package with the system package manager
-- **AND** it tells the agent to retry the task without asking the user first
 
-#### Scenario: Installation requires user input
-- **WHEN** shell execution is unavailable, installation fails, the package is unusually invasive or heavy, the operation could alter user data, or the request is ambiguous
-- **THEN** the generated file-handling skill tells the agent to report the issue or ask the user for guidance
+- **WHEN** a required file-handling tool is not available inside the container
+- **THEN** the generated file-handling skill tells the agent to report that the runtime image was built without it
+- **AND** the agent attempts no installation
+
+#### Scenario: No package managers
+
+- **WHEN** the skill describes recovering a missing tool
+- **THEN** it forbids running any package manager (apt-get, apk, devbox, nix-env)
+- **AND** it states that the toolchain cannot be changed at runtime
 
 ### Requirement: QR and barcode decoding guidance
 Piccolo SHALL teach generated agents to decode QR codes and barcodes using deterministic decoder tooling when shell execution is available.

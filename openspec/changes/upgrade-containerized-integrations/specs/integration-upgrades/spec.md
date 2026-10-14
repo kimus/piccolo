@@ -102,4 +102,4 @@ The system SHALL run upgrade descriptor validation in a one-shot container with 
 
 #### Scenario: Descriptor container preserves image Nix store
 - **WHEN** the system validates an upgraded integration descriptor
-- **THEN** the descriptor container does not mount `<workspace>/runtime/nix` over `/nix`
+- **THEN** the descriptor container mounts no host directory over `/nix`
