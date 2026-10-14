@@ -624,7 +624,7 @@ func runDeclarativeSetup(ctx context.Context, out io.Writer, runner integrationR
 		if done {
 			break
 		}
-		patch, err := s.runAction(ctx, chosen)
+		patch, err := s.runAction(ctx, chosen, state)
 		if err != nil {
 			return err
 		}
@@ -734,12 +734,12 @@ func inputsFor(action picintegration.Action, state picintegration.State) []picin
 	return out
 }
 
-func (s *setupSession) runAction(ctx context.Context, entry *menuEntry) (json.RawMessage, error) {
+// runAction executes one chosen action. `state` is the same snapshot the menu
+// was built from, so the facts that gated availability are also the facts that
+// filter the inputs: one read per iteration, no window where the two disagree,
+// and no extra container start per action.
+func (s *setupSession) runAction(ctx context.Context, entry *menuEntry, state picintegration.State) (json.RawMessage, error) {
 	action := entry.Action
-	state, err := s.state(ctx)
-	if err != nil {
-		return nil, err
-	}
 	inputs := inputsFor(action, state)
 	values, err := renderActionInputs(action, inputs, s.hostStateDir, s.contState, s.tty)
 	if err != nil {
