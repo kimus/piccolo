@@ -841,6 +841,7 @@ func runDeclarativeSetup(ctx context.Context, out io.Writer, runner integrationR
 	// action do exactly one thing instead of shipping composite entries.
 	var pendingPatch json.RawMessage
 	var reported []actionReport
+	quitting := false
 	crashes := map[string]int{}
 	for {
 		state, err := s.state(ctx)
@@ -855,8 +856,11 @@ func runDeclarativeSetup(ctx context.Context, out io.Writer, runner integrationR
 		if err != nil {
 			if errors.Is(err, huh.ErrUserAborted) {
 				// Quitting from the menu abandons the run: a proposal from a completed
-				// action is not applied behind the user's back.
-				return nil
+				// action is not applied behind the user's back. The summary still
+				// prints, because failures the user walked away from are exactly the
+				// thing not to lose silently.
+				quitting = true
+				break
 			}
 			return err
 		}
@@ -875,8 +879,8 @@ func runDeclarativeSetup(ctx context.Context, out io.Writer, runner integrationR
 		if len(rep.patch) > 0 {
 			pendingPatch = rep.patch
 		}
+		reported = append(reported, *rep)
 		if rep.outcome.terminal() {
-			reported = append(reported, *rep)
 			if rep.outcome == outcomeCrashed {
 				crashes[rep.action]++
 				if crashes[rep.action] == 2 {
@@ -889,6 +893,10 @@ func runDeclarativeSetup(ctx context.Context, out io.Writer, runner integrationR
 		// of the session ending on top of it.
 	}
 	s.summarize(reported)
+	if quitting {
+		fmt.Fprintln(s.out, s.style.Mutedf("  left without applying a pending config change; rerun setup to review it"))
+		return nil
+	}
 	if len(pendingPatch) == 0 {
 		return nil
 	}
@@ -899,12 +907,22 @@ func runDeclarativeSetup(ctx context.Context, out io.Writer, runner integrationR
 // and words, so the command itself can exit 0: a diagnostic that correctly
 // reports a disabled API is not a failed command, and making it one is how every
 // message later gets ignored.
-func (s *setupSession) summarize(reported []actionReport) {
-	if len(reported) == 0 {
+// summarize lists only unfinished actions. The filter lives here, not in the
+// caller: a summary that prints whatever it is handed would list a success or a
+// cancel the user chose as a failure the moment a second call site appears, and
+// a summary with false entries is the thing that teaches people to skip it.
+func (s *setupSession) summarize(reports []actionReport) {
+	var unfinished []actionReport
+	for _, r := range reports {
+		if r.outcome.terminal() {
+			unfinished = append(unfinished, r)
+		}
+	}
+	if len(unfinished) == 0 {
 		return
 	}
 	fmt.Fprintln(s.out, s.style.heading("\nSome actions did not complete"))
-	for _, r := range reported {
+	for _, r := range unfinished {
 		line := fmt.Sprintf("  %s: %s", r.action, r.outcome)
 		if r.outcome == outcomeCrashed || r.outcome == outcomeTimedOut {
 			fmt.Fprintln(s.out, s.style.Crashf("%s", line))

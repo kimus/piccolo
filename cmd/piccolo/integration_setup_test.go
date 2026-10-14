@@ -902,3 +902,41 @@ func TestNewStylerOnlyColoursRealTerminals(t *testing.T) {
 		t.Error("NO_COLOR must disable colour")
 	}
 }
+
+// The summary is the only place a walked-away failure gets recorded before the
+// command exits 0, so it must render without a terminal and stay plain text.
+func TestSummarizeReportsUnfinishedActions(t *testing.T) {
+	var out bytes.Buffer
+	s := &setupSession{out: &out, style: newStyler(&out), integrationName: "gws"}
+	s.summarize([]actionReport{
+		{action: "check_connectivity", outcome: outcomeReported},
+		{action: "login", outcome: outcomeCrashed},
+		{action: "set_credentials", outcome: outcomeSucceeded},
+		{action: "check_connectivity", outcome: outcomeCancelled},
+	})
+	got := out.String()
+	if !strings.Contains(got, "Some actions did not complete") {
+		t.Fatalf("no summary rendered: %q", got)
+	}
+	if !strings.Contains(got, "check_connectivity: reported failure") {
+		t.Errorf("reported failure missing from summary: %q", got)
+	}
+	if !strings.Contains(got, "login: crashed") {
+		t.Errorf("crash missing from summary: %q", got)
+	}
+	// Successes and user cancels are not unfinished work.
+	if strings.Contains(got, "set_credentials") || strings.Contains(got, "cancelled") {
+		t.Errorf("summary listed non-failures: %q", got)
+	}
+	// Nothing coloured when the writer is not a terminal.
+	if strings.Contains(got, "\x1b[") {
+		t.Errorf("ANSI leaked into a non-terminal writer: %q", got)
+	}
+
+	var quiet bytes.Buffer
+	qs := &setupSession{out: &quiet, style: newStyler(&quiet)}
+	qs.summarize(nil)
+	if quiet.Len() != 0 {
+		t.Errorf("a clean session should print no summary, got %q", quiet.String())
+	}
+}
