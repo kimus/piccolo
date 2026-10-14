@@ -31,7 +31,18 @@ type Engine interface {
 	ImageLabels(ctx context.Context, image string) (map[string]string, bool, error)
 	ContainerExists(ctx context.Context, name string) (bool, error)
 	ListByPrefix(ctx context.Context, prefix string) ([]string, error)
+	ListImages(ctx context.Context) ([]docker.ImageRecord, error)
+	ContainerImages(ctx context.Context) (map[string][]string, error)
 }
+
+// Unreferenced runtime images are reported once they exceed either bound, and
+// the smaller threshold wins: two images is the point where a workspace is
+// holding more than "current + rollback", and 10 GB is where accumulation
+// becomes a disk-full event rather than untidiness.
+const (
+	unreferencedImageWarnCount = 2
+	unreferencedImageWarnBytes = int64(10) << 30
+)
 
 // Status is the severity of one check result.
 type Status int
@@ -159,6 +170,7 @@ func Run(ctx context.Context, opts Options) []Result {
 	// and names the rebuild; it never starts one, because a stale image is not an
 	// error — adopting a rebuild is a user decision.
 	results = append(results, checkImageDrift(ctx, opts.Engine, m, imagePresent)...)
+	results = append(results, checkImageRetention(ctx, opts.Engine, m)...)
 
 	// 3c. An interrupted promotion leaves the previous gateway parked under the
 	// reserved name. The canonical name always belongs to what should be running,
@@ -274,6 +286,59 @@ func checkImageDrift(ctx context.Context, engine Engine, m *manifest.Manifest, i
 			"runtime image is stale: %s, wants %s (%s) — rebuild with 'piccolo image build --set && piccolo restart'; Piccolo never rebuilds implicitly",
 			info.Current, info.Desired, strings.Join(info.Reasons, "; ")),
 	}}
+}
+
+// checkImageRetention reports locally built runtime images that nothing
+// references any more. It is a warning with a count, a size, and the command:
+// deleting images on the user's behalf is never doctor's job, and the rollback
+// target in particular is the one image nothing else can recover.
+func checkImageRetention(ctx context.Context, engine Engine, m *manifest.Manifest) []Result {
+	if engine == nil {
+		return nil
+	}
+	images, err := engine.ListImages(ctx)
+	if err != nil {
+		return []Result{{Status: WARN, Message: fmt.Sprintf("runtime image retention: could not check (%v)", err)}}
+	}
+	containers, err := engine.ContainerImages(ctx)
+	if err != nil {
+		return []Result{{Status: WARN, Message: fmt.Sprintf("runtime image retention: could not check (%v)", err)}}
+	}
+	candidates := make([]runtimeplan.ImageInfo, 0, len(images))
+	for _, img := range images {
+		for _, ref := range img.RepoTags {
+			if !runtimeplan.RuntimeImagePrefix(ref, runtimeimage.DefaultTagPrefix) || strings.HasPrefix(ref, "<none>") {
+				continue
+			}
+			candidates = append(candidates, runtimeplan.ImageInfo{
+				Ref: ref, ID: img.ID, Size: img.Size, Created: img.Created,
+				Containers: append([]string(nil), containers[ref]...),
+			})
+		}
+	}
+	plan := runtimeplan.Retain(candidates, m.Container.Image, m.Container.PreviousImage)
+	if len(plan.Removable) == 0 {
+		return []Result{{Status: OK, Message: "runtime image retention: no unreferenced runtime images"}}
+	}
+	if len(plan.Removable) < unreferencedImageWarnCount && plan.Reclaimable < unreferencedImageWarnBytes {
+		return []Result{{Status: OK, Message: fmt.Sprintf("runtime image retention: %d unreferenced image(s) (%s), below the reporting threshold", len(plan.Removable), humanBytes(plan.Reclaimable))}}
+	}
+	return []Result{{Status: WARN, Message: fmt.Sprintf(
+		"runtime image retention: %d unreferenced runtime image(s), up to %s — reclaim with 'piccolo image prune' (keeps the image in use and the rollback target); Piccolo never deletes images on its own",
+		len(plan.Removable), humanBytes(plan.Reclaimable))}}
+}
+
+func humanBytes(n int64) string {
+	const unit = 1024
+	if n < unit {
+		return fmt.Sprintf("%dB", n)
+	}
+	div, exp := int64(unit), 0
+	for v := n / unit; v >= unit; v /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f%cB", float64(n)/float64(div), "KMGTPE"[exp])
 }
 
 func checkRuntimeToolchain(m *manifest.Manifest) []Result {

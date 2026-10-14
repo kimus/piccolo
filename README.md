@@ -386,14 +386,18 @@ The build uses the configured pinned PicoClaw image as its base, generates a tem
 
 The cost is disk, and it is measured rather than assumed: with the default package list the runtime image goes from **440 MB to about 8.3 GB**, and the toolchain layer alone is **5.78 GB** (libreoffice, ffmpeg, imagemagick and tesseract dominate). Two things keep that from being worse: the layer is gc-rooted and pruned in place (collection recovered ~30 MB, because the closure genuinely is that size), and layer digests are shared across tags, so rebuilding for an integration change does not pay for it again — a `0.3.1 → 0.3.2` upgrade rebuilt in ~40s with the toolchain layer reporting `Using cache`. Trim `runtime.toolchain.packages` if the full office/media set is not needed.
 
-**Old images accumulate and Piccolo never deletes them.** Every distinct toolchain/integration/base configuration is a new ~8 GB tag, and the rollback slot (`container.previous_image`) deliberately keeps an older one reachable. Check what you have and reclaim what is not referenced:
+**Old images accumulate, and Piccolo never deletes them silently.** Every distinct toolchain/integration/base configuration is a new ~8 GB tag, and the rollback slot (`container.previous_image`) deliberately keeps an older one reachable. Ask Piccolo what is there:
 
 ```sh
-docker images --format '{{.Repository}}:{{.Tag}} {{.Size}}' | grep picoclaw-runtime
-docker image prune          # dangling only; never removes a tagged image
+piccolo image list          # size, age, and why each image was kept
+piccolo image list --json
+piccolo image prune         # prints what it would remove, then asks
+piccolo image prune --yes
 ```
 
-Do not remove the tag `piccolo status` reports as `rollback:` unless you give up that rollback.
+Prune keeps three things and says so in its own report: the image in use, the recorded rollback target, and any image a container still references **in any state** — a stopped container is a live reference, and deleting its image strands it. Base PicoClaw images are never candidates. The size it quotes is an upper bound, because tags share layers; that is stated rather than hidden.
+
+`piccolo doctor` warns once unreferenced images reach 2 or 10 GB, naming the command — and still removes nothing.
 
 ```yaml
 runtime:

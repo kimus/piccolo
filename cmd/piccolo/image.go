@@ -40,9 +40,9 @@ var newImageRunner = func() imageRunner { return docker.New() }
 func newImageCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "image",
-		Short: "Build and manage Piccolo runtime images",
+		Short: "Build, list, and reclaim Piccolo runtime images",
 	}
-	cmd.AddCommand(newImageBuildCmd())
+	cmd.AddCommand(newImageBuildCmd(), newImageListCmd(), newImagePruneCmd())
 	return cmd
 }
 

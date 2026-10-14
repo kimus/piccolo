@@ -445,6 +445,86 @@ func (r *Runner) StartDetached(ctx context.Context, spec Spec) (string, error) {
 	return id, nil
 }
 
+// ImageRecord is one locally present image, with exactly what a reclamation
+// decision needs: the tags pointing at it, its reported size, and the
+// containers (running OR stopped) that were created from it.
+type ImageRecord struct {
+	ID         string
+	RepoTags   []string
+	Size       int64
+	Created    int64
+	Containers int64
+}
+
+// ListImages reports the images present locally.
+func (r *Runner) ListImages(ctx context.Context) ([]ImageRecord, error) {
+	cli, err := r.newClient(ctx)
+	if err != nil {
+		return nil, err
+	}
+	res, err := cli.ImageList(ctx, mobyclient.ImageListOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("list images: %w", err)
+	}
+	out := make([]ImageRecord, 0, len(res.Items))
+	for _, item := range res.Items {
+		out = append(out, ImageRecord{
+			ID:         item.ID,
+			RepoTags:   append([]string(nil), item.RepoTags...),
+			Size:       item.Size,
+			Created:    item.Created,
+			Containers: item.Containers,
+		})
+	}
+	return out, nil
+}
+
+// ContainerImages maps every container (any state) to the image reference it
+// was created from. Reclamation must not trust tag existence alone: a stopped
+// container is a live reference, and deleting its image strands it.
+func (r *Runner) ContainerImages(ctx context.Context) (map[string][]string, error) {
+	cli, err := r.newClient(ctx)
+	if err != nil {
+		return nil, err
+	}
+	res, err := cli.ContainerList(ctx, mobyclient.ContainerListOptions{All: true})
+	if err != nil {
+		return nil, fmt.Errorf("list containers: %w", err)
+	}
+	byImage := map[string][]string{}
+	for _, c := range res.Items {
+		name := ""
+		if len(c.Names) > 0 && strings.TrimSpace(c.Names[0]) != "" {
+			name = strings.TrimPrefix(c.Names[0], "/")
+		}
+		if name == "" && len(c.ID) >= 12 {
+			name = c.ID[:12]
+		}
+		if name == "" {
+			name = "unnamed container"
+		}
+		byImage[c.Image] = append(byImage[c.Image], name)
+		if c.ImageID != "" {
+			byImage[c.ImageID] = append(byImage[c.ImageID], name)
+		}
+	}
+	return byImage, nil
+}
+
+// RemoveImage untags or deletes one image reference. It refuses force removal:
+// a reference still held by a container should be reported, not silently
+// destroyed along with the container's ability to start again.
+func (r *Runner) RemoveImage(ctx context.Context, ref string) error {
+	cli, err := r.newClient(ctx)
+	if err != nil {
+		return err
+	}
+	if _, err := cli.ImageRemove(ctx, ref, mobyclient.ImageRemoveOptions{Force: false, PruneChildren: false}); err != nil {
+		return fmt.Errorf("remove image %s: %w", ref, err)
+	}
+	return nil
+}
+
 // State describes a container's current lifecycle status.
 type State struct {
 	Found    bool

@@ -26,6 +26,10 @@ type fakeEngine struct {
 	container    bool
 	parkedTarget bool
 	setupOrphans []string
+	// images/containers default to a healthy workspace (the image in use, held
+	// by its running container). Tests that want accumulation inject their own.
+	images     []docker.ImageRecord
+	containers map[string][]string
 }
 
 func (f fakeEngine) Ping(context.Context) error { return f.pingErr }
@@ -41,6 +45,24 @@ func (f fakeEngine) ContainerExists(_ context.Context, name string) (bool, error
 	}
 	return f.container, nil
 }
+
+// ListImages/ContainerImages default to exactly what a healthy workspace has:
+// the image in use, referenced by its running container. A test that wants
+// accumulation injects its own records.
+func (f fakeEngine) ListImages(context.Context) ([]docker.ImageRecord, error) {
+	if f.images != nil {
+		return f.images, nil
+	}
+	return []docker.ImageRecord{{ID: "sha256:cur", RepoTags: []string{"piccolo/picoclaw-runtime:cur"}, Size: 8 << 30, Containers: 1}}, nil
+}
+
+func (f fakeEngine) ContainerImages(context.Context) (map[string][]string, error) {
+	if f.containers != nil {
+		return f.containers, nil
+	}
+	return map[string][]string{"piccolo/picoclaw-runtime:cur": {"piccolo-gateway"}}, nil
+}
+
 func (f fakeEngine) ListByPrefix(_ context.Context, prefix string) ([]string, error) {
 	var out []string
 	for _, name := range f.setupOrphans {
@@ -628,5 +650,52 @@ func TestDoctorReportsParkedPromotionTarget(t *testing.T) {
 	}
 	if !strings.Contains(r.Message, "piccolo serve") {
 		t.Errorf("parked target message should name the repair: %s", r.Message)
+	}
+}
+
+// Accumulated, unreferenced runtime images must be reported with the command
+// that reclaims them -- and never reclaimed by the check itself.
+func TestDoctorReportsUnreferencedRuntimeImages(t *testing.T) {
+	dir := initWorkspace(t)
+	path := filepath.Join(dir, "piccolo.yaml")
+	m, err := manifest.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.Container.Image = "piccolo/picoclaw-runtime:cur"
+	m.Container.PreviousImage = "piccolo/picoclaw-runtime:prev"
+	if err := m.Write(path); err != nil {
+		t.Fatal(err)
+	}
+	gib := int64(1) << 30
+	engine := fakeEngine{
+		imageExists: true, labelsFound: true,
+		images: []docker.ImageRecord{
+			{ID: "sha256:cur", RepoTags: []string{"piccolo/picoclaw-runtime:cur"}, Size: gib, Containers: 1},
+			{ID: "sha256:prev", RepoTags: []string{"piccolo/picoclaw-runtime:prev"}, Size: gib},
+			{ID: "sha256:old1", RepoTags: []string{"piccolo/picoclaw-runtime:old1"}, Size: gib},
+			{ID: "sha256:old2", RepoTags: []string{"piccolo/picoclaw-runtime:old2"}, Size: gib},
+			// A stopped container keeps its image alive even though no tag in
+			// piccolo.yaml points at it.
+			{ID: "sha256:held", RepoTags: []string{"piccolo/picoclaw-runtime:held"}, Size: gib},
+		},
+		containers: map[string][]string{
+			"piccolo/picoclaw-runtime:cur":  {"piccolo-gateway"},
+			"piccolo/picoclaw-runtime:held": {"piccolo-gateway.prev"},
+		},
+	}
+	results := Run(context.Background(), Options{Workspace: dir, Engine: engine, LookupEnv: func(string) (string, bool) { return "", false }})
+	r := find(results, "runtime image retention")
+	if r == nil || r.Status != WARN {
+		t.Fatalf("expected a retention warning: %#v", results)
+	}
+	if !strings.Contains(r.Message, "2 unreferenced") {
+		t.Errorf("count wrong (a stopped container must protect 'held'): %s", r.Message)
+	}
+	if !strings.Contains(r.Message, "piccolo image prune") {
+		t.Errorf("warning must name the reclaim command: %s", r.Message)
+	}
+	if Failed(results) {
+		t.Error("disk accumulation must warn, never fail")
 	}
 }

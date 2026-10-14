@@ -58,3 +58,18 @@ Piccolo SHALL warn when unreferenced runtime images exceed a meaningful size and
 
 - **WHEN** unreferenced images are reported
 - **THEN** the overall result still counts as a warning, not a failure
+
+### Requirement: Rollback survives reclamation
+
+Image reclamation SHALL NOT remove the image needed to roll back, and SHALL state what it kept when it reports what it removed.
+
+#### Scenario: Rollback target is protected
+
+- **WHEN** reclamation runs on a workspace with a recorded previous image
+- **THEN** that image is kept
+- **AND** the report names it as the reason it was kept
+
+#### Scenario: Rollback after reclamation still works
+
+- **WHEN** a user rolls back following a reclamation
+- **THEN** the rollback finds its target present and promotes it through the usual gate
