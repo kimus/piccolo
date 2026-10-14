@@ -74,3 +74,12 @@
 - [ ] 8.10 Live verify with `piccolo-gws`: add → setup menu → import credentials via file picker → browser login via courier → confirmed config diff → `status` green
 - [x] 8.11 Update README for Piccolo-owned setup UI and the action/state/call contract, and AGENTS.md for the descriptor seam
 - [x] 8.12 Document the contract surface for integration authors (actions, state keys, event envelope, patch scope)
+
+## 9. Option A follow-up: intent menu, not step menu
+
+- [x] 9.1 Re-render the menu after each action, re-reading `state`, with a `Done` exit row
+- [x] 9.2 Apply the pending config patch once, on `Done`, instead of per action
+- [x] 9.3 Order the menu so available actions come first and gated ones sink below with their reason
+- [x] 9.4 Add optional `inputs[].whenUnmet` so satisfied prerequisites stop re-prompting
+- [x] 9.5 Container name per integration+action (`piccolo-setup-<name>-<action>`), still deterministic and reclaimable
+- [x] 9.6 Document the loop, conditional inputs, and credential-value model in README

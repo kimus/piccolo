@@ -45,9 +45,12 @@ type ActionInput struct {
 	// Destination is relative to the integration state directory and only
 	// meaningful for type "path": Piccolo stages the host file there and hands
 	// the integration the container-side path.
-	Destination string   `json:"destination,omitempty"`
-	Sensitive   bool     `json:"sensitive,omitempty"`
-	Options     []string `json:"options,omitempty"`
+	Destination string `json:"destination,omitempty"`
+	// WhenUnmet skips prompting while the named fact is still false (ask until the
+	// prerequisite is satisfied). Unknown fact names read as unmet, so the input shows.
+	WhenUnmet string   `json:"whenUnmet,omitempty"`
+	Sensitive bool     `json:"sensitive,omitempty"`
+	Options   []string `json:"options,omitempty"`
 }
 
 // Supported reports whether every input type is in the closed vocabulary.

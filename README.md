@@ -250,14 +250,18 @@ For integrations that declare actions, **Piccolo renders the setup menu** with t
 `huh` widgets used by `piccolo init`/`piccolo setup`; the integration ships no terminal UI.
 
 ```text
-piccolo integration setup kimus/piccolo-gws
-
 ? Google Workspace — what do you want to do?
-  ▸ Set up Google Workspace access
-    Import credentials
+  ▸ Set OAuth client credentials
     Login / authorize Google account
     Check Gmail, Calendar, and Drive connectivity
+    Done
 ```
+
+Every action does one thing. After it finishes, Piccolo re-reads the integration's
+state facts and re-renders the menu, so what is left to do rises to the top and
+newly unlocked actions appear — no composite "do everything" entry, and no
+re-running `setup` between steps. Pick **Done** to leave; that is also when the
+proposed `config.json` change is previewed and confirmed, once.
 
 How it works:
 
@@ -268,7 +272,8 @@ piccolo runs: call X  → answers on STDIN · NDJSON events on STDOUT · logs on
 ```
 
 - **Menu gating.** An action whose `requires` facts are false is shown as unavailable with the missing prerequisite named, and Piccolo refuses to invoke it.
-- **File imports.** A `path` input opens Piccolo's host file browser and stages the file at the action's declared destination with mode `0600`, then hands the integration the *container* path. Secrets travel on stdin only — argv is visible in `docker top`, env in `docker inspect`.
+- **Conditional inputs.** An input may declare `whenUnmet: <fact>`; Piccolo skips it once that fact holds, so the credentials form does not re-ask for a client ID you already stored, and login stops re-asking for scope once authorized.
+- **Credentials are values, not files.** Google Cloud Console shows a client ID and a client secret; Piccolo asks for those two fields (the secret masked) and the integration writes what its backend needs, mode `0600`, inside its own state directory. No download, no file browser, no copying into the workspace. Secrets travel on stdin only — argv is visible in `docker top`, env in `docker inspect`. (A `path` input still exists in the vocabulary for service-account-style integrations that genuinely need a key file.)
 - **Browser callbacks.** When an action emits `wait_redirect`, Piccolo binds the loopback port taken from that URL's own `redirect_uri`, captures exactly one request, and relays the raw query into the still-running container. Integrations publish no ports, and Piccolo never interprets or logs the credential material.
 - **Config writes are Piccolo's.** An integration *proposes* a `configPatch`; Piccolo validates it against a fixed allowlist (only that integration's `tools.mcp.servers.<key>` entry), shows a diff, asks for confirmation, then writes `config.json.bak` and the file atomically. A patch reaching any other path is refused.
 - **Headless** (no TTY, CI): Piccolo refuses rather than hanging, so setup stays deterministic.

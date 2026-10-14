@@ -435,3 +435,34 @@ func TestStageHostFileConfirmsBeforeOverwritingExisting(t *testing.T) {
 		t.Fatal("nil confirm must refuse to overwrite")
 	}
 }
+
+func TestInputsForSkipsSatisfiedFacts(t *testing.T) {
+	inputs := []picintegration.ActionInput{
+		{Key: "client_id", Type: "text", Title: "id", WhenUnmet: "credentials"},
+		{Key: "client_secret", Type: "secret", Title: "secret", WhenUnmet: "credentials", Sensitive: true},
+		{Key: "scope", Type: "select", Title: "scope"},
+	}
+	state := picintegration.State{Facts: map[string]bool{"credentials": false}}
+	if got := inputsFor(picintegration.Action{Inputs: inputs}, state); len(got) != 3 {
+		t.Fatalf("unmet facts must prompt for all inputs, got %d", len(got))
+	}
+	state.Facts["credentials"] = true
+	got := inputsFor(picintegration.Action{Inputs: inputs}, state)
+	if len(got) != 1 || got[0].Key != "scope" {
+		t.Fatalf("satisfied fact must drop its inputs: %#v", got)
+	}
+}
+
+func TestActionContainerNamesAreDeterministicAndScoped(t *testing.T) {
+	a := actionContainerName("gws", "set_credentials")
+	b := actionContainerName("gws", "set_credentials")
+	if a != b {
+		t.Fatalf("names must be stable: %q vs %q", a, b)
+	}
+	if a == statusContainerName("gws") || a == setupContainerName("gws") {
+		t.Fatalf("action container must not collide with status/setup: %q", a)
+	}
+	if !strings.HasPrefix(a, "piccolo-setup-gws-") {
+		t.Fatalf("name should be scoped to the integration: %q", a)
+	}
+}

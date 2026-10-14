@@ -33,6 +33,9 @@ type menuEntry struct {
 	Reason  string // why it is unavailable when Enabled is false
 }
 
+// doneLabel is the loop-exit sentinel offered in the menu; it is not an action.
+const doneLabel = "Done"
+
 // buildMenu maps descriptor actions through live state facts. An action whose
 // required facts are unmet stays visible but unselectable, with the missing
 // prerequisite named, so users are never sent into a doomed flow.
@@ -288,8 +291,8 @@ func relayCallbackIntoContainer(ctx context.Context, runner integrationRunner, c
 // renderActionInputs builds a huh form from the action's declared inputs and
 // returns answer values keyed by input. For a `path` input the returned value
 // is the *container-side* path, staged under the integration state directory.
-func renderActionInputs(action picintegration.Action, hostStateDir, containerState string, tty bool) (map[string]string, error) {
-	if len(action.Inputs) == 0 {
+func renderActionInputs(action picintegration.Action, inputs []picintegration.ActionInput, hostStateDir, containerState string, tty bool) (map[string]string, error) {
+	if len(inputs) == 0 {
 		return map[string]string{}, nil
 	}
 	if !tty {
@@ -305,10 +308,10 @@ func renderActionInputs(action picintegration.Action, hostStateDir, containerSta
 		multi []string
 		input picintegration.ActionInput
 	}
-	holders := make([]*holder, 0, len(action.Inputs))
+	holders := make([]*holder, 0, len(inputs))
 	var groups []*huh.Group
 
-	for _, in := range action.Inputs {
+	for _, in := range inputs {
 		h := &holder{key: in.Key, kind: in.Type, input: in}
 		holders = append(holders, h)
 		switch in.Type {
@@ -567,121 +570,208 @@ func deriveArgv(setupCommand []string, sub ...string) ([]string, error) {
 // runDeclarativeSetup drives an action-based integration: describe → state →
 // menu → inputs → call → events → proposed config patch.
 func runDeclarativeSetup(ctx context.Context, out io.Writer, runner integrationRunner, layout workspace.Layout, workspaceRoot string, m *manifest.Manifest, found *manifest.Integration, env []string, desc picintegration.Descriptor) error {
-	bind := integrationSetupBinds(layout)
-	source := layout.PicoclawHome()
-	stateHost := layout.Integration(found.StatePathRelative())
-	containerState := "/root/.piccolo/integrations/" + found.StatePathRelative()
 	stdinTTY := term.IsTerminal(int(os.Stdin.Fd()))
-	host := detectHostSession(envMapFromList(env), stdinTTY)
-	// Refuse before any container work: without a terminal the menu cannot be
-	// rendered, so fetching state first would only cost a cold start.
 	if !stdinTTY {
 		return fmt.Errorf("integration setup needs an interactive terminal — rerun from a shell with a TTY")
 	}
-
-	// 1. Live facts gate the menu.
+	rel := found.StatePathRelative()
+	callBase, err := deriveArgv(found.SetupCommand)
+	if err != nil {
+		return err
+	}
+	s := &setupSession{
+		runner:          runner,
+		layout:          layout,
+		out:             out,
+		integrationName: found.Name,
+		callBase:        callBase,
+		hostStateDir:    layout.Integration(rel),
+		contState:       "/root/.piccolo/integrations/" + rel,
+		tty:             stdinTTY,
+		env:             env,
+		specBase: docker.Spec{
+			Image:   m.Container.Image,
+			Network: m.Container.Network,
+			Source:  layout.PicoclawHome(),
+			Volumes: integrationSetupBinds(layout),
+			Env:     env,
+			Labels:  map[string]string{docker.LabelWorkspace: workspaceRoot},
+		},
+	}
 	stateArgv, err := deriveArgv(found.SetupCommand, "state")
 	if err != nil {
 		return err
 	}
-	entry, cmdArgs := splitEntrypointCommand(stateArgv)
-	stateSpec := docker.Spec{
-		Name:       statusContainerName(found.Name),
-		Image:      m.Container.Image,
-		Source:     source,
-		Volumes:    bind,
-		Entrypoint: entry,
-		Command:    cmdArgs,
-		Labels:     map[string]string{docker.LabelWorkspace: workspaceRoot},
-	}
-	stateData, err := runContainerCapture(ctx, runner, stateSpec)
-	if err != nil {
-		return fmt.Errorf("integration state lookup failed; refusing to render a menu from assumed facts: %w", err)
-	}
-	state, err := picintegration.ParseState(stateData)
-	if err != nil {
-		return err
-	}
+	s.stateArgv = stateArgv
 
-	// 2. Menu.
-	menu := buildMenu(desc.Actions, state)
-	if len(menu) == 0 {
-		return fmt.Errorf("integration declares no usable setup actions")
-	}
-	labels := make([]string, 0, len(menu))
-	for _, e := range menu {
-		labels = append(labels, e.Title())
-	}
-	var chosenLabel string
-	form := huh.NewForm(huh.NewGroup(
-		huh.NewSelect[string]().
-			Title(fmt.Sprintf("%s — what do you want to do?", displayIntegration(*found))).
-			Description("Credentials identify the app; login authorizes your Google account.").
-			Options(huh.NewOptions(labels...)...).
-			Value(&chosenLabel),
-	))
-	if err := form.Run(); err != nil {
-		return err
-	}
-	var chosen *menuEntry
-	for i := range menu {
-		if menu[i].Title() == chosenLabel {
-			chosen = &menu[i]
+	// The menu re-renders after every action: state facts change, so what is
+	// available and what is left to do change with them. That is what lets each
+	// action do exactly one thing instead of shipping composite entries.
+	var pendingPatch json.RawMessage
+	for {
+		state, err := s.state(ctx)
+		if err != nil {
+			return err
+		}
+		menu := buildMenu(desc.Actions, state)
+		if len(menu) == 0 {
+			return fmt.Errorf("integration declares no usable setup actions")
+		}
+		chosen, done, err := s.chooseAction(displayIntegration(*found), menu)
+		if err != nil {
+			return err
+		}
+		if done {
 			break
 		}
+		patch, err := s.runAction(ctx, chosen)
+		if err != nil {
+			return err
+		}
+		if len(patch) > 0 {
+			pendingPatch = patch
+		}
 	}
-	if chosen == nil {
-		return fmt.Errorf("menu selection %q no longer matches the integration's actions", chosenLabel)
+	if len(pendingPatch) == 0 {
+		return nil
 	}
-	if !chosen.Enabled {
-		return fmt.Errorf("action %q is unavailable: %s", chosen.Action.ID, chosen.Reason)
-	}
+	return applyIntegrationPatch(s.out, s.layout.Config(), pendingPatch, integrationServerKey(*found, desc), confirmApplyConfig)
+}
 
-	// 3. Inputs.
-	values, err := renderActionInputs(chosen.Action, stateHost, containerState, stdinTTY)
-	if err != nil {
-		return err
-	}
-	answers, err := answersJSON(chosen.Action.Inputs, values)
-	if err != nil {
-		return err
-	}
+// setupSession carries the wiring an interactive flow needs, so the loop body
+// stays readable and tests can drive it.
+type setupSession struct {
+	runner          integrationRunner
+	layout          workspace.Layout
+	out             io.Writer
+	integrationName string
+	stateArgv       []string
+	callBase        []string
+	specBase        docker.Spec
+	hostStateDir    string
+	contState       string
+	tty             bool
+	env             []string
+}
 
-	// 4. Invoke, streaming events.
-	callArgv, err := deriveArgv(found.SetupCommand, "call", chosen.Action.ID)
+func (s *setupSession) state(ctx context.Context) (picintegration.State, error) {
+	entry, cmd := splitEntrypointCommand(s.stateArgv)
+	spec := s.specBase
+	spec.Name = statusContainerName(s.name())
+	spec.Entrypoint, spec.Command = entry, cmd
+	data, err := runContainerCapture(ctx, s.runner, spec)
 	if err != nil {
-		return err
+		return picintegration.State{}, fmt.Errorf("integration state lookup failed; refusing to render a menu from assumed facts: %w", err)
 	}
-	entry, cmdArgs = splitEntrypointCommand(callArgv)
-	container := setupContainerName(found.Name)
-	spec := docker.Spec{
-		Name:       container,
-		Image:      m.Container.Image,
-		Network:    m.Container.Network,
-		Source:     source,
-		Ports:      found.SetupPorts,
-		Env:        env,
-		Volumes:    bind,
-		Entrypoint: entry,
-		Command:    cmdArgs,
-		Labels:     map[string]string{docker.LabelWorkspace: workspaceRoot},
+	st, err := picintegration.ParseState(data)
+	if err != nil {
+		return picintegration.State{}, err
 	}
-	if removed, err := runner.RemoveByPrefix(ctx, docker.SetupContainerPrefix+sanitizeForName(found.Name)); err == nil && len(removed) > 0 {
-		fmt.Fprintf(out, "Removed %d abandoned integration container(s): %s\n", len(removed), strings.Join(removed, ", "))
-	}
-	fmt.Fprintf(out, "Running %s for %s...\n", chosen.Action.ID, displayIntegration(*found))
+	return st, nil
+}
 
+func (s *setupSession) name() string { return s.integrationName }
+
+func (s *setupSession) chooseAction(title string, menu []menuEntry) (*menuEntry, bool, error) {
+	// Available actions come first so the user sees what is left to do; gated
+	// ones sink to the bottom with their reason, still visible and explanatory.
+	order := make([]int, 0, len(menu))
+	for i := range menu {
+		if menu[i].Enabled {
+			order = append(order, i)
+		}
+	}
+	for i := range menu {
+		if !menu[i].Enabled {
+			order = append(order, i)
+		}
+	}
+	labels := make([]string, 0, len(order)+1)
+	indexes := make([]int, 0, len(order)+1)
+	for _, i := range order {
+		labels = append(labels, menu[i].Title())
+		indexes = append(indexes, i)
+	}
+	labels = append(labels, doneLabel)
+	indexes = append(indexes, -1)
+	var pick string
+	form := huh.NewForm(huh.NewGroup(
+		huh.NewSelect[string]().
+			Title(title + " — what do you want to do?").
+			Description("Credentials identify the app; login authorizes your Google account.").
+			Options(huh.NewOptions(labels...)...).
+			Value(&pick),
+	))
+	if err := form.Run(); err != nil {
+		return nil, false, err
+	}
+	for n, label := range labels {
+		if label != pick {
+			continue
+		}
+		if indexes[n] < 0 {
+			return nil, true, nil
+		}
+		entry := &menu[indexes[n]]
+		if !entry.Enabled {
+			return nil, false, fmt.Errorf("action %q is unavailable: %s", entry.Action.ID, entry.Reason)
+		}
+		return entry, false, nil
+	}
+	return nil, false, fmt.Errorf("selection %q no longer matches the integration's actions", pick)
+}
+
+// inputsFor drops inputs whose whenUnmet fact is already satisfied, so a
+// credentials form collapses to a scope prompt once credentials exist.
+func inputsFor(action picintegration.Action, state picintegration.State) []picintegration.ActionInput {
+	var out []picintegration.ActionInput
+	for _, in := range action.Inputs {
+		if in.WhenUnmet != "" && state.Facts[in.WhenUnmet] {
+			continue
+		}
+		out = append(out, in)
+	}
+	return out
+}
+
+func (s *setupSession) runAction(ctx context.Context, entry *menuEntry) (json.RawMessage, error) {
+	action := entry.Action
+	state, err := s.state(ctx)
+	if err != nil {
+		return nil, err
+	}
+	inputs := inputsFor(action, state)
+	values, err := renderActionInputs(action, inputs, s.hostStateDir, s.contState, s.tty)
+	if err != nil {
+		return nil, err
+	}
+	answers, err := answersJSON(inputs, values)
+	if err != nil {
+		return nil, err
+	}
+	callArgv := append(append([]string(nil), s.callBase...), "call", action.ID)
+	bin, cmd := splitEntrypointCommand(callArgv)
+	spec := s.specBase
+	spec.Name = actionContainerName(s.integrationName, action.ID)
+	spec.Ports = nil // callbacks ride the courier; nothing is published
+	spec.Entrypoint, spec.Command = bin, cmd
+	if removed, err := s.runner.RemoveByPrefix(ctx, docker.SetupContainerPrefix+s.integrationName+"-"); err == nil && len(removed) > 0 {
+		fmt.Fprintf(s.out, "Removed %d abandoned integration container(s): %s\n", len(removed), strings.Join(removed, ", "))
+	}
+	fmt.Fprintf(s.out, "Running %s...\n", action.ID)
+
+	host := detectHostSession(envMapFromList(s.env), s.tty)
 	var courierErr error
 	deadline := time.Now().Add(actionWaitBudget)
 	onEvent := func(ev picintegration.Event) {
 		switch ev.Type {
 		case picintegration.EventStep:
-			fmt.Fprintf(out, "  [%s] %s: %s\n", ev.Status, ev.ID, ev.Message)
+			fmt.Fprintf(s.out, "  [%s] %s: %s\n", ev.Status, ev.ID, ev.Message)
 		case picintegration.EventOpenURL:
-			fmt.Fprintf(out, "\n%s\n", host.browserHint(ev.URL))
+			fmt.Fprintf(s.out, "\n%s\n", host.browserHint(ev.URL))
 			if host.shouldLaunchBrowser() {
 				if err := openInBrowser(ctx, ev.URL); err != nil {
-					fmt.Fprintf(out, "  (could not launch a browser: %v)\n", err)
+					fmt.Fprintf(s.out, "  (could not launch a browser: %v)\n", err)
 				}
 			}
 		case picintegration.EventWaitRedirect:
@@ -700,42 +790,44 @@ func runDeclarativeSetup(ctx context.Context, out io.Writer, runner integrationR
 				remaining = time.Second
 			}
 			relay := func(rctx context.Context, q string) error {
-				return relayCallbackIntoContainer(rctx, runner, container, port, q)
+				return relayCallbackIntoContainer(rctx, s.runner, spec.Name, port, q)
 			}
 			if err := c.await(ctx, remaining, relay); err != nil {
 				courierErr = err
 			}
 		case picintegration.EventError:
-			fmt.Fprintf(out, "  ✗ %s\n", ev.Message)
+			fmt.Fprintf(s.out, "  x %s\n", ev.Message)
 			if ev.Remediation != "" {
-				fmt.Fprintf(out, "    → %s\n", ev.Remediation)
+				fmt.Fprintf(s.out, "    -> %s\n", ev.Remediation)
 			}
 			if ev.RemediationURL != "" {
-				fmt.Fprintf(out, "      %s %s\n", ev.Label, ev.RemediationURL)
+				fmt.Fprintf(s.out, "       %s: %s\n", ev.Label, ev.RemediationURL)
 			}
 		}
 	}
 
-	reader, err := runIntegrationAction(ctx, runner, integrationCallRequest{
+	reader, err := runIntegrationAction(ctx, s.runner, integrationCallRequest{
 		Answers:   answers,
-		Container: container,
+		Container: spec.Name,
 		Spec:      spec,
-	}, out, onEvent)
+	}, s.out, onEvent)
 	if courierErr != nil {
-		return fmt.Errorf("browser authorization did not complete: %w", courierErr)
+		return nil, fmt.Errorf("browser authorization did not complete: %w", courierErr)
 	}
 	if err != nil {
-		return err
+		return nil, err
 	}
-
-	// 5. Configuration: the integration proposed, Piccolo applies.
 	res := reader.Result()
 	if res == nil || res.Result == nil {
-		return nil
+		return nil, nil
 	}
-	serverKey := integrationServerKey(*found, desc)
-	confirm := func() (bool, error) { return confirmApplyConfig(out) }
-	return applyIntegrationPatch(out, layout.Config(), res.Result.ConfigPatch, serverKey, confirm)
+	return res.Result.ConfigPatch, nil
+}
+
+// actionContainerName keeps one deterministic name per integration+action so an
+// abandoned run is always reclaimable.
+func actionContainerName(integration, action string) string {
+	return docker.SetupContainerPrefix + sanitizeForName(integration) + "-" + sanitizeForName(action)
 }
 
 // integrationServerKey derives the MCP server key an integration owns, so the
@@ -752,7 +844,7 @@ func integrationServerKey(in manifest.Integration, desc picintegration.Descripto
 
 // confirmApplyConfig is the single confirmation gate for writing the
 // user-owned config.json.
-func confirmApplyConfig(out io.Writer) (bool, error) {
+func confirmApplyConfig() (bool, error) {
 	confirm := false
 	form := huh.NewForm(huh.NewGroup(
 		huh.NewConfirm().
