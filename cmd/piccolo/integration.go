@@ -92,7 +92,6 @@ func newIntegrationBuildCmd() *cobra.Command {
 	cmd.Flags().BoolVar(&f.yes, "yes", false, "non-interactive: accept prompts")
 	cmd.Flags().BoolVar(&f.pull, "pull", false, "ask Docker to pull a newer base image before building")
 	cmd.Flags().StringVar(&f.tag, "tag", "", "local image tag to build (default: deterministic content-derived tag)")
-	cmd.Flags().BoolVar(&f.force, "force", false, "rebuild even if the resolved release or runtime image already matches")
 	return cmd
 }
 

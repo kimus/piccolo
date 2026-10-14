@@ -94,3 +94,10 @@
 - [x] 10.6 Confirm answers now work over a pipe; absent input refuses instead of silently installing
 - [x] 10.7 Stamp `version`/`buildDate` via ldflags in the release workflow; unstamped dev builds say so
 - [x] 10.8 Tests: no-op paths assert zero downloads and zero builds; plan rendering; digest trimming; `--force` override
+
+## 11. Setup action invocation fixes
+
+- [x] 11.1 Fix action argv order: `piccolo-gws call <id> --config-dir <dir>` (a flag before the subcommand is rejected by clap, which failed every declarative action)
+- [x] 11.2 Factor `actionArgv` so the ordering contract is directly unit-tested
+- [x] 11.3 Assert the same ordering for the `state` derivation
+- [x] 11.4 Remove `--force` from `integration build`: source builds have no resolved version, so a short-circuit (and its override) does not apply; the flag was previously accepted but inert

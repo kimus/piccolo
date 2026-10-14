@@ -567,6 +567,14 @@ func deriveArgv(setupCommand []string, sub ...string) ([]string, error) {
 	return argv, nil
 }
 
+// actionArgv builds the argv for one action invocation. It exists so the
+// ordering rule below is directly testable: `piccolo-gws call <id> --config-dir
+// <dir>`. Deriving a base first and appending "call" after it put the flag
+// before the subcommand, which clap rejects outright.
+func actionArgv(setupCommand []string, actionID string) ([]string, error) {
+	return deriveArgv(setupCommand, "call", actionID)
+}
+
 // runDeclarativeSetup drives an action-based integration: describe → state →
 // menu → inputs → call → events → proposed config patch.
 func runDeclarativeSetup(ctx context.Context, out io.Writer, runner integrationRunner, layout workspace.Layout, workspaceRoot string, m *manifest.Manifest, found *manifest.Integration, env []string, desc picintegration.Descriptor) error {
@@ -575,16 +583,12 @@ func runDeclarativeSetup(ctx context.Context, out io.Writer, runner integrationR
 		return fmt.Errorf("integration setup needs an interactive terminal — rerun from a shell with a TTY")
 	}
 	rel := found.StatePathRelative()
-	callBase, err := deriveArgv(found.SetupCommand)
-	if err != nil {
-		return err
-	}
 	s := &setupSession{
 		runner:          runner,
 		layout:          layout,
 		out:             out,
 		integrationName: found.Name,
-		callBase:        callBase,
+		setupCommand:    found.SetupCommand,
 		hostStateDir:    layout.Integration(rel),
 		contState:       "/root/.piccolo/integrations/" + rel,
 		tty:             stdinTTY,
@@ -598,6 +602,9 @@ func runDeclarativeSetup(ctx context.Context, out io.Writer, runner integrationR
 			Labels:  map[string]string{docker.LabelWorkspace: workspaceRoot},
 		},
 	}
+	// Derive the full argv here, not by appending to a pre-derived base: the
+	// state-directory flag must trail the subcommand, because clap rejects flags
+	// that appear before the subcommand they belong to.
 	stateArgv, err := deriveArgv(found.SetupCommand, "state")
 	if err != nil {
 		return err
@@ -646,7 +653,7 @@ type setupSession struct {
 	out             io.Writer
 	integrationName string
 	stateArgv       []string
-	callBase        []string
+	setupCommand    []string
 	specBase        docker.Spec
 	hostStateDir    string
 	contState       string
@@ -749,7 +756,10 @@ func (s *setupSession) runAction(ctx context.Context, entry *menuEntry, state pi
 	if err != nil {
 		return nil, err
 	}
-	callArgv := append(append([]string(nil), s.callBase...), "call", action.ID)
+	callArgv, err := actionArgv(s.setupCommand, action.ID)
+	if err != nil {
+		return nil, err
+	}
 	bin, cmd := splitEntrypointCommand(callArgv)
 	spec := s.specBase
 	spec.Name = actionContainerName(s.integrationName, action.ID)

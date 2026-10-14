@@ -466,3 +466,48 @@ func TestActionContainerNamesAreDeterministicAndScoped(t *testing.T) {
 		t.Fatalf("name should be scoped to the integration: %q", a)
 	}
 }
+
+// TestActionArgvOrdersSubcommandBeforeFlags pins the clap contract: a flag that
+// precedes the subcommand is rejected by the integration binary outright, which
+// made every declarative setup action fail with "unexpected argument
+// '--config-dir' found".
+func TestActionArgvOrdersSubcommandBeforeFlags(t *testing.T) {
+	setup := []string{"piccolo-gws", "setup", "--config-dir", "/root/.piccolo/integrations/kimus/piccolo-gws"}
+
+	got, err := actionArgv(setup, "login")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"piccolo-gws", "call", "login", "--config-dir", "/root/.piccolo/integrations/kimus/piccolo-gws"}
+	if strings.Join(got, " ") != strings.Join(want, " ") {
+		t.Fatalf("argv = %v, want %v", got, want)
+	}
+
+	// The flag must never appear before the subcommand.
+	flagIdx, subIdx := len(got), len(got)
+	for i, a := range got {
+		if a == "call" && i < subIdx {
+			subIdx = i
+		}
+		if strings.HasPrefix(a, "-") && i < flagIdx {
+			flagIdx = i
+		}
+	}
+	if flagIdx < subIdx {
+		t.Fatalf("flag %v appears before subcommand: %v", got[flagIdx], got)
+	}
+}
+
+func TestStateArgvAlsoPutsSubcommandFirst(t *testing.T) {
+	setup := []string{"piccolo-gws", "setup", "--config-dir", "/root/.piccolo/integrations/kimus/piccolo-gws"}
+	got, err := deriveArgv(setup, "state")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got[0] != "piccolo-gws" || got[1] != "state" {
+		t.Fatalf("state argv must be <binary> state [--config-dir ...], got %v", got)
+	}
+	if len(got) > 2 && strings.HasPrefix(got[1], "-") {
+		t.Fatalf("flag before subcommand: %v", got)
+	}
+}
