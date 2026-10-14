@@ -83,3 +83,14 @@
 - [x] 9.4 Add optional `inputs[].whenUnmet` so satisfied prerequisites stop re-prompting
 - [x] 9.5 Container name per integration+action (`piccolo-setup-<name>-<action>`), still deterministic and reclaimable
 - [x] 9.6 Document the loop, conditional inputs, and credential-value model in README
+
+## 10. No-op installs, informative confirm, stamped builds
+
+- [x] 10.1 Split the release fetcher into `Resolve` (metadata only) and `Download` (artifact)
+- [x] 10.2 Short-circuit `add` when resolved version and artifact digest already match: no download, no build, no prompt
+- [x] 10.3 Short-circuit `upgrade` the same way, after printing each resolution
+- [x] 10.4 Show the install plan (version transition, digest, artifact, base image, toolchain, preserved state, unaffected integrations) before the confirmation
+- [x] 10.5 Add `--force` to `add`/`upgrade`/`build` to override the short-circuit
+- [x] 10.6 Confirm answers now work over a pipe; absent input refuses instead of silently installing
+- [x] 10.7 Stamp `version`/`buildDate` via ldflags in the release workflow; unstamped dev builds say so
+- [x] 10.8 Tests: no-op paths assert zero downloads and zero builds; plan rendering; digest trimming; `--force` override

@@ -71,6 +71,13 @@ Manual installs can download a release archive and `checksums.txt` from GitHub R
 ## Requirements
 
 - Go 1.25+ (only when building from source)
+
+`piccolo --version` reports the build date so a stale local binary is obvious:
+
+```text
+piccolo version 0.1.1 (built 2026-10-14T12:00:18Z, go1.26.5)   # stamped release build
+piccolo version 0.1.0-poc (dev build, not stamped; ...)          # plain `go build`
+```
 - A reachable Docker daemon (Docker Desktop, colima, podman socket, ...). The `docker` CLI is **not** required — Piccolo talks to the daemon through the Docker Go SDK.
 
 ## Quickstart
@@ -181,6 +188,7 @@ Containerized integrations are self-describing packages baked into the gateway i
 ```sh
 piccolo integration add kimus/piccolo-gws          # latest release
 piccolo integration add kimus/piccolo-gws@3.1.0   # exact release tag/selector
+piccolo integration add kimus/piccolo-gws --force # rebuild even if unchanged
 piccolo integration setup kimus/piccolo-gws
 piccolo restart
 
@@ -192,6 +200,17 @@ piccolo restart
 # verify provider connectivity
 piccolo integration status kimus/piccolo-gws
 ```
+
+`add` and `upgrade` resolve the release **before** asking anything, and skip the work entirely when nothing would change:
+
+```text
+$ piccolo integration add kimus/piccolo-gws --yes
+✓ Already up to date: kimus/piccolo-gws 0.3.0 (sha256:131f8cf4172f)
+  image: piccolo/picoclaw-runtime:efd4e52201df
+  state: integrations/kimus/piccolo-gws (preserved)
+```
+
+When something *would* change, the confirmation lists it first — resolved version, artifact name and digest, base image, toolchain packages, and which integrations are unaffected — because the prompt previously asked "install or update?" with no information at all. Only after a yes does Piccolo download the (multi-megabyte) artifact and build. `--force` overrides the short-circuit; `--yes` skips the prompt but not the check.
 
 Package refs use `[provider:]owner/repo[@selector]`; the default provider is GitHub. Short aliases such as `gws` are not supported. The selector is provider/repository-owned and opaque, so `kimus/piccolo-gws@3.1.0` and `johndoe/piccolo-maker@v2.1.10` are both valid if those GitHub Release tags exist.
 

@@ -18,8 +18,25 @@ import (
 	"github.com/kimus/piccolo/internal/runtimeimage"
 )
 
+// releaseResolution is what a *cheap* metadata lookup can tell us: the tag a
+// selector resolves to, the digest and asset we would download. It never
+// touches the (multi-megabyte) artifact, so it is safe to use for
+// "already installed?" checks and for the confirmation prompt.
+type releaseResolution struct {
+	Ref      picintegration.PackageRef
+	Tag      string
+	Version  string
+	Digest   string
+	Asset    string
+	Manifest picintegration.ReleaseManifest
+}
+
+// releaseFetcher separates resolve from download: Piccolo must be able to tell
+// the user exactly what a run would install, and short-circuit when nothing
+// would change, before paying for an artifact download.
 type releaseFetcher interface {
-	Fetch(context.Context, picintegration.PackageRef) (fetchedRelease, error)
+	Resolve(context.Context, picintegration.PackageRef) (releaseResolution, error)
+	Download(context.Context, releaseResolution) (fetchedRelease, error)
 }
 
 type fetchedRelease struct {
@@ -34,56 +51,80 @@ var newReleaseFetcher = func() releaseFetcher { return githubReleaseFetcher{clie
 
 type githubReleaseFetcher struct{ client *http.Client }
 
-func (g githubReleaseFetcher) Fetch(ctx context.Context, ref picintegration.PackageRef) (fetchedRelease, error) {
+func (g githubReleaseFetcher) Resolve(ctx context.Context, ref picintegration.PackageRef) (releaseResolution, error) {
 	if ref.Provider != "github" {
-		return fetchedRelease{}, fmt.Errorf("unsupported integration provider %q", ref.Provider)
+		return releaseResolution{}, fmt.Errorf("unsupported integration provider %q", ref.Provider)
 	}
 	tag := ref.Selector
 	if tag == "" || tag == "latest" {
 		latest, err := g.githubJSON(ctx, fmt.Sprintf("https://api.github.com/repos/%s/%s/releases/latest", ref.Owner, ref.Repo))
 		if err != nil {
-			return fetchedRelease{}, err
+			return releaseResolution{}, err
 		}
 		var obj struct {
 			TagName string `json:"tag_name"`
 		}
 		if err := json.Unmarshal(latest, &obj); err != nil {
-			return fetchedRelease{}, fmt.Errorf("parse GitHub latest release: %w", err)
+			return releaseResolution{}, fmt.Errorf("parse GitHub latest release: %w", err)
 		}
 		if strings.TrimSpace(obj.TagName) == "" {
-			return fetchedRelease{}, fmt.Errorf("GitHub latest release for %s/%s did not include tag_name", ref.Owner, ref.Repo)
+			return releaseResolution{}, fmt.Errorf("GitHub latest release for %s/%s did not include tag_name", ref.Owner, ref.Repo)
 		}
 		tag = obj.TagName
 	}
 	base := fmt.Sprintf("https://github.com/%s/%s/releases/download/%s", ref.Owner, ref.Repo, tag)
 	manifestBytes, err := g.httpGet(ctx, base+"/piccolo-integration-release.json")
 	if err != nil {
-		return fetchedRelease{}, fmt.Errorf("download release manifest for %s@%s: %w", ref.Short(), tag, err)
+		return releaseResolution{}, fmt.Errorf("download release manifest for %s@%s: %w", ref.Short(), tag, err)
 	}
 	manifest, err := picintegration.ParseReleaseManifest(manifestBytes)
 	if err != nil {
-		return fetchedRelease{}, err
+		return releaseResolution{}, err
 	}
 	if manifest.Package != ref.Package() {
-		return fetchedRelease{}, fmt.Errorf("release manifest package %q does not match %q", manifest.Package, ref.Package())
+		return releaseResolution{}, fmt.Errorf("release manifest package %q does not match %q", manifest.Package, ref.Package())
 	}
 	platform := "linux/" + runtime.GOARCH
 	artifact, ok := manifest.ArtifactFor(platform)
 	if !ok {
-		return fetchedRelease{}, fmt.Errorf("release %s@%s has no artifact for %s", ref.Short(), tag, platform)
+		return releaseResolution{}, fmt.Errorf("release %s@%s has no artifact for %s", ref.Short(), tag, platform)
 	}
-	archive, err := g.httpGet(ctx, base+"/"+artifact.Asset)
+	return releaseResolution{
+		Ref:      ref,
+		Tag:      tag,
+		Version:  manifest.Version,
+		Digest:   "sha256:" + strings.TrimPrefix(strings.ToLower(artifact.SHA256), "sha256:"),
+		Asset:    artifact.Asset,
+		Manifest: manifest,
+	}, nil
+}
+
+// Download fetches and verifies one resolved artifact and unpacks it.
+func (g githubReleaseFetcher) Download(ctx context.Context, res releaseResolution) (fetchedRelease, error) {
+	base := fmt.Sprintf("https://github.com/%s/%s/releases/download/%s", res.Ref.Owner, res.Ref.Repo, res.Tag)
+	archive, err := g.httpGet(ctx, base+"/"+res.Asset)
 	if err != nil {
-		return fetchedRelease{}, fmt.Errorf("download release artifact %s: %w", artifact.Asset, err)
+		return fetchedRelease{}, fmt.Errorf("download release artifact %s: %w", res.Asset, err)
 	}
-	if err := picintegration.VerifySHA256(archive, artifact.SHA256); err != nil {
+	if err := picintegration.VerifySHA256(archive, strings.TrimPrefix(res.Digest, "sha256:")); err != nil {
 		return fetchedRelease{}, err
 	}
 	root, commands, err := extractIntegrationArchive(archive)
 	if err != nil {
 		return fetchedRelease{}, err
 	}
-	return fetchedRelease{Ref: ref, Version: manifest.Version, Digest: "sha256:" + strings.TrimPrefix(strings.ToLower(artifact.SHA256), "sha256:"), Manifest: manifest, Bundle: runtimeimage.IntegrationBundle{Package: ref.Package(), Version: manifest.Version, Root: root, Commands: commands}}, nil
+	return fetchedRelease{
+		Ref:      res.Ref,
+		Version:  res.Version,
+		Digest:   res.Digest,
+		Manifest: res.Manifest,
+		Bundle: runtimeimage.IntegrationBundle{
+			Package:  res.Ref.Package(),
+			Version:  res.Version,
+			Root:     root,
+			Commands: commands,
+		},
+	}, nil
 }
 
 func (g githubReleaseFetcher) githubJSON(ctx context.Context, url string) ([]byte, error) {

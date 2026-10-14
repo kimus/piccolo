@@ -30,7 +30,8 @@ jobs:
             os="${target%/*}"
             arch="${target#*/}"
             work="$(mktemp -d)"
-            GOOS="$os" GOARCH="$arch" CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o "$work/piccolo" ./cmd/piccolo
+            stamp="-s -w -X main.version=${GITHUB_REF_NAME} -X main.buildDate=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            GOOS="$os" GOARCH="$arch" CGO_ENABLED=0 go build -trimpath -ldflags "$stamp" -o "$work/piccolo" ./cmd/piccolo
             cp README.md "$work/README.md"
             tar -C "$work" -czf "dist/piccolo_${version}_${os}_${arch}.tar.gz" .
             rm -rf "$work"

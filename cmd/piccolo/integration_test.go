@@ -98,25 +98,71 @@ type nopWriteCloser struct{ *bytes.Buffer }
 
 func (n nopWriteCloser) Close() error { return nil }
 
+// fakeReleaseFetcher records how often the cheap resolve and the expensive
+// download run, so tests can prove a no-op install never touches the artifact.
 type fakeReleaseFetcher struct {
-	release fetchedRelease
-	err     error
+	release   fetchedRelease
+	version   string
+	digest    string
+	err       error
+	resolves  *int
+	downloads *int
 }
 
-func (f fakeReleaseFetcher) Fetch(context.Context, picintegration.PackageRef) (fetchedRelease, error) {
-	return f.release, f.err
+func (f fakeReleaseFetcher) Resolve(_ context.Context, ref picintegration.PackageRef) (releaseResolution, error) {
+	if f.resolves != nil {
+		*f.resolves++
+	}
+	if f.err != nil {
+		return releaseResolution{}, f.err
+	}
+	version, digest := f.version, f.digest
+	if version == "" {
+		version = f.release.Version
+	}
+	if digest == "" {
+		digest = f.release.Digest
+	}
+	return releaseResolution{
+		Ref:     ref,
+		Tag:     version,
+		Version: version,
+		Digest:  digest,
+		Asset:   "piccolo-gws_" + version + "_linux_arm64.tar.gz",
+	}, nil
+}
+
+func (f fakeReleaseFetcher) Download(_ context.Context, res releaseResolution) (fetchedRelease, error) {
+	if f.downloads != nil {
+		*f.downloads++
+	}
+	if f.err != nil {
+		return fetchedRelease{}, f.err
+	}
+	rel := f.release
+	rel.Version = res.Version
+	rel.Digest = res.Digest
+	if rel.Bundle.Package == "" {
+		rel.Bundle = runtimeimage.IntegrationBundle{Package: res.Ref.Package(), Version: res.Version}
+	} else {
+		rel.Bundle.Version = res.Version
+	}
+	return rel, nil
 }
 
 func TestIntegrationAddReleaseBuildsDescribesAndUpdatesManifest(t *testing.T) {
 	dir := t.TempDir()
 	writeTestManifest(t, dir, "docker.io/sipeed/picoclaw:v0.3.1")
 	bundleRoot := makeBundleDir(t, []string{"piccolo-gws", "gws"})
-	rel := fetchedRelease{Ref: mustPackageRef(t, "kimus/piccolo-gws"), Version: "3.1.0", Digest: "sha256:abc", Bundle: runtimeimage.IntegrationBundle{Package: "github:kimus/piccolo-gws", Version: "3.1.0", Root: bundleRoot, Commands: []string{"piccolo-gws", "gws"}}}
+	var resolves, downloads int
+	rel := fetchedRelease{Ref: mustPackageRef(t, "kimus/piccolo-gws"), Version: "3.1.0", Digest: "sha256:abc", Manifest: picintegration.ReleaseManifest{Schema: picintegration.ReleaseManifestSchemaV1, Package: "github:kimus/piccolo-gws", Version: "3.1.0"}, Bundle: runtimeimage.IntegrationBundle{Package: "github:kimus/piccolo-gws", Version: "3.1.0", Root: bundleRoot, Commands: []string{"piccolo-gws", "gws"}}}
 	desc := `{"schema":"piccolo.integration.v1","name":"gws","displayName":"Google Workspace","commands":["piccolo-gws"],"setup":{"command":["piccolo-gws","setup","--config-dir","/root/.piccolo/integrations/gws"],"requiresTty":true,"ports":["127.0.0.1:8000:8000"]},"commands":{"status":{"command":"piccolo-gws","args":["status","--config-dir","/root/.piccolo/integrations/gws","--json"]},"setup":{"command":"piccolo-gws","args":["setup","--config-dir","/root/.piccolo/integrations/gws"]}}}`
 	fake := &fakeIntegrationRunner{stdout: desc}
 	oldRunner, oldFetcher := newIntegrationRunner, newReleaseFetcher
 	newIntegrationRunner = func() integrationRunner { return fake }
-	newReleaseFetcher = func() releaseFetcher { return fakeReleaseFetcher{release: rel} }
+	newReleaseFetcher = func() releaseFetcher {
+		return fakeReleaseFetcher{release: rel, resolves: &resolves, downloads: &downloads}
+	}
 	defer func() { newIntegrationRunner = oldRunner; newReleaseFetcher = oldFetcher }()
 	oldDir := dirFlag
 	dirFlag = dir
@@ -148,12 +194,15 @@ func TestIntegrationAddReleaseReplacesLegacySourceBuild(t *testing.T) {
 	dir := t.TempDir()
 	writeIntegrationManifest(t, dir, []manifest.Integration{{Name: "gws", Ref: "github:kimus/piccolo-gws", Commands: []string{"piccolo-gws"}}})
 	bundleRoot := makeBundleDir(t, []string{"piccolo-gws", "gws"})
-	rel := fetchedRelease{Ref: mustPackageRef(t, "kimus/piccolo-gws"), Version: "0.1.0", Digest: "sha256:abc", Bundle: runtimeimage.IntegrationBundle{Package: "github:kimus/piccolo-gws", Version: "0.1.0", Root: bundleRoot, Commands: []string{"piccolo-gws", "gws"}}}
+	var resolves, downloads int
+	rel := fetchedRelease{Ref: mustPackageRef(t, "kimus/piccolo-gws"), Version: "0.1.0", Digest: "sha256:abc", Manifest: picintegration.ReleaseManifest{Schema: picintegration.ReleaseManifestSchemaV1, Package: "github:kimus/piccolo-gws", Version: "0.1.0"}, Bundle: runtimeimage.IntegrationBundle{Package: "github:kimus/piccolo-gws", Version: "0.1.0", Root: bundleRoot, Commands: []string{"piccolo-gws", "gws"}}}
 	desc := `{"schema":"piccolo.integration.v1","name":"gws","displayName":"Google Workspace","commands":["piccolo-gws"],"setup":{"command":["piccolo-gws","setup"]}}`
 	fake := &fakeIntegrationRunner{stdout: desc}
 	oldRunner, oldFetcher := newIntegrationRunner, newReleaseFetcher
 	newIntegrationRunner = func() integrationRunner { return fake }
-	newReleaseFetcher = func() releaseFetcher { return fakeReleaseFetcher{release: rel} }
+	newReleaseFetcher = func() releaseFetcher {
+		return fakeReleaseFetcher{release: rel, resolves: &resolves, downloads: &downloads}
+	}
 	defer func() { newIntegrationRunner = oldRunner; newReleaseFetcher = oldFetcher }()
 	oldDir := dirFlag
 	dirFlag = dir
@@ -508,4 +557,166 @@ func makeBundleArchive(t *testing.T) []byte {
 		t.Fatal(err)
 	}
 	return buf.Bytes()
+}
+
+// --- no-op install/upgrade: never download, never build, never prompt ---
+
+func TestIntegrationAddSameVersionIsNoOp(t *testing.T) {
+	dir := t.TempDir()
+	writeIntegrationManifest(t, dir, []manifest.Integration{{
+		Package: "github:kimus/piccolo-gws", Requested: "kimus/piccolo-gws", Source: "release", Channel: "latest",
+		ResolvedVersion: "3.1.0", ArtifactDigest: "sha256:abc", StatePath: "integrations/kimus/piccolo-gws",
+		Name: "gws", DisplayName: "Google Workspace",
+		DescriptorCommand: []string{"piccolo-gws", "describe", "--json"},
+		SetupCommand:      []string{"piccolo-gws", "setup"},
+	}})
+	var resolves, downloads int
+	rel := fetchedRelease{Bundle: runtimeimage.IntegrationBundle{Package: "github:kimus/piccolo-gws", Root: "/tmp/unused"}}
+	fake := &fakeIntegrationRunner{}
+	oldRunner, oldFetcher := newIntegrationRunner, newReleaseFetcher
+	newIntegrationRunner = func() integrationRunner { return fake }
+	newReleaseFetcher = func() releaseFetcher {
+		return fakeReleaseFetcher{release: rel, version: "3.1.0", digest: "sha256:abc", resolves: &resolves, downloads: &downloads}
+	}
+	defer func() { newIntegrationRunner, newReleaseFetcher = oldRunner, oldFetcher }()
+	oldDir := dirFlag
+	dirFlag = dir
+	defer func() { dirFlag = oldDir }()
+
+	var out bytes.Buffer
+	if err := runIntegrationAdd(testCommand(&out), "kimus/piccolo-gws", integrationFlags{}); err != nil {
+		t.Fatalf("no-op add must succeed: %v", err)
+	}
+	got := out.String()
+	if !strings.Contains(got, "Already up to date") || !strings.Contains(got, "3.1.0") {
+		t.Fatalf("expected up-to-date message, got %q", got)
+	}
+	if downloads != 0 {
+		t.Fatalf("no-op must not download the artifact (downloads=%d)", downloads)
+	}
+	if fake.builds != 0 {
+		t.Fatalf("no-op must not build an image (builds=%d)", fake.builds)
+	}
+	if len(fake.runs) != 0 {
+		t.Fatalf("no-op must not start containers: %#v", fake.runs)
+	}
+}
+
+func TestIntegrationAddForceOverridesNoOp(t *testing.T) {
+	dir := t.TempDir()
+	writeIntegrationManifest(t, dir, []manifest.Integration{{
+		Package: "github:kimus/piccolo-gws", Source: "release", Channel: "latest",
+		ResolvedVersion: "3.1.0", ArtifactDigest: "sha256:abc", StatePath: "integrations/kimus/piccolo-gws",
+		Name: "gws", DisplayName: "Google Workspace",
+		DescriptorCommand: []string{"piccolo-gws", "describe", "--json"},
+		SetupCommand:      []string{"piccolo-gws", "setup"},
+	}})
+	m, _ := manifest.Load(filepath.Join(dir, "piccolo.yaml"))
+	m.Container.Image = "piccolo/picoclaw-runtime:abc"
+	if err := m.Write(filepath.Join(dir, "piccolo.yaml")); err != nil {
+		t.Fatal(err)
+	}
+	var resolves, downloads int
+	bundleRoot := makeBundleDir(t, []string{"piccolo-gws"})
+	rel := fetchedRelease{
+		Ref: mustPackageRef(t, "kimus/piccolo-gws"), Version: "3.1.0", Digest: "sha256:abc",
+		Manifest: picintegration.ReleaseManifest{Schema: picintegration.ReleaseManifestSchemaV1, Package: "github:kimus/piccolo-gws", Version: "3.1.0"},
+		Bundle:   runtimeimage.IntegrationBundle{Package: "github:kimus/piccolo-gws", Version: "3.1.0", Root: bundleRoot, Commands: []string{"piccolo-gws"}},
+	}
+	desc := `{"schema":"piccolo.integration.v1","name":"gws","displayName":"Google Workspace","commands":["piccolo-gws"],"setup":{"command":["piccolo-gws","setup"]}}`
+	fake := &fakeIntegrationRunner{stdout: desc}
+	oldRunner, oldFetcher := newIntegrationRunner, newReleaseFetcher
+	newIntegrationRunner = func() integrationRunner { return fake }
+	newReleaseFetcher = func() releaseFetcher {
+		return fakeReleaseFetcher{release: rel, version: "3.1.0", digest: "sha256:abc", resolves: &resolves, downloads: &downloads}
+	}
+	defer func() { newIntegrationRunner, newReleaseFetcher = oldRunner, oldFetcher }()
+	oldDir := dirFlag
+	dirFlag = dir
+	defer func() { dirFlag = oldDir }()
+
+	var out bytes.Buffer
+	if err := runIntegrationAdd(testCommand(&out), "kimus/piccolo-gws", integrationFlags{yes: true, force: true, tag: "piccolo/picoclaw-runtime:forced"}); err != nil {
+		t.Fatalf("--force must rebuild: %v", err)
+	}
+	if downloads == 0 || fake.builds == 0 {
+		t.Fatalf("--force must download and build (downloads=%d builds=%d)", downloads, fake.builds)
+	}
+}
+
+func TestIntegrationUpgradeSameVersionIsNoOp(t *testing.T) {
+	dir := t.TempDir()
+	writeIntegrationManifest(t, dir, []manifest.Integration{{
+		Package: "github:kimus/piccolo-gws", Source: "release", Channel: "latest",
+		ResolvedVersion: "3.1.0", ArtifactDigest: "sha256:abc", StatePath: "integrations/kimus/piccolo-gws",
+		Name: "gws", DisplayName: "Google Workspace", SetupCommand: []string{"piccolo-gws", "setup"},
+	}})
+	var resolves, downloads int
+	fake := &fakeIntegrationRunner{}
+	oldRunner, oldFetcher := newIntegrationRunner, newReleaseFetcher
+	newIntegrationRunner = func() integrationRunner { return fake }
+	newReleaseFetcher = func() releaseFetcher {
+		return fakeReleaseFetcher{
+			release:   fetchedRelease{Bundle: runtimeimage.IntegrationBundle{Package: "github:kimus/piccolo-gws", Root: "/tmp/unused"}},
+			version:   "3.1.0",
+			digest:    "sha256:abc",
+			resolves:  &resolves,
+			downloads: &downloads,
+		}
+	}
+	defer func() { newIntegrationRunner, newReleaseFetcher = oldRunner, oldFetcher }()
+	oldDir := dirFlag
+	dirFlag = dir
+	defer func() { dirFlag = oldDir }()
+
+	var out bytes.Buffer
+	err := runIntegrationUpgrade(testCommand(&out), "kimus/piccolo-gws", integrationUpgradeFlags{integrationFlags: integrationFlags{yes: true}})
+	if err != nil {
+		t.Fatalf("no-op upgrade must succeed: %v", err)
+	}
+	if !strings.Contains(out.String(), "Already up to date") {
+		t.Fatalf("output = %q", out.String())
+	}
+	if resolves == 0 {
+		t.Fatal("upgrade should resolve cheaply before deciding")
+	}
+	if downloads != 0 || fake.builds != 0 {
+		t.Fatalf("no-op upgrade must not download or build (downloads=%d builds=%d)", downloads, fake.builds)
+	}
+}
+
+func TestShortDigest(t *testing.T) {
+	cases := map[string]string{
+		"":                                  "unknown",
+		"sha256:abcdefghijklmnopqrstuvwxyz": "abcdefghijkl",
+		"sha256:abc":                        "abc",
+	}
+	for in, want := range cases {
+		if got := shortDigest(in); got != want {
+			t.Fatalf("shortDigest(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestPrintIntegrationPlanShowsVersions(t *testing.T) {
+	dir := t.TempDir()
+	writeIntegrationManifest(t, dir, []manifest.Integration{{
+		Package: "github:kimus/piccolo-gws", Source: "release", Channel: "latest",
+		ResolvedVersion: "0.2.0", ArtifactDigest: "sha256:oldoldoldold", StatePath: "integrations/kimus/piccolo-gws",
+		Name: "gws", DisplayName: "Google Workspace", SetupCommand: []string{"piccolo-gws", "setup"},
+	}})
+	m, err := manifest.Load(filepath.Join(dir, "piccolo.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	printIntegrationPlan(&out, m, mustPackageRef(t, "kimus/piccolo-gws"), releaseResolution{
+		Version: "0.3.0", Digest: "sha256:newnewnewnew", Asset: "piccolo-gws_0.3.0_linux_arm64.tar.gz",
+	}, installedOf(m, "github:kimus/piccolo-gws"))
+	got := out.String()
+	for _, want := range []string{"0.2.0 -> 0.3.0", "piccolo-gws_0.3.0_linux_arm64.tar.gz", "base image:", "toolchain:", "preserved"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("plan must show %q, got:\n%s", want, got)
+		}
+	}
 }

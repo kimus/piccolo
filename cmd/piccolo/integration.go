@@ -26,9 +26,10 @@ import (
 )
 
 type integrationFlags struct {
-	yes  bool
-	pull bool
-	tag  string
+	yes   bool
+	pull  bool
+	tag   string
+	force bool // rebuild even when the resolved release/image already matches
 }
 
 type integrationUpgradeFlags struct {
@@ -74,6 +75,7 @@ func newIntegrationAddCmd() *cobra.Command {
 	cmd.Flags().BoolVar(&f.yes, "yes", false, "non-interactive: accept prompts")
 	cmd.Flags().BoolVar(&f.pull, "pull", false, "ask Docker to pull a newer base image before building")
 	cmd.Flags().StringVar(&f.tag, "tag", "", "local image tag to build (default: deterministic content-derived tag)")
+	cmd.Flags().BoolVar(&f.force, "force", false, "rebuild even if the resolved release or runtime image already matches")
 	return cmd
 }
 
@@ -90,6 +92,7 @@ func newIntegrationBuildCmd() *cobra.Command {
 	cmd.Flags().BoolVar(&f.yes, "yes", false, "non-interactive: accept prompts")
 	cmd.Flags().BoolVar(&f.pull, "pull", false, "ask Docker to pull a newer base image before building")
 	cmd.Flags().StringVar(&f.tag, "tag", "", "local image tag to build (default: deterministic content-derived tag)")
+	cmd.Flags().BoolVar(&f.force, "force", false, "rebuild even if the resolved release or runtime image already matches")
 	return cmd
 }
 
@@ -174,6 +177,7 @@ func newIntegrationUpgradeCmd() *cobra.Command {
 	cmd.Flags().BoolVar(&f.yes, "yes", false, "non-interactive: accept prompts")
 	cmd.Flags().BoolVar(&f.pull, "pull", false, "ask Docker to pull a newer base image before building")
 	cmd.Flags().StringVar(&f.tag, "tag", "", "local image tag to build (default: deterministic content-derived tag)")
+	cmd.Flags().BoolVar(&f.force, "force", false, "rebuild even if the resolved release or runtime image already matches")
 	cmd.Flags().BoolVar(&f.all, "all", false, "upgrade all installed latest-channel integrations")
 	return cmd
 }
@@ -204,25 +208,48 @@ func runIntegrationAdd(cmd *cobra.Command, input string, f integrationFlags) err
 	if pkg.Channel() == picintegration.ChannelLatest {
 		fmt.Fprintf(out, "[WARN] integration tracks latest; future upgrades may resolve newer releases\n")
 	}
-	if !f.yes && term.IsTerminal(int(os.Stdin.Fd())) {
-		fmt.Fprintf(out, "Install or update this integration release? [y/N] ")
-		line, _ := bufio.NewReader(cmd.InOrStdin()).ReadString('\n')
-		if !strings.EqualFold(strings.TrimSpace(line), "y") && !strings.EqualFold(strings.TrimSpace(line), "yes") {
+	fetcher := newReleaseFetcher()
+	res, err := fetcher.Resolve(ctx, pkg)
+	if err != nil {
+		return err
+	}
+
+	// Already installed at this exact release? Then there is nothing to
+	// download, nothing to build, and nothing to ask.
+	if installed, ok := manifestIntegration(m, pkg.Package()); ok && !f.force &&
+		installed.ResolvedVersion == res.Version && installed.ArtifactDigest == res.Digest {
+		fmt.Fprintf(out, "\n✓ Already up to date: %s %s (sha256:%s)\n", pkg.Short(), res.Version, shortDigest(res.Digest))
+		fmt.Fprintf(out, "  image: %s\n", m.Container.Image)
+		fmt.Fprintf(out, "  state: %s (preserved)\n", installed.StatePath)
+		fmt.Fprintf(out, "\nUse --force to rebuild anyway, or 'piccolo integration add %s@<selector>' to change version.\n", pkg.Short())
+		return nil
+	}
+
+	printIntegrationPlan(out, m, pkg, res, installedOf(m, pkg.Package()))
+	if !f.yes {
+		fmt.Fprintf(out, "\nInstall or update this integration release? [y/N] ")
+		line, readErr := bufio.NewReader(cmd.InOrStdin()).ReadString('\n')
+		answer := strings.ToLower(strings.TrimSpace(line))
+		if readErr != nil && answer == "" {
+			// No answer available at all: refuse rather than silently installing.
+			return errors.New("integration add needs confirmation; rerun with --yes to accept non-interactively")
+		}
+		if answer != "y" && answer != "yes" {
 			return errors.New("integration add cancelled")
 		}
 	}
+
 	runner := newIntegrationRunner()
 	pingCtx, cancel := context.WithTimeout(ctx, defaultImageBuildProbeTimeout)
 	defer cancel()
 	if err := runner.Ping(pingCtx); err != nil {
 		return fmt.Errorf("docker daemon not reachable: %w", err)
 	}
-	fetcher := newReleaseFetcher()
 	bundles, err := fetchReleaseBundlesForManifest(ctx, fetcher, m.Runtime.Integrations)
 	if err != nil {
 		return err
 	}
-	fetched, err := fetcher.Fetch(ctx, pkg)
+	fetched, err := fetcher.Download(ctx, res)
 	if err != nil {
 		return err
 	}
@@ -231,6 +258,12 @@ func runIntegrationAdd(cmd *cobra.Command, input string, f integrationFlags) err
 	plan, err := runtimeimage.BuildPlan(runtimeimage.Options{BaseImage: base, Tag: f.tag, Packages: effectiveToolchain(m).Packages, Commands: effectiveToolchain(m).Commands, Bundles: bundles, Integrations: sourceManifestIntegrationsForBuildExcept(m.Runtime.Integrations, pkg.Package())})
 	if err != nil {
 		return err
+	}
+	// Authoritative no-op catch: the tag is a digest of the exact image inputs,
+	// so equality means a build would reproduce the image we already point at.
+	if !f.force && !f.yes && plan.Tag == m.Container.Image {
+		fmt.Fprintf(out, "\n✓ Runtime image already matches this configuration (%s); nothing to rebuild. Use --force to rebuild anyway.\n", plan.Tag)
+		return nil
 	}
 	buildCtx, err := plan.ContextTar()
 	if err != nil {
@@ -632,6 +665,34 @@ func runIntegrationUpgrade(cmd *cobra.Command, name string, f integrationUpgrade
 		fmt.Fprintln(out, "No latest-channel integrations to upgrade.")
 		return nil
 	}
+	// Resolve first (metadata only): if nothing actually changed there is no
+	// prompt to ask, nothing to download, and no image to rebuild.
+	fetcher := newReleaseFetcher()
+	resolutions := make(map[int]releaseResolution, len(indexes))
+	var changed bool
+	fmt.Fprintf(out, "Resolving latest releases:\n")
+	for _, i := range indexes {
+		item := m.Runtime.Integrations[i]
+		pkg, err := packageRefForManifest(item)
+		if err != nil {
+			return err
+		}
+		pkg.Selector = ""
+		res, err := fetcher.Resolve(ctx, pkg)
+		if err != nil {
+			return err
+		}
+		resolutions[i] = res
+		if item.ResolvedVersion != res.Version || item.ArtifactDigest != res.Digest {
+			changed = true
+		}
+		fmt.Fprintf(out, "  %s: %s -> %s\n", pkg.Short(), valueOrDash(item.ResolvedVersion), res.Version)
+	}
+	if !changed && !f.force {
+		fmt.Fprintf(out, "\n\u2713 Already up to date (image %s); nothing to rebuild.\n", m.Container.Image)
+		fmt.Fprintln(out, "Use --force to rebuild anyway, or 'piccolo integration add <owner/repo>@<selector>' to pin a version.")
+		return nil
+	}
 	if !f.yes && term.IsTerminal(int(os.Stdin.Fd())) {
 		fmt.Fprintf(out, "Upgrade %d latest-channel integration(s)? [y/N] ", len(indexes))
 		line, _ := bufio.NewReader(cmd.InOrStdin()).ReadString('\n')
@@ -647,25 +708,18 @@ func runIntegrationUpgrade(cmd *cobra.Command, name string, f integrationUpgrade
 	}
 	planned := append([]manifest.Integration(nil), m.Runtime.Integrations...)
 	fetches := map[int]fetchedRelease{}
-	fetcher := newReleaseFetcher()
 	bundles, err := fetchReleaseBundlesForManifest(ctx, fetcher, planned)
 	if err != nil {
 		return err
 	}
 	for _, i := range indexes {
-		item := planned[i]
-		pkg, err := packageRefForManifest(item)
-		if err != nil {
-			return err
-		}
-		pkg.Selector = ""
-		fetched, err := fetcher.Fetch(ctx, pkg)
+		res := resolutions[i]
+		fetched, err := fetcher.Download(ctx, res)
 		if err != nil {
 			return err
 		}
 		fetches[i] = fetched
 		bundles = upsertBundle(bundles, fetched.Bundle)
-		fmt.Fprintf(out, "Resolved %s: %s -> %s\n", pkg.Short(), valueOrDash(item.ResolvedVersion), fetched.Version)
 	}
 	base := integrationBuildBase(m)
 	plan, err := runtimeimage.BuildPlan(runtimeimage.Options{BaseImage: base, Tag: f.tag, Packages: effectiveToolchain(m).Packages, Commands: effectiveToolchain(m).Commands, Integrations: sourceManifestIntegrationsForBuild(planned), Bundles: bundles})
@@ -981,7 +1035,7 @@ func fetchReleaseBundlesForManifest(ctx context.Context, fetcher releaseFetcher,
 		if err != nil {
 			return nil, err
 		}
-		fetched, err := fetcher.Fetch(ctx, pkg)
+		fetched, err := downloadResolvedRelease(ctx, fetcher, pkg)
 		if err != nil {
 			return nil, err
 		}
