@@ -27,6 +27,7 @@ import (
 	picintegration "github.com/kimus/piccolo/internal/integration"
 	"github.com/kimus/piccolo/internal/manifest"
 	"github.com/kimus/piccolo/internal/setup"
+	"github.com/kimus/piccolo/internal/wizard"
 	"github.com/kimus/piccolo/internal/workspace"
 )
 
@@ -380,6 +381,25 @@ type actionReport struct {
 	summary string
 }
 
+// attemptLog is what the session knows about each action, keyed by action id.
+//
+// Recording every attempt as its own line made a retry lie: check_connectivity
+// failing on a disabled API and then passing after the user enabled it printed
+// "check_connectivity: reported failure" at the end of a run that ended fine.
+// The log keeps the latest outcome per action, in first-attempt order, so
+// finishing something clears it from the summary the way it clears the menu.
+type attemptLog []actionReport
+
+func (l *attemptLog) record(rep actionReport) {
+	for i, existing := range *l {
+		if existing.action == rep.action {
+			(*l)[i] = rep
+			return
+		}
+	}
+	*l = append(*l, rep)
+}
+
 // relayCallbackIntoContainer delivers the captured query string into the still
 // running action container's own loopback. Piccolo never interprets the query:
 // the credential material belongs to the integration.
@@ -534,7 +554,7 @@ func renderActionInputs(action picintegration.Action, inputs []picintegration.Ac
 		}
 	}
 
-	if err := huh.NewForm(groups...).Run(); err != nil {
+	if err := wizard.Form(groups...).Run(); err != nil {
 		if errors.Is(err, huh.ErrUserAborted) {
 			return nil, errActionAborted
 		}
@@ -620,7 +640,7 @@ func confirmOverwrite(target string) (bool, error) {
 		return false, fmt.Errorf("%s already exists and no terminal is available to confirm replacing it", filepath.Base(target))
 	}
 	agree := false
-	form := huh.NewForm(huh.NewGroup(
+	form := wizard.Form(huh.NewGroup(
 		huh.NewConfirm().
 			Title(fmt.Sprintf("Replace the existing %s?", filepath.Base(target))).
 			Description("the current credentials for this integration will be overwritten").
@@ -629,6 +649,12 @@ func confirmOverwrite(target string) (bool, error) {
 			Value(&agree),
 	))
 	if err := form.Run(); err != nil {
+		if errors.Is(err, huh.ErrUserAborted) {
+			// Backing out of a yes/no gate is a no. Reporting it as a failure would
+			// make the escape key sound like a crash on the screen whose whole job is
+			// to let the user say no.
+			return false, nil
+		}
 		return false, err
 	}
 	return agree, nil
@@ -840,7 +866,7 @@ func runDeclarativeSetup(ctx context.Context, out io.Writer, runner integrationR
 	// available and what is left to do change with them. That is what lets each
 	// action do exactly one thing instead of shipping composite entries.
 	var pendingPatch json.RawMessage
-	var reported []actionReport
+	var attempts attemptLog
 	quitting := false
 	crashes := map[string]int{}
 	for {
@@ -879,7 +905,7 @@ func runDeclarativeSetup(ctx context.Context, out io.Writer, runner integrationR
 		if len(rep.patch) > 0 {
 			pendingPatch = rep.patch
 		}
-		reported = append(reported, *rep)
+		attempts.record(*rep)
 		if rep.outcome.terminal() {
 			if rep.outcome == outcomeCrashed {
 				crashes[rep.action]++
@@ -892,9 +918,13 @@ func runDeclarativeSetup(ctx context.Context, out io.Writer, runner integrationR
 		// next iteration re-reads state, so a partial save becomes visible instead
 		// of the session ending on top of it.
 	}
-	s.summarize(reported)
+	s.summarize(attempts)
 	if quitting {
-		fmt.Fprintln(s.out, s.style.Mutedf("  left without applying a pending config change; rerun setup to review it"))
+		// Only true when something actually was pending: a session that proposed
+		// nothing should not report abandoning something.
+		if len(pendingPatch) > 0 {
+			fmt.Fprintln(s.out, s.style.Mutedf("  left without applying a pending config change; rerun setup to review it"))
+		}
 		return nil
 	}
 	if len(pendingPatch) == 0 {
@@ -1068,7 +1098,7 @@ func (s *setupSession) chooseAction(title string, menu []menuEntry, state picint
 	if subtitle != "" {
 		selectField = selectField.Description(subtitle)
 	}
-	form := huh.NewForm(huh.NewGroup(selectField))
+	form := wizard.Form(huh.NewGroup(selectField))
 	if err := form.Run(); err != nil {
 		return nil, false, err
 	}
@@ -1261,7 +1291,7 @@ func integrationServerKey(in manifest.Integration, desc picintegration.Descripto
 // user-owned config.json.
 func confirmApplyConfig() (bool, error) {
 	confirm := false
-	form := huh.NewForm(huh.NewGroup(
+	form := wizard.Form(huh.NewGroup(
 		huh.NewConfirm().
 			Title("Apply this change to config.json?").
 			Description("your previous config.json is kept as config.json.bak").
@@ -1270,6 +1300,12 @@ func confirmApplyConfig() (bool, error) {
 			Value(&confirm),
 	))
 	if err := form.Run(); err != nil {
+		if errors.Is(err, huh.ErrUserAborted) {
+			// Backing out of a yes/no gate is a no. Reporting it as a failure would
+			// make the escape key sound like a crash on the screen whose whole job is
+			// to let the user say no.
+			return false, nil
+		}
 		return false, err
 	}
 	return confirm, nil

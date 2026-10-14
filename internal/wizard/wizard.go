@@ -7,10 +7,37 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/charmbracelet/bubbles/key"
 	"github.com/charmbracelet/huh"
 
 	"github.com/kimus/piccolo/internal/generate"
 )
+
+// KeyMap is the one keybinding definition for every interactive Piccolo screen:
+// the init wizard, `piccolo setup`, and integration setup.
+//
+// It exists because those screens drifted apart. `piccolo setup` bound esc to
+// back/quit while the integration forms kept the library default of ctrl+c
+// alone, so the key people press to leave a field did nothing on exactly the
+// screen where they were typing a credential -- and the same key meant something
+// else one screen earlier. esc now aborts a form everywhere, which the setup
+// flow already turns into "back to the menu, or out if you were at the menu".
+//
+// The binding is safe against the library's own uses of esc: the file picker's
+// Close binding ships disabled, so the form-level abort never steals a key a
+// field still needs.
+func KeyMap() *huh.KeyMap {
+	km := huh.NewDefaultKeyMap()
+	km.Quit = key.NewBinding(key.WithKeys("ctrl+c", "esc"), key.WithHelp("esc", "back/quit"))
+	return km
+}
+
+// Form builds an interactive form with the shared KeyMap. Piccolo screens should
+// be constructed through here rather than huh.NewForm directly, so a key never
+// means two things on two consecutive screens.
+func Form(groups ...*huh.Group) *huh.Form {
+	return huh.NewForm(groups...).WithKeyMap(KeyMap())
+}
 
 // Prefill carries non-interactive flag values into the wizard; empty fields
 // are asked interactively.
@@ -163,7 +190,7 @@ func Run(pre Prefill) (generate.Inputs, string, error) {
 	}
 
 	if len(groups) > 0 {
-		form := huh.NewForm(groups...)
+		form := Form(groups...)
 		if err := form.Run(); err != nil {
 			return generate.Inputs{}, "", fmt.Errorf("wizard cancelled: %w", err)
 		}

@@ -940,3 +940,37 @@ func TestSummarizeReportsUnfinishedActions(t *testing.T) {
 		t.Errorf("a clean session should print no summary, got %q", quiet.String())
 	}
 }
+
+// A retry that succeeds must leave the session clean. Logging every attempt
+// printed the stale first failure at the end of a run that ended fine.
+func TestAttemptLogKeepsLatestOutcomePerAction(t *testing.T) {
+	var l attemptLog
+	l.record(actionReport{action: "check_connectivity", outcome: outcomeReported})
+	l.record(actionReport{action: "login", outcome: outcomeCrashed})
+	l.record(actionReport{action: "check_connectivity", outcome: outcomeSucceeded})
+
+	var out bytes.Buffer
+	s := &setupSession{out: &out, style: newStyler(&out)}
+	s.summarize(l)
+	got := out.String()
+	if strings.Contains(got, "check_connectivity") {
+		t.Errorf("a retried action that passed is still listed as unfinished:\n%s", got)
+	}
+	// The other action genuinely failed and must remain.
+	if !strings.Contains(got, "login: crashed") {
+		t.Errorf("unrelated failure dropped:\n%s", got)
+	}
+	// One line per action, not per attempt.
+	if n := strings.Count(got, "login:"); n != 1 {
+		t.Errorf("expected one login line, got %d:\n%s", n, got)
+	}
+
+	// Order is first attempt, so the summary reads like the session did.
+	var ordered attemptLog
+	ordered.record(actionReport{action: "b", outcome: outcomeReported})
+	ordered.record(actionReport{action: "a", outcome: outcomeReported})
+	ordered.record(actionReport{action: "b", outcome: outcomeReported})
+	if len(ordered) != 2 || ordered[0].action != "b" || ordered[1].action != "a" {
+		t.Errorf("unexpected order/len: %+v", ordered)
+	}
+}

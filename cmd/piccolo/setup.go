@@ -12,7 +12,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/charmbracelet/bubbles/key"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/huh"
 	"github.com/spf13/cobra"
@@ -23,6 +22,7 @@ import (
 	"github.com/kimus/piccolo/internal/manifest"
 	"github.com/kimus/piccolo/internal/runtimeimage"
 	"github.com/kimus/piccolo/internal/setup"
+	"github.com/kimus/piccolo/internal/wizard"
 	"github.com/kimus/piccolo/internal/workspace"
 )
 
@@ -48,10 +48,10 @@ func newSetupCmd() *cobra.Command {
 	return cmd
 }
 
+// setupForm is `piccolo setup`'s screen constructor. The keymap comes from the
+// wizard package so it cannot drift from the other interactive Piccolo surfaces.
 func setupForm(groups ...*huh.Group) *huh.Form {
-	km := huh.NewDefaultKeyMap()
-	km.Quit = key.NewBinding(key.WithKeys("ctrl+c", "esc"), key.WithHelp("esc", "back/quit"))
-	return huh.NewForm(groups...).WithKeyMap(km).WithProgramOptions(tea.WithAltScreen())
+	return wizard.Form(groups...).WithProgramOptions(tea.WithAltScreen())
 }
 
 type setupState struct {
