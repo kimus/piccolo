@@ -62,7 +62,7 @@ curl -fsSL https://kimus.github.io/piccolo/install.sh | sh
 Install a specific version:
 
 ```sh
-curl -fsSL https://kimus.github.io/piccolo/install.sh | sh -s -- --version 0.2.0
+curl -fsSL https://kimus.github.io/piccolo/install.sh | sh -s -- --version 0.3.0
 ```
 
 The installer downloads the matching GitHub Release archive, verifies `checksums.txt`, and installs only the host `piccolo` CLI. It does not install Docker, PicoClaw, or integrations.
@@ -76,8 +76,8 @@ Manual installs can download a release archive and `checksums.txt` from GitHub R
 `piccolo --version` reports the build date so a stale local binary is obvious:
 
 ```text
-piccolo version 0.2.0 (built 2026-10-14T12:00:18Z, go1.26.5)   # stamped release build
-piccolo version 0.2.0-dev (dev build, not stamped; ...)          # plain `go build`
+piccolo version 0.3.0 (built 2026-10-15T12:00:18Z, go1.26.5)   # stamped release build
+piccolo version 0.3.0-dev (dev build, not stamped; ...)          # plain `go build`
 ```
 - A reachable Docker daemon (Docker Desktop, colima, podman socket, ...). The `docker` CLI is **not** required — Piccolo talks to the daemon through the Docker Go SDK.
 

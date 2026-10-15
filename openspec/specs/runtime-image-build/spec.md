@@ -17,16 +17,28 @@ Piccolo SHALL provide a command that builds a local custom PicoClaw runtime imag
 - **THEN** Piccolo fails with an actionable error
 - **AND** no workspace files are modified
 
-### Requirement: Devbox support in custom image
-The custom runtime image SHALL include Devbox support suitable for running common file-handling tools.
+### Requirement: Toolchain installs with the base image package manager
+The runtime image SHALL install its toolchain using the base image's own package manager, and SHALL NOT install or depend on a separate package system inside the image.
 
-#### Scenario: Devbox available in image
-- **WHEN** the custom image build succeeds
-- **THEN** containers created from the image can run `devbox` from the default shell environment
+#### Scenario: Packages installed by the base distribution
+- **WHEN** the runtime image is built
+- **THEN** the configured toolchain packages are installed by the base image's package manager
+- **AND** their programs are on the default PATH without any additional environment setup
 
-#### Scenario: File-handling Devbox config generated
-- **WHEN** Piccolo prepares the custom image build context
-- **THEN** it includes a `devbox.json` with common file-handling utilities for QR/barcode decoding, file type detection, structured data parsing, PDF extraction, OCR, metadata inspection, media inspection, SQLite, and archives
+#### Scenario: No separate package system in the image
+- **WHEN** the runtime image build inputs are generated
+- **THEN** no installer, configuration file, profile path, or garbage-collection step for a secondary package system appears in the Dockerfile
+- **AND** no build context file is generated for one
+
+#### Scenario: Bootstrap tools limited to what the build needs
+- **WHEN** the Dockerfile installs its bootstrap layer
+- **THEN** it includes only tools required to build and run the runtime
+- **AND** it does not include packages needed solely by a removed packaging system
+
+#### Scenario: A version can be pinned by naming it
+- **WHEN** a toolchain package entry includes an explicit version
+- **THEN** that entry is passed to the package manager unchanged
+- **AND** the build resolves exactly that version or fails
 
 ### Requirement: Explicit manifest adoption
 Piccolo SHALL only update `piccolo.yaml` to use the custom image after explicit user consent or an explicit non-interactive flag.

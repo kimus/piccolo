@@ -110,19 +110,6 @@ The system SHALL advance installed latest-channel release integrations with `pic
 - **THEN** Piccolo attempts to upgrade every installed latest-channel release integration
 - **AND** leaves fixed selector integrations unchanged
 
-### Requirement: Build integrations from source explicitly
-The system SHALL provide `piccolo integration build <package-ref>` as the explicit source-build path using Devbox/Nix source installation.
-
-#### Scenario: Build source package
-- **WHEN** the user runs `piccolo integration build kimus/piccolo-gws@main`
-- **THEN** Piccolo builds the integration from source using the existing Devbox/Nix mechanism
-- **AND** records the integration source as `build`
-
-#### Scenario: Warn about build dependencies
-- **WHEN** the user runs `piccolo integration build <package-ref>`
-- **THEN** Piccolo warns that source builds can download compilers and build dependencies
-- **AND** recommends `piccolo integration add <package-ref>` for normal release installs
-
 ### Requirement: Integration identity resolvable without artifact download
 
 Piccolo SHALL be able to determine an installed release integration's resolved version, artifact name and digest from release metadata alone, without transferring the artifact.
@@ -144,6 +131,13 @@ Piccolo SHALL be able to determine an installed release integration's resolved v
 - **WHEN** Piccolo assembles the set of integrations that must be present in a rebuilt image
 - **THEN** it obtains each integration's identity from release metadata
 - **AND** it downloads an artifact only for an integration whose content must actually be placed in the build context
+
+#### Scenario: Source-installed integrations are excluded
+
+- **WHEN** a manifest records an integration installed from source
+- **THEN** an image rebuild reports that source-built integrations are no longer supported
+- **AND** it names `piccolo integration add <package-ref>` as the replacement path
+- **AND** drift checks and the already-running image are unaffected
 
 ### Requirement: Integration state path derived from package reference
 

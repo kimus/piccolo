@@ -29,7 +29,7 @@ Piccolo SHALL teach generated agents that the file-handling toolchain is fixed b
 #### Scenario: No package managers
 
 - **WHEN** the skill describes recovering a missing tool
-- **THEN** it forbids running any package manager (apt-get, apk, devbox, nix-env)
+- **THEN** it forbids running any package manager (apk, apt-get, nix-env)
 - **AND** it states that the toolchain cannot be changed at runtime
 
 ### Requirement: QR and barcode decoding guidance
