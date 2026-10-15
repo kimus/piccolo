@@ -30,6 +30,11 @@ type Engine interface {
 	ImageExists(ctx context.Context, image string) (bool, error)
 	ImageLabels(ctx context.Context, image string) (map[string]string, bool, error)
 	ContainerExists(ctx context.Context, name string) (bool, error)
+	// StateByName reads the container that is actually serving traffic, which is the
+	// only way to notice it runs a DIFFERENT image from the one piccolo.yaml names.
+	// Every other image check here consults the local image store, and a store can
+	// hold a correct image while an older container keeps running the old binaries.
+	StateByName(ctx context.Context, name string) (docker.State, error)
 	ListByPrefix(ctx context.Context, prefix string) ([]string, error)
 	ListImages(ctx context.Context) ([]docker.ImageRecord, error)
 	ContainerImages(ctx context.Context) (map[string][]string, error)
@@ -205,11 +210,19 @@ func Run(ctx context.Context, opts Options) []Result {
 		}
 	}
 
-	// 5. Stale container (warning only).
+	// 5. Stale container (warning only): one that exists but is NOT running. A
+	// running container built from the current image is the service itself, not a
+	// leftover, and calling it stale made every healthy workspace carry a permanent
+	// false warning. A running container built from a DIFFERENT image is reported by
+	// checkRunningImage below with the accurate verb (restart), so it is not
+	// double-reported here.
 	if opts.Engine != nil {
-		if exists, err := opts.Engine.ContainerExists(ctx, m.Container.Name); err == nil && exists {
+		exists, err := opts.Engine.ContainerExists(ctx, m.Container.Name)
+		state, serr := opts.Engine.StateByName(ctx, m.Container.Name)
+		if err == nil && exists && !(serr == nil && state.Found && state.Running) {
 			add(WARN, "stale container %q exists (serve will replace it)", m.Container.Name)
 		}
+		results = append(results, checkRunningImage(ctx, opts.Engine, m)...)
 		// One-shot setup/status containers are reclaimed automatically before
 		// the next run, but a leftover means a previous attempt was interrupted.
 		if names, err := opts.Engine.ListByPrefix(ctx, docker.SetupContainerPrefix); err == nil && len(names) > 0 {
@@ -240,6 +253,7 @@ func Run(ctx context.Context, opts Options) []Result {
 
 	// 8. Models.
 	results = append(results, checkModels(cfg)...)
+	results = append(results, checkLegacyAgentModelNames(data)...)
 
 	// 9. Image understanding. PicoClaw can receive channel attachments; Piccolo
 	// recommends routing them through a vision-capable image_model and the
@@ -253,6 +267,150 @@ func Run(ctx context.Context, opts Options) []Result {
 	// are user-owned and ignored here).
 	results = append(results, checkChannels(data)...)
 
+	// 12. MCP reachability: a registered integration server is not a callable tool.
+	results = append(results, checkIntegrationRegistration(m, data)...)
+	results = append(results, checkMCPAccess(opts.Workspace, cfg, data)...)
+
+	return results
+}
+
+// checkIntegrationRegistration closes the half of "installed" that the manifest
+// cannot prove. Registration is the LAST act of `piccolo integration setup`: the
+// server entry is written from the action result's configPatch, through a
+// confirmation gate the user can decline (or reach by pressing esc), and Piccolo
+// prints "discarded; integration state was left as-is". That leaves a workspace where
+// the image contains the binary, the manifest lists the integration, credentials are
+// stored, and config.json has never heard of it — which a user experiences exactly as
+// "I added it and it silently does nothing", because checkMCPAccess stays silent when
+// no server is registered and nothing else compares the two files.
+//
+// Warning, never failure: the integration is installed, and completing it is the
+// user's action, not Piccolo's to take.
+func checkIntegrationRegistration(m *manifest.Manifest, configData []byte) []Result {
+	if m == nil || len(m.Runtime.Integrations) == 0 {
+		return nil
+	}
+	var raw struct {
+		Tools struct {
+			MCP struct {
+				Servers map[string]json.RawMessage `json:"servers"`
+			} `json:"mcp"`
+		} `json:"tools"`
+	}
+	if err := json.Unmarshal(configData, &raw); err != nil {
+		return nil
+	}
+	var results []Result
+	for _, in := range m.Runtime.Integrations {
+		// Only an integration that records a server key claims to need one. An empty
+		// key means it works without MCP (a CLI-only integration), and demanding an
+		// entry would invent a problem.
+		key := strings.TrimSpace(in.MCPServerKey)
+		if key == "" {
+			continue
+		}
+		if _, ok := raw.Tools.MCP.Servers[key]; ok {
+			continue
+		}
+		ref := integrationHandle(in)
+		label := in.Name
+		if label == "" {
+			label = ref
+		}
+		results = append(results, Result{Status: WARN, Message: fmt.Sprintf("integration %s is installed and configured but never registered: config.json has no tools.mcp.servers.%s entry — its tools are not offered to any agent; finish it with 'piccolo integration setup %s' and accept the config change", label, key, ref)})
+	}
+	return results
+}
+
+// checkMCPAccess reports whether the MCP servers an integration registered can
+// reach an agent at all. Two independent gates stand between a registered server
+// and a tool the model can call, and both fail silently:
+//
+//  1. tools.mcp.enabled — PicoClaw returns from ensureMCPInitialized before it ever
+//     reads the servers map while the MCP tool is off (pkg/agent/agent_mcp.go:79),
+//     and the toggle defaults to false (pkg/config/defaults.go:428-431). A
+//     registered server is therefore inert, and an integration cannot fix that
+//     itself: the patch allowlist confines it to tools.mcp.servers.<key> precisely
+//     so it cannot touch tool toggles.
+//  2. a declared AGENT.md `tools:` list — PicoClaw builds a strict, exact-name
+//     allowlist from it (pkg/agent/tool_allowlist.go:143-164, applied at
+//     pkg/tools/registry.go:171-184) while MCP tools are named
+//     mcp_<server>_<tool> at runtime (pkg/tools/integration/mcp_tool.go:143). No
+//     list written at generation time can contain those names, so declaring one on
+//     the coordinator revokes every tool every installed integration provides.
+//
+// A gateway in either state answers /health and executes its integration binaries,
+// so the serve readiness gate passes; this check exists because that gate proves
+// the binary, not the capability. It stays silent when nothing is installed, since
+// an absent integration is not a broken one.
+func checkMCPAccess(workspace string, cfg picoclaw.Config, configData []byte) []Result {
+	var results []Result
+	add := func(s Status, format string, args ...any) {
+		results = append(results, Result{Status: s, Message: fmt.Sprintf(format, args...)})
+	}
+
+	var raw struct {
+		Tools struct {
+			MCP struct {
+				Enabled *bool `json:"enabled"`
+				Servers map[string]struct {
+					Enabled *bool `json:"enabled"`
+				} `json:"servers"`
+			} `json:"mcp"`
+		} `json:"tools"`
+	}
+	if err := json.Unmarshal(configData, &raw); err != nil {
+		return results
+	}
+
+	var registered, disabled []string
+	for name, srv := range raw.Tools.MCP.Servers {
+		if srv.Enabled != nil && !*srv.Enabled {
+			disabled = append(disabled, name)
+			continue
+		}
+		registered = append(registered, name)
+	}
+	if len(registered) == 0 && len(disabled) == 0 {
+		return results
+	}
+	sort.Strings(registered)
+	sort.Strings(disabled)
+	if len(disabled) > 0 {
+		add(WARN, "mcp: server %s is registered but disabled — its tools are not offered to any agent", strings.Join(disabled, ", "))
+	}
+	if len(registered) == 0 {
+		return results
+	}
+	names := strings.Join(registered, ", ")
+
+	if raw.Tools.MCP.Enabled == nil || !*raw.Tools.MCP.Enabled {
+		add(WARN, "mcp: tools.mcp.enabled is not true while server(s) {%s} are registered — PicoClaw skips MCP initialization entirely, so agents are handed none of these integrations' tools even though their binaries run; enable it with 'piccolo setup' \u2192 Tools \u2192 MCP tool servers", names)
+		return results
+	}
+
+	for _, a := range cfg.Agents.List {
+		if !a.Default {
+			continue
+		}
+		ws := a.Workspace
+		if ws == "" {
+			ws = cfg.Agents.Defaults.Workspace
+		}
+		hostPath, ok := translateWorkspacePath(workspace, ws)
+		if !ok {
+			continue // checkAgents reports this precisely.
+		}
+		fm, err := parseFrontmatter(filepath.Join(hostPath, "AGENT.md"))
+		if err != nil {
+			continue // checkAgents reports this precisely.
+		}
+		if len(fm.Tools) > 0 {
+			add(WARN, "mcp: coordinator %q declares an AGENT.md tools: allowlist — PicoClaw matches tool names exactly and MCP tools are named mcp_<server>_<tool> at runtime, so this agent cannot receive any tool from {%s}; Piccolo generates the coordinator with no tools: line, and deleting that line grants it every tool config.json enables", a.ID, names)
+			continue
+		}
+		add(OK, "mcp: %d server(s) reachable by coordinator %q (%s)", len(registered), a.ID, names)
+	}
 	return results
 }
 
@@ -469,12 +627,27 @@ func checkIntegrations(m *manifest.Manifest) []Result {
 		if label == "" {
 			label = in.Name
 		}
-		results = append(results, Result{Status: OK, Message: fmt.Sprintf("integration installed: %s (%s)", label, in.Ref)})
+		results = append(results, Result{Status: OK, Message: fmt.Sprintf("integration installed: %s (%s)", label, integrationHandle(in))})
 		if len(in.SetupCommand) == 0 {
 			results = append(results, Result{Status: WARN, Message: fmt.Sprintf("integration %s has no setup command", in.Name)})
 		}
 	}
 	return results
+}
+
+// integrationHandle is the identifier a user can paste straight back into another
+// piccolo command. Integration.Ref is the RETIRED source-build field and is empty for
+// every release-based integration, so printing it alone produced both an empty
+// "installed: Google Workspace ()" and, worse, a remedy reading "piccolo integration
+// setup " with nothing in it — advice that cannot be followed. The order mirrors what
+// integrationMatches actually accepts.
+func integrationHandle(in manifest.Integration) string {
+	for _, candidate := range []string{in.Package, in.Name, in.Ref} {
+		if s := strings.TrimSpace(candidate); s != "" {
+			return s
+		}
+	}
+	return "(unnamed integration)"
 }
 
 func hasString(values []string, want string) bool {
@@ -489,6 +662,13 @@ func hasString(values []string, want string) bool {
 func checkExecSafety(configData []byte) []Result {
 	var results []Result
 	var raw struct {
+		Agents struct {
+			Defaults struct {
+				// Pointer: an absent key is PicoClaw's default, which is TRUE
+				// (pkg/config/defaults.go:29), not false.
+				RestrictToWorkspace *bool `json:"restrict_to_workspace"`
+			} `json:"defaults"`
+		} `json:"agents"`
 		Tools struct {
 			Exec struct {
 				Enabled     *bool `json:"enabled"`
@@ -501,6 +681,17 @@ func checkExecSafety(configData []byte) []Result {
 	}
 	if raw.Tools.Exec.AllowRemote != nil && *raw.Tools.Exec.AllowRemote {
 		results = append(results, Result{Status: WARN, Message: "exec: tools.exec.allow_remote is true — remote chats can request shell commands inside the container subject to PicoClaw safety checks; enable only for trusted channels/users"})
+	}
+	// Absent means restricted; only an explicit false clears it. Piccolo generates
+	// false, so this fires on a workspace hand-hardened or created by an older
+	// Piccolo, and names the guard the agent will keep tripping.
+	restricted := raw.Agents.Defaults.RestrictToWorkspace == nil || *raw.Agents.Defaults.RestrictToWorkspace
+	if restricted {
+		if raw.Tools.Exec.Enabled != nil && *raw.Tools.Exec.Enabled {
+			results = append(results, Result{Status: WARN, Message: "exec: agents.defaults.restrict_to_workspace is true while tools.exec is enabled — PicoClaw blocks shell commands naming any path outside the agent's own workspace (\"Command blocked by safety guard (path outside working dir)\"), and allow_read_outside_workspace does NOT relax that exec check; turn it off with 'piccolo setup' → Tools → Workspace path guard unless you want the sandbox"})
+		} else {
+			results = append(results, Result{Status: WARN, Message: "agents.defaults.restrict_to_workspace is true — write/edit/append stay confined to each agent workspace (Piccolo now generates false; the container is the boundary). Change it with 'piccolo setup' → Tools → Workspace path guard"})
+		}
 	}
 	return results
 }
@@ -663,9 +854,17 @@ func checkAgents(workspace string, cfg picoclaw.Config) []Result {
 			continue
 		}
 		agentMD := filepath.Join(hostPath, "AGENT.md")
-		if _, err := parseFrontmatter(agentMD); err != nil {
+		fm, err := parseFrontmatter(agentMD)
+		if err != nil {
 			add(FAIL, "agent %q: %v", a.ID, err)
 			continue
+		}
+		// AGENT.md frontmatter outranks config.json for this agent's model
+		// (verified v0.3.1 pkg/agent/instance.go:380-392), so a pin here must
+		// resolve too. Piccolo never generates a model key, which makes this a
+		// user-written reference — reported, never rewritten.
+		if pin := strings.TrimSpace(fm.Model); pin != "" && !knownModels(cfg)[pin] {
+			add(FAIL, "agent %q: AGENT.md pins model %q missing from model_list", a.ID, pin)
 		}
 		suffix := ""
 		if a.Default {
@@ -688,6 +887,15 @@ func checkAgents(workspace string, cfg picoclaw.Config) []Result {
 	return results
 }
 
+// knownModels is the set of aliases model_list defines.
+func knownModels(cfg picoclaw.Config) map[string]bool {
+	names := map[string]bool{}
+	for _, mdl := range cfg.ModelList {
+		names[mdl.ModelName] = true
+	}
+	return names
+}
+
 func checkModels(cfg picoclaw.Config) []Result {
 	var results []Result
 	add := func(s Status, format string, args ...any) {
@@ -698,29 +906,97 @@ func checkModels(cfg picoclaw.Config) []Result {
 		add(FAIL, "config.json model_list is empty")
 		return results
 	}
-	names := map[string]bool{}
+	names := knownModels(cfg)
 	for _, mdl := range cfg.ModelList {
-		names[mdl.ModelName] = true
 		if len(mdl.APIKeys) == 0 || isPlaceholderKey(mdl.APIKeys[0]) {
 			add(WARN, "model %q has a placeholder or empty API key", mdl.ModelName)
 		} else {
 			add(OK, "model: %s (%s)", mdl.ModelName, mdl.Model)
 		}
 	}
-	// Every agent-referenced model must exist in model_list.
-	refs := map[string]bool{cfg.Agents.Defaults.ModelName: true}
-	if cfg.Agents.Defaults.ImageModel != "" {
-		refs[cfg.Agents.Defaults.ImageModel] = true
+	// Every model alias config.json references must exist in model_list. Walked
+	// per location and reported with it, so a dangling alias says where to fix
+	// it — and in document order, because ranging over a map here made the line
+	// order vary between runs.
+	type modelRef struct{ path, alias string }
+	var refs []modelRef
+	addRef := func(path, alias string) {
+		if a := strings.TrimSpace(alias); a != "" {
+			refs = append(refs, modelRef{path, a})
+		}
+	}
+	d := cfg.Agents.Defaults
+	addRef("agents.defaults.model_name", d.ModelName)
+	for i, f := range d.ModelFallbacks {
+		addRef(fmt.Sprintf("agents.defaults.model_fallbacks[%d]", i), f)
+	}
+	addRef("agents.defaults.image_model", d.ImageModel)
+	for i, f := range d.ImageModelFallbacks {
+		addRef(fmt.Sprintf("agents.defaults.image_model_fallbacks[%d]", i), f)
 	}
 	for _, a := range cfg.Agents.List {
-		if a.ModelName != "" {
-			refs[a.ModelName] = true
+		label := "agents.list[" + a.ID + "]"
+		if a.Model != nil {
+			// Both spellings of the field — bare alias string or
+			// {primary,fallbacks} — are named by the field path, matching how
+			// internal/setup reports a reference.
+			addRef(label+".model", a.Model.Primary)
+			for i, f := range a.Model.Fallbacks {
+				addRef(fmt.Sprintf("%s.model.fallbacks[%d]", label, i), f)
+			}
+		}
+		if a.Subagents != nil && a.Subagents.Model != nil {
+			addRef(label+".subagents.model", a.Subagents.Model.Primary)
+			for i, f := range a.Subagents.Model.Fallbacks {
+				addRef(fmt.Sprintf("%s.subagents.model.fallbacks[%d]", label, i), f)
+			}
 		}
 	}
-	for ref := range refs {
-		if ref != "" && !names[ref] {
-			add(FAIL, "model_name %q is referenced but missing from model_list", ref)
+	for _, r := range refs {
+		if !names[r.alias] {
+			add(FAIL, "%s references model %q missing from model_list", r.path, r.alias)
 		}
+	}
+	if d.ModelName != "" {
+		add(OK, "default model: %s", d.ModelName)
+	}
+	return results
+}
+
+// checkLegacyAgentModelNames reports the key Piccolo itself used to write on
+// agents.list entries. PicoClaw reads "model" there and ignores "model_name"
+// (verified v0.3.1 pkg/config/config.go:313-321, pkg/agent/instance.go:388), so
+// such an entry silently keeps the default model. Nothing can repair that
+// automatically — the value may name a model that does not exist — so it is
+// reported, never rewritten.
+func checkLegacyAgentModelNames(configData []byte) []Result {
+	var raw struct {
+		Agents struct {
+			List []struct {
+				ID        string `json:"id"`
+				ModelName string `json:"model_name"`
+				Model     any    `json:"model"`
+			} `json:"list"`
+		} `json:"agents"`
+	}
+	var results []Result
+	if err := json.Unmarshal(configData, &raw); err != nil {
+		return nil
+	}
+	for _, a := range raw.Agents.List {
+		if strings.TrimSpace(a.ModelName) == "" {
+			continue
+		}
+		suffix := ""
+		if a.Model != nil {
+			suffix = fmt.Sprintf(" (its model field already says %v and wins)", a.Model)
+		}
+		results = append(results, Result{
+			Status: WARN,
+			Message: fmt.Sprintf(
+				"agent %q sets model_name %q, which PicoClaw ignores on an agents.list entry — the field is model%s",
+				a.ID, a.ModelName, suffix),
+		})
 	}
 	return results
 }
@@ -841,4 +1117,43 @@ func parseFrontmatter(path string) (*frontmatter, error) {
 		return nil, fmt.Errorf("%s frontmatter has no name", path)
 	}
 	return &fm, nil
+}
+
+// checkRunningImage compares the image the container serving traffic was created
+// from against the image piccolo.yaml names, and warns when they differ.
+//
+// No other check in doctor can see this gap, and it is not cosmetic.
+// `piccolo integration add`/`upgrade` bakes a NEW image and rewrites container.image,
+// but the running gateway keeps the OLD binaries until a restart — while config.json,
+// bind-mounted, is re-read immediately. The combination that breaks is the ordinary
+// one: enable an integration's tool, forget the restart. The failure is then total,
+// because an MCP server baked only into the new image is absent from the running one,
+// and PicoClaw fails every chat message rather than only the integration's requests.
+// That is exactly how this was observed: piccolo-gws 0.3.4 still serving, the manifest
+// naming the 0.3.5 image, and `invalid character 'C' looking for beginning of value`
+// on each turn.
+func checkRunningImage(ctx context.Context, engine Engine, m *manifest.Manifest) []Result {
+	if engine == nil || m == nil {
+		return nil
+	}
+	state, err := engine.StateByName(ctx, m.Container.Name)
+	if err != nil || !state.Found || state.Image == "" {
+		// No daemon, or no container: the image-store and stale-container checks
+		// already speak to that, and inventing a second complaint about the same
+		// absent container would double-report one condition.
+		return nil
+	}
+	if !state.Running {
+		// A stopped container is a leftover, and the stale-container warning covers it
+		// with the right verb; "the running gateway holds old binaries" would be a lie.
+		return nil
+	}
+	if state.Image == m.Container.Image {
+		return []Result{{Status: OK, Message: fmt.Sprintf("running container image: %s", state.Image)}}
+	}
+	verb := "serves"
+	if !state.Running {
+		verb = "was created from"
+	}
+	return []Result{{Status: WARN, Message: fmt.Sprintf("container %q %s image %q, but piccolo.yaml names %q — the running gateway holds the OLD integration binaries while config.json is re-read immediately; run 'piccolo restart' before enabling anything the new image provides", m.Container.Name, verb, state.Image, m.Container.Image)}}
 }

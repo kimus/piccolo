@@ -94,6 +94,15 @@ func newStatusCmd() *cobra.Command {
 				// Staleness is reported here too: status is where a user looks when
 				// something is not as expected.
 				warnImageDrift(ctx, out, runner, m)
+				// The image the running container was created from can differ from the one
+				// piccolo.yaml names: `integration add`/`upgrade` bakes a new image and
+				// rewrites the manifest, but only a restart swaps the running binaries —
+				// while bind-mounted config.json is re-read immediately. Worth a line here,
+				// because the symptom a user sees is chat failing, not an image error.
+				if state.Image != "" && state.Image != m.Container.Image {
+					fmt.Fprintf(out, "stale:     container runs %s but piccolo.yaml names %s — run 'piccolo restart' to swap the binaries\n",
+						state.Image, m.Container.Image)
+				}
 				if m.Container.PreviousImage != "" {
 					fmt.Fprintf(out, "rollback:  %s (piccolo integration rollback)\n", m.Container.PreviousImage)
 				}

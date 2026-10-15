@@ -178,25 +178,45 @@ func Models(doc *configdoc.Doc) []ModelInfo {
 	return out
 }
 
-// PatchModel adds or updates a model_list entry (matched by alias). Provider
-// and model are stored as separate fields (PicoClaw's preferred explicit
-// form); a redundant "<provider>/" prefix on model is stripped so it is never
-// double-prefixed. Empty optional values clear the corresponding field on
-// update.
-func PatchModel(doc *configdoc.Doc, alias, provider, model, apiKey, apiBase string) {
+// PatchModel adds or updates a model_list entry.
+//
+// lookup is the alias of the entry being EDITED; pass "" when adding. alias is
+// the entry's alias AFTER the write, so editing the alias of an existing entry
+// renames it in place (array position and unknown keys kept) instead of
+// appending a duplicate and orphaning the entry every reference still points
+// at. Renaming onto a different existing alias is refused: silently editing
+// that other entry while leaving the original behind is never what an edit
+// means.
+//
+// Provider and model are stored as separate fields (PicoClaw's preferred
+// explicit form); a redundant "<provider>/" prefix on model is stripped so it
+// is never double-prefixed. Empty optional values clear the corresponding field
+// on update.
+func PatchModel(doc *configdoc.Doc, lookup, alias, provider, model, apiKey, apiBase string) error {
+	alias = strings.TrimSpace(alias)
+	if alias == "" {
+		return fmt.Errorf("model alias is required")
+	}
 	entry := configdoc.NewDoc()
 	idx := -1
 	if v, ok := doc.Get("model_list"); ok {
 		arr, _ := v.([]configdoc.Value)
+		want := lookup
+		if want == "" {
+			want = alias
+		}
 		for i, el := range arr {
 			if m, ok := el.(*configdoc.Doc); ok {
-				if a, _ := m.GetString("model_name"); a == alias {
+				if a, _ := m.GetString("model_name"); a == want {
 					entry = m
 					idx = i
 					break
 				}
 			}
 		}
+	}
+	if lookup != "" && alias != lookup && modelExists(doc, alias) {
+		return fmt.Errorf("a model named %q already exists — pick another alias", alias)
 	}
 	entry.Set("model_name", alias)
 	provider = strings.TrimSpace(provider)
@@ -227,12 +247,243 @@ func PatchModel(doc *configdoc.Doc, alias, provider, model, apiKey, apiBase stri
 		}
 		doc.Set("model_list", append(list, entry))
 	}
+	return nil
+}
+
+func modelExists(doc *configdoc.Doc, alias string) bool {
+	for _, m := range Models(doc) {
+		if m.Alias == alias {
+			return true
+		}
+	}
+	return false
+}
+
+// modelRef is one place config.json names a model alias. owner/key/index locate
+// it in the document so a rename writes it back in place, keeping every other
+// key and the document order.
+type modelRef struct {
+	Path   string // human-readable location, e.g. agents.list[coder].model
+	Alias  string
+	InList bool // element of a fallback list: droppable, not load-bearing
+	owner  *configdoc.Doc
+	key    string
+	index  int // -1 for a scalar field
+}
+
+// Set replaces the alias this reference points at.
+func (r *modelRef) Set(alias string) {
+	if r.index < 0 {
+		r.owner.Set(r.key, alias)
+		return
+	}
+	v, ok := r.owner.Get(r.key)
+	list, ok2 := v.([]configdoc.Value)
+	if !ok || !ok2 || r.index >= len(list) {
+		return
+	}
+	list[r.index] = alias
+	r.owner.Set(r.key, list)
+}
+
+// Drop removes this element from its fallback list, deleting the key once the
+// list is empty: upstream omits an empty fallbacks field.
+func (r *modelRef) Drop() {
+	v, ok := r.owner.Get(r.key)
+	list, ok2 := v.([]configdoc.Value)
+	if !ok || !ok2 || r.index >= len(list) {
+		return
+	}
+	out := append(append([]configdoc.Value{}, list[:r.index]...), list[r.index+1:]...)
+	if len(out) == 0 {
+		r.owner.Delete(r.key)
+		return
+	}
+	r.owner.Set(r.key, out)
+}
+
+// modelRefs walks every reference site PicoClaw resolves against model_list
+// (verified v0.3.1 pkg/config/config.go:428-431 and pkg/agent/instance.go:380-392),
+// in document order. An AGENT.md frontmatter `model:` pin also names a model,
+// but that file is user-owned workspace content: callers report those instead
+// of rewriting them.
+func modelRefs(doc *configdoc.Doc) []*modelRef {
+	agents, ok := doc.GetObject("agents")
+	if !ok {
+		return nil
+	}
+	var refs []*modelRef
+	if defaults := lookupAgentsDefaults(doc); defaults != nil {
+		for _, key := range []string{"model_name", "image_model"} {
+			if v, ok := defaults.GetString(key); ok {
+				refs = append(refs, &modelRef{Path: "agents.defaults." + key, Alias: v, owner: defaults, key: key, index: -1})
+			}
+		}
+		refs = append(refs, fallbackRefs(defaults, "model_fallbacks", "agents.defaults.model_fallbacks")...)
+		refs = append(refs, fallbackRefs(defaults, "image_model_fallbacks", "agents.defaults.image_model_fallbacks")...)
+	}
+	listRaw, ok := agents.Get("list")
+	if !ok {
+		return refs
+	}
+	list, ok := listRaw.([]configdoc.Value)
+	if !ok {
+		return refs
+	}
+	for _, item := range list {
+		ag, ok := item.(*configdoc.Doc)
+		if !ok {
+			continue
+		}
+		id, _ := ag.GetString("id")
+		if id == "" {
+			id = "?"
+		}
+		label := "agents.list[" + id + "]"
+		refs = append(refs, modelFieldRefs(ag, label+".model")...)
+		if sub, ok := ag.GetObject("subagents"); ok {
+			refs = append(refs, modelFieldRefs(sub, label+".subagents.model")...)
+		}
+	}
+	return refs
+}
+
+// fallbackRefs names each element of a *_fallbacks array on owner.
+func fallbackRefs(owner *configdoc.Doc, key, path string) []*modelRef {
+	v, ok := owner.Get(key)
+	if !ok {
+		return nil
+	}
+	list, ok := v.([]configdoc.Value)
+	if !ok {
+		return nil
+	}
+	var out []*modelRef
+	for i, el := range list {
+		s, ok := el.(string)
+		if !ok {
+			continue
+		}
+		out = append(out, &modelRef{Path: fmt.Sprintf("%s[%d]", path, i), Alias: s, InList: true, owner: owner, key: key, index: i})
+	}
+	return out
+}
+
+// modelFieldRefs reads one "model" field, which PicoClaw accepts as either a
+// bare alias string or {"primary": ..., "fallbacks": [...]} (verified
+// config.go:283-311).
+func modelFieldRefs(owner *configdoc.Doc, path string) []*modelRef {
+	v, ok := owner.Get("model")
+	if !ok {
+		return nil
+	}
+	switch t := v.(type) {
+	case string:
+		return []*modelRef{{Path: path, Alias: t, owner: owner, key: "model", index: -1}}
+	case *configdoc.Doc:
+		var out []*modelRef
+		if s, ok := t.GetString("primary"); ok {
+			// The primary is named by the field path, exactly as the bare-string
+			// form is, so one rule reads the same wherever a model is named.
+			out = append(out, &modelRef{Path: path, Alias: s, owner: t, key: "primary", index: -1})
+		}
+		out = append(out, fallbackRefs(t, "fallbacks", path+".fallbacks")...)
+		return out
+	}
+	return nil
+}
+
+// ModelRefPaths lists where an alias is referenced, in document order. Empty
+// means nothing in config.json still points at it.
+func ModelRefPaths(doc *configdoc.Doc, alias string) []string {
+	var out []string
+	for _, r := range modelRefs(doc) {
+		if r.Alias == alias {
+			out = append(out, r.Path)
+		}
+	}
+	return out
+}
+
+// RenameModelRefs rewrites every reference from oldAlias to newAlias and returns
+// the paths it touched. It deliberately skips workspace AGENT.md files, which
+// callers report instead of editing.
+func RenameModelRefs(doc *configdoc.Doc, oldAlias, newAlias string) []string {
+	oldAlias, newAlias = strings.TrimSpace(oldAlias), strings.TrimSpace(newAlias)
+	if oldAlias == "" || newAlias == "" || oldAlias == newAlias {
+		return nil
+	}
+	var touched []string
+	for _, r := range modelRefs(doc) {
+		if r.Alias != oldAlias {
+			continue
+		}
+		r.Set(newAlias)
+		touched = append(touched, r.Path)
+	}
+	return touched
+}
+
+// RemoveModel deletes one model_list entry. It refuses while the alias is still
+// a load-bearing reference — a default, an image model, or an agent's own model
+// — because PicoClaw would then resolve an alias that no longer exists, and
+// doctor FAILs on exactly that; the error names the paths to change first.
+// Fallback entries are dropped with the model: a failover list keeps working
+// with one fewer candidate.
+func RemoveModel(doc *configdoc.Doc, alias string) error {
+	alias = strings.TrimSpace(alias)
+	if alias == "" {
+		return fmt.Errorf("model alias is required")
+	}
+	v, ok := doc.Get("model_list")
+	if !ok {
+		return fmt.Errorf("config.json has no model_list")
+	}
+	arr, ok := v.([]configdoc.Value)
+	if !ok {
+		return fmt.Errorf("model_list is not an array")
+	}
+	idx := -1
+	for i, el := range arr {
+		if m, ok := el.(*configdoc.Doc); ok {
+			if a, _ := m.GetString("model_name"); a == alias {
+				idx = i
+				break
+			}
+		}
+	}
+	if idx < 0 {
+		return fmt.Errorf("model %q is not in model_list", alias)
+	}
+	var blocking []string
+	var drops []*modelRef
+	for _, r := range modelRefs(doc) {
+		if r.Alias != alias {
+			continue
+		}
+		if r.InList {
+			drops = append(drops, r)
+			continue
+		}
+		blocking = append(blocking, r.Path)
+	}
+	if len(blocking) > 0 {
+		return fmt.Errorf("%s is still referenced by %s", alias, strings.Join(blocking, ", "))
+	}
+	// Reverse order keeps the remaining element indices valid: one Drop only
+	// shifts the elements after the index it removes.
+	for i := len(drops) - 1; i >= 0; i-- {
+		drops[i].Drop()
+	}
+	out := append(append([]configdoc.Value{}, arr[:idx]...), arr[idx+1:]...)
+	doc.Set("model_list", out)
+	return nil
 }
 
 // ToolsState is the enabled/unknown state of the piccolo tool toggles.
 type ToolsState struct {
-	Web, Exec, Spawn, Subagent, LoadImage *bool
-	ExecAllowRemote                       *bool
+	Web, Exec, Spawn, Subagent, LoadImage, MCP *bool
+	ExecAllowRemote                            *bool
 }
 
 func toolToggle(doc *configdoc.Doc, name string) *bool {
@@ -259,6 +510,7 @@ func GetTools(doc *configdoc.Doc) ToolsState {
 		Spawn:           toolToggle(doc, "spawn"),
 		Subagent:        toolToggle(doc, "subagent"),
 		LoadImage:       toolToggle(doc, "load_image"),
+		MCP:             toolToggle(doc, "mcp"),
 		ExecAllowRemote: execAllowRemote(doc),
 	}
 }
@@ -415,22 +667,18 @@ func SetExecAllowRemote(doc *configdoc.Doc, enabled bool) {
 	exec.Set("allow_remote", enabled)
 }
 
-// DefaultImageModel returns agents.defaults.image_model.
-func DefaultImageModel(doc *configdoc.Doc) string {
+// lookupAgentsDefaults returns agents.defaults without creating anything.
+func lookupAgentsDefaults(doc *configdoc.Doc) *configdoc.Doc {
 	agents, ok := doc.GetObject("agents")
 	if !ok {
-		return ""
+		return nil
 	}
-	defaults, ok := agents.GetObject("defaults")
-	if !ok {
-		return ""
-	}
-	model, _ := defaults.GetString("image_model")
-	return model
+	d, _ := agents.GetObject("defaults")
+	return d
 }
 
-// SetDefaultImageModel writes agents.defaults.image_model, creating parents.
-func SetDefaultImageModel(doc *configdoc.Doc, alias string) {
+// ensureAgentsDefaults returns agents.defaults, creating it and its parent.
+func ensureAgentsDefaults(doc *configdoc.Doc) *configdoc.Doc {
 	agents, ok := doc.GetObject("agents")
 	if !ok {
 		agents = configdoc.NewDoc()
@@ -441,7 +689,74 @@ func SetDefaultImageModel(doc *configdoc.Doc, alias string) {
 		defaults = configdoc.NewDoc()
 		agents.Set("defaults", defaults)
 	}
-	defaults.Set("image_model", alias)
+	return defaults
+}
+
+// DefaultModel returns agents.defaults.model_name: the alias every agent
+// inherits unless its AGENT.md frontmatter or its agents.list entry pins a model
+// of its own (precedence verified v0.3.1 pkg/agent/instance.go:380-392).
+func DefaultModel(doc *configdoc.Doc) string {
+	defaults := lookupAgentsDefaults(doc)
+	if defaults == nil {
+		return ""
+	}
+	model, _ := defaults.GetString("model_name")
+	return model
+}
+
+// SetDefaultModel writes agents.defaults.model_name, creating parents.
+func SetDefaultModel(doc *configdoc.Doc, alias string) {
+	ensureAgentsDefaults(doc).Set("model_name", alias)
+}
+
+// DefaultImageModel returns agents.defaults.image_model.
+func DefaultImageModel(doc *configdoc.Doc) string {
+	defaults := lookupAgentsDefaults(doc)
+	if defaults == nil {
+		return ""
+	}
+	model, _ := defaults.GetString("image_model")
+	return model
+}
+
+// SetDefaultImageModel writes agents.defaults.image_model, creating parents.
+func SetDefaultImageModel(doc *configdoc.Doc, alias string) {
+	ensureAgentsDefaults(doc).Set("image_model", alias)
+}
+
+// WorkspaceRestricted returns agents.defaults.restrict_to_workspace. A nil
+// result means the key is absent, which PicoClaw reads as TRUE
+// (pkg/config/defaults.go:29) — callers must not treat absent as unrestricted.
+//
+// The flag is the whole exec path guard. Verified v0.3.1
+// pkg/agent/instance.go:85-86,113:
+//
+//	restrict     := defaults.RestrictToWorkspace
+//	readRestrict := restrict && !defaults.AllowReadOutsideWorkspace
+//	tools.NewExecToolWithConfig(workspace, restrict, cfg, allowReadPaths)
+//
+// exec receives `restrict`, not `readRestrict`, so allowing reads outside the
+// workspace does NOT stop a shell command that names an absolute path (a tool on
+// PATH, /proc, another agent's workspace) from failing with "Command blocked by
+// safety guard (path outside working dir)" — pkg/tools/shell.go:1172,1278 only
+// exempts /dev pseudo-devices and tools.allow_read_paths.
+func WorkspaceRestricted(doc *configdoc.Doc) *bool {
+	defaults := lookupAgentsDefaults(doc)
+	if defaults == nil {
+		return nil
+	}
+	b, ok := defaults.GetBool("restrict_to_workspace")
+	if !ok {
+		return nil
+	}
+	return &b
+}
+
+// SetWorkspaceRestricted writes agents.defaults.restrict_to_workspace, creating
+// parents. Piccolo generates false: the container is the security boundary, and a
+// guard that trips on ordinary commands produces errors the agent cannot read.
+func SetWorkspaceRestricted(doc *configdoc.Doc, restricted bool) {
+	ensureAgentsDefaults(doc).Set("restrict_to_workspace", restricted)
 }
 
 // ToolNames is the editable toggle set exposed by piccolo setup.
@@ -451,6 +766,7 @@ var ToolNames = []struct{ Key, Label, Help string }{
 	{"spawn", "Spawn sub-runners", "background task spawning"},
 	{"subagent", "Subagent delegation", "main agent delegating to specialists"},
 	{"load_image", "Image understanding", "load_image lets agents visually inspect local image attachments with a vision model — recommended ON"},
+	{"mcp", "MCP tool servers", "the tool an integration's servers.<key> entry needs; OFF makes every installed integration invisible to agents"},
 }
 
 // ReadChannel extracts current values for pre-filling an edit form.

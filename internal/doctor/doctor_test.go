@@ -30,6 +30,9 @@ type fakeEngine struct {
 	// by its running container). Tests that want accumulation inject their own.
 	images     []docker.ImageRecord
 	containers map[string][]string
+	// running is what the container serving traffic reports, image included: a
+	// container can exist while being built from an older image than piccolo.yaml.
+	running docker.State
 }
 
 func (f fakeEngine) Ping(context.Context) error { return f.pingErr }
@@ -44,6 +47,12 @@ func (f fakeEngine) ContainerExists(_ context.Context, name string) (bool, error
 		return f.parkedTarget, nil
 	}
 	return f.container, nil
+}
+
+// StateByName defaults to "no container", which is the state a fresh workspace has
+// and keeps the running-versus-manifest check silent unless a test says otherwise.
+func (f fakeEngine) StateByName(context.Context, string) (docker.State, error) {
+	return f.running, nil
 }
 
 // ListImages/ContainerImages default to exactly what a healthy workspace has:
@@ -142,6 +151,85 @@ func TestDoctorReportsInstalledIntegrations(t *testing.T) {
 	results := Run(context.Background(), Options{Workspace: dir, Engine: fakeEngine{imageExists: true}, LookupEnv: func(string) (string, bool) { return "", false }})
 	if r := find(results, "integration installed: Google Workspace"); r == nil || r.Status != OK {
 		t.Fatalf("integration result not found: %#v", results)
+	}
+}
+
+// Registration is the LAST act of 'piccolo integration setup' — the server entry is
+// written from the action's configPatch through a confirm gate the user can decline
+// ("discarded; integration state was left as-is"). That leaves a workspace where the
+// image has the binary, the manifest lists the integration, and config.json has never
+// heard of it: the user's experience is "I added it and it silently does nothing",
+// and before this check nothing compared the two files.
+func TestDoctorWarnsOnInstalledButUnregisteredIntegration(t *testing.T) {
+	dir := initWorkspace(t)
+	path := filepath.Join(dir, "piccolo.yaml")
+	m, err := manifest.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.Runtime.Integrations = []manifest.Integration{{
+		Name: "gws", DisplayName: "Google Workspace",
+		// Package only: Ref is the retired source-build field and is empty on every
+		// release-based integration, exactly the shape that used to render an empty
+		// remedy — "piccolo integration setup " with nothing to run.
+		Package:      "github:kimus/piccolo-gws",
+		MCPServerKey: "google_workspace",
+		SetupCommand: []string{"piccolo-gws", "setup"},
+	}}
+	if err := m.Write(path); err != nil {
+		t.Fatal(err)
+	}
+
+	results := Run(context.Background(), Options{Workspace: dir, Engine: fakeEngine{imageExists: true}, LookupEnv: func(string) (string, bool) { return "", false }})
+	r := find(results, "never registered")
+	if r == nil || r.Status != WARN {
+		t.Fatalf("expected never-registered WARN, got %v", results)
+	}
+	for _, want := range []string{"google_workspace", "piccolo integration setup github:kimus/piccolo-gws"} {
+		if !strings.Contains(r.Message, want) {
+			t.Fatalf("WARN must name %q so the user knows what to run: %s", want, r.Message)
+		}
+	}
+	// The installed line carries a followable handle too, not empty parentheses.
+	if r := find(results, "integration installed: Google Workspace (github:kimus/piccolo-gws)"); r == nil {
+		t.Fatalf("installed integration should name its package: %v", results)
+	}
+	if Failed(results) {
+		t.Fatalf("an unfinished setup is a WARN, never a FAIL: %v", results)
+	}
+
+	// Registering it clears the finding.
+	patchConfig(t, dir, func(cfg map[string]any) {
+		tools := cfg["tools"].(map[string]any)
+		tools["mcp"] = map[string]any{"enabled": true, "servers": map[string]any{
+			"google_workspace": map[string]any{"type": "stdio", "enabled": true, "command": "piccolo-gws", "args": []any{"mcp"}},
+		}}
+	})
+	results = Run(context.Background(), Options{Workspace: dir, Engine: fakeEngine{imageExists: true}, LookupEnv: func(string) (string, bool) { return "", false }})
+	if r := find(results, "never registered"); r != nil {
+		t.Fatalf("registered integration must not be warned about: %+v", *r)
+	}
+}
+
+// An integration that needs no MCP server must not be reported for lacking one:
+// inventing a requirement is how every warning gets ignored.
+func TestDoctorSilentOnIntegrationWithoutMCPServer(t *testing.T) {
+	dir := initWorkspace(t)
+	path := filepath.Join(dir, "piccolo.yaml")
+	m, err := manifest.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.Runtime.Integrations = []manifest.Integration{{
+		Name: "notes", DisplayName: "Notes helper", Ref: "github:kimus/piccolo-notes",
+		SetupCommand: []string{"piccolo-notes", "setup"},
+	}}
+	if err := m.Write(path); err != nil {
+		t.Fatal(err)
+	}
+	results := Run(context.Background(), Options{Workspace: dir, Engine: fakeEngine{imageExists: true}, LookupEnv: func(string) (string, bool) { return "", false }})
+	if r := find(results, "never registered"); r != nil {
+		t.Fatalf("no MCP server claimed, so nothing is missing: %+v", *r)
 	}
 }
 
@@ -336,9 +424,15 @@ container:
 
 func TestDoctorStaleContainerWarns(t *testing.T) {
 	dir := initWorkspace(t)
+	m, err := manifest.Load(filepath.Join(dir, "piccolo.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
 	results := Run(context.Background(), Options{
 		Workspace: dir,
-		Engine:    fakeEngine{imageExists: true, container: true},
+		Engine: fakeEngine{imageExists: true, container: true, running: docker.State{
+			Found: true, Running: false, Status: "exited", Image: m.Container.Image,
+		}},
 	})
 	if Failed(results) {
 		t.Fatalf("stale container must not fail: %v", results)
@@ -346,6 +440,47 @@ func TestDoctorStaleContainerWarns(t *testing.T) {
 	r := find(results, "stale container")
 	if r == nil || r.Status != WARN {
 		t.Fatalf("expected stale WARN, got %v", results)
+	}
+}
+
+// A running container built from the current image is the service, not a leftover.
+// Warning about it unconditionally gave every healthy workspace a permanent false
+// warning, which is how warnings get ignored.
+func TestDoctorDoesNotCallHealthyRunningContainerStale(t *testing.T) {
+	dir := initWorkspace(t)
+	m, err := manifest.Load(filepath.Join(dir, "piccolo.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	results := Run(context.Background(), Options{
+		Workspace: dir,
+		Engine: fakeEngine{imageExists: true, container: true, running: docker.State{
+			Found: true, Running: true, Status: "running", Image: m.Container.Image,
+		}},
+	})
+	if r := find(results, "stale container"); r != nil {
+		t.Fatalf("the current running gateway is not stale: %+v", *r)
+	}
+	if r := find(results, "running container image"); r == nil || r.Status != OK {
+		t.Fatalf("expected running-image OK, got %v", results)
+	}
+}
+
+// Running-but-stale gets ONE warning, with the verb that fits (restart, not
+// "serve will replace it"), rather than two complaints about one condition.
+func TestDoctorSingleWarningForRunningStaleImage(t *testing.T) {
+	dir := initWorkspace(t)
+	results := Run(context.Background(), Options{
+		Workspace: dir,
+		Engine: fakeEngine{imageExists: true, container: true, running: docker.State{
+			Found: true, Running: true, Status: "running", Image: "piccolo/picoclaw-runtime:OLDGENERATION",
+		}},
+	})
+	if r := find(results, "stale container"); r != nil {
+		t.Fatalf("a running container is not a leftover: %+v", *r)
+	}
+	if r := find(results, "but piccolo.yaml names"); r == nil || r.Status != WARN {
+		t.Fatalf("expected the pending-restart WARN, got %v", results)
 	}
 }
 
@@ -427,19 +562,84 @@ func TestDoctorImageUnderstandingWarnings(t *testing.T) {
 		t.Fatalf("expected load_image disabled WARN, got %v", results)
 	}
 
+	// Aimed at a specialist: the coordinator declares no allowlist any more, so
+	// there is no list of its own to fall out of sync with load_image.
 	dir = initWorkspace(t)
-	agentPath := filepath.Join(dir, "picoclaw", "agents", "main", "AGENT.md")
+	agentPath := filepath.Join(dir, "picoclaw", "agents", "research", "AGENT.md")
 	data, err := os.ReadFile(agentPath)
 	if err != nil {
 		t.Fatal(err)
 	}
 	content := strings.Replace(string(data), ", load_image", "", 1)
+	if content == string(data) {
+		t.Fatal("research AGENT.md does not declare load_image; test no longer exercises the allowlist path")
+	}
 	if err := os.WriteFile(agentPath, []byte(content), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	results = Run(context.Background(), Options{Workspace: dir, Engine: fakeEngine{imageExists: true}})
-	if r := find(results, `agent "main" AGENT.md does not allow load_image`); r == nil || r.Status != WARN {
+	if r := find(results, `agent "research" AGENT.md does not allow load_image`); r == nil || r.Status != WARN {
 		t.Fatalf("expected agent load_image WARN, got %v", results)
+	}
+}
+
+// The workspace can hold the right image while the CONTAINER serving traffic runs an
+// older one: `piccolo integration add` bakes a new image and rewrites container.image,
+// but only a restart swaps the running binaries — while bind-mounted config.json is
+// re-read immediately. Every other image check here consults the image store, so this
+// state was invisible, and it breaks the gateway wholesale: enabling an integration's
+// MCP tool against a container that lacks the fixed binary fails every chat message.
+func TestDoctorWarnsWhenRunningContainerLagsManifestImage(t *testing.T) {
+	dir := initWorkspace(t)
+	m, err := manifest.Load(filepath.Join(dir, "piccolo.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	results := Run(context.Background(), Options{Workspace: dir, Engine: fakeEngine{
+		imageExists: true,
+		container:   true,
+		running:     docker.State{Found: true, Running: true, Status: "running", Image: "piccolo/picoclaw-runtime:OLDGENERATION"},
+	}})
+	r := find(results, "but piccolo.yaml names")
+	if r == nil || r.Status != WARN {
+		t.Fatalf("expected stale-running-image WARN, got %v", results)
+	}
+	for _, want := range []string{"piccolo/picoclaw-runtime:OLDGENERATION", m.Container.Image, "piccolo restart"} {
+		if !strings.Contains(r.Message, want) {
+			t.Fatalf("WARN must name %q so the user can act: %s", want, r.Message)
+		}
+	}
+	if Failed(results) {
+		t.Fatalf("a pending restart is a WARN, never a FAIL: %v", results)
+	}
+}
+
+func TestDoctorReportsMatchingRunningImage(t *testing.T) {
+	dir := initWorkspace(t)
+	m, err := manifest.Load(filepath.Join(dir, "piccolo.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	results := Run(context.Background(), Options{Workspace: dir, Engine: fakeEngine{
+		imageExists: true,
+		container:   true,
+		running:     docker.State{Found: true, Running: true, Status: "running", Image: m.Container.Image},
+	}})
+	if r := find(results, "running container image"); r == nil || r.Status != OK {
+		t.Fatalf("expected matching-image OK, got %v", results)
+	}
+	if r := find(results, "but piccolo.yaml names"); r != nil {
+		t.Fatalf("matching images must not warn: %s", r.Message)
+	}
+}
+
+// No container is not a lagging container: the stale-container and image checks
+// already speak to an absent one, and a second complaint would be noise.
+func TestDoctorSilentOnRunningImageWhenNoContainer(t *testing.T) {
+	dir := initWorkspace(t)
+	results := Run(context.Background(), Options{Workspace: dir, Engine: fakeEngine{imageExists: true}})
+	if r := find(results, "piccolo.yaml names"); r != nil {
+		t.Fatalf("no container should mean no running-image finding: %s", r.Message)
 	}
 }
 
@@ -457,6 +657,151 @@ func TestDoctorWarnsOnRemoteExec(t *testing.T) {
 	}
 }
 
+// PicoClaw's exec path guard takes the raw restrict flag, not the read relaxed by
+// allow_read_outside_workspace (verified v0.3.1 pkg/agent/instance.go:85-86,113),
+// so restrict + exec is the combination that produces "Command blocked by safety
+// guard (path outside working dir)" for ordinary commands. Piccolo generates the
+// flag off, so this WARN exists to tell an older or hand-hardened workspace why
+// its agent keeps failing.
+func TestDoctorWarnsOnExecPathGuard(t *testing.T) {
+	dir := initWorkspace(t)
+	patchConfig(t, dir, func(cfg map[string]any) {
+		defaults := cfg["agents"].(map[string]any)["defaults"].(map[string]any)
+		defaults["restrict_to_workspace"] = true
+		tools := cfg["tools"].(map[string]any)
+		tools["exec"].(map[string]any)["enabled"] = true
+	})
+	results := Run(context.Background(), Options{Workspace: dir, Engine: fakeEngine{imageExists: true}})
+	r := find(results, "restrict_to_workspace is true while tools.exec is enabled")
+	if r == nil || r.Status != WARN {
+		t.Fatalf("expected exec path-guard WARN, got %v", results)
+	}
+	if !strings.Contains(r.Message, "allow_read_outside_workspace does NOT relax") {
+		t.Fatalf("WARN must state that read access does not relax exec, got: %s", r.Message)
+	}
+	if Failed(results) {
+		t.Fatalf("path guard is a user choice, never a FAIL: %v", results)
+	}
+}
+
+func TestDoctorAcceptsGeneratedWorkspaceWithoutPathGuardWarning(t *testing.T) {
+	dir := initWorkspace(t)
+	results := Run(context.Background(), Options{Workspace: dir, Engine: fakeEngine{imageExists: true}})
+	if r := find(results, "restrict_to_workspace"); r != nil {
+		t.Fatalf("fresh workspace must not be warned about the path guard: %+v", *r)
+	}
+}
+
+// An absent key is PicoClaw's default, which is TRUE: silence here would report a
+// workspace as unrestricted while its agents hit the guard on every command.
+func TestDoctorTreatsMissingPathGuardKeyAsRestricted(t *testing.T) {
+	dir := initWorkspace(t)
+	patchConfig(t, dir, func(cfg map[string]any) {
+		defaults := cfg["agents"].(map[string]any)["defaults"].(map[string]any)
+		delete(defaults, "restrict_to_workspace")
+	})
+	results := Run(context.Background(), Options{Workspace: dir, Engine: fakeEngine{imageExists: true}})
+	if r := find(results, "restrict_to_workspace"); r == nil || r.Status != WARN {
+		t.Fatalf("expected WARN for an absent (therefore on) path guard, got %v", results)
+	}
+}
+
+// A gateway in this state answers /health and runs its integration binaries, so
+// the serve readiness gate passes while the agent is handed none of the
+// integration's tools. PicoClaw skips MCP initialization unless tools.mcp.enabled
+// is true (pkg/agent/agent_mcp.go:79) and defaults it to false
+// (pkg/config/defaults.go:428-431).
+func TestDoctorWarnsOnRegisteredButUnreachableMCPServer(t *testing.T) {
+	dir := initWorkspace(t)
+	patchConfig(t, dir, func(cfg map[string]any) {
+		tools := cfg["tools"].(map[string]any)
+		tools["mcp"] = map[string]any{
+			"enabled": false,
+			"servers": map[string]any{
+				"google_workspace": map[string]any{"enabled": true, "command": "piccolo-gws"},
+			},
+		}
+	})
+	results := Run(context.Background(), Options{Workspace: dir, Engine: fakeEngine{imageExists: true}})
+	r := find(results, "tools.mcp.enabled is not true")
+	if r == nil || r.Status != WARN {
+		t.Fatalf("expected unreachable-MCP WARN, got %v", results)
+	}
+	if !strings.Contains(r.Message, "google_workspace") {
+		t.Fatalf("WARN must name the registered server: %s", r.Message)
+	}
+	if Failed(results) {
+		t.Fatalf("unreachable MCP is a WARN, not a FAIL: %v", results)
+	}
+}
+
+// The other gate: a declared `tools:` key becomes a strict exact-name allowlist
+// (pkg/agent/tool_allowlist.go:143-164 → pkg/tools/registry.go:171-184), and MCP
+// tools are named mcp_<server>_<tool> only at runtime, so no such list can hold
+// them. Piccolo generates the coordinator without one.
+func TestDoctorWarnsWhenCoordinatorDeclaresToolAllowlist(t *testing.T) {
+	dir := initWorkspace(t)
+	patchConfig(t, dir, func(cfg map[string]any) {
+		tools := cfg["tools"].(map[string]any)
+		tools["mcp"] = map[string]any{
+			"enabled": true,
+			"servers": map[string]any{
+				"google_workspace": map[string]any{"enabled": true, "command": "piccolo-gws"},
+			},
+		}
+	})
+	path := filepath.Join(dir, "picoclaw", "agents", "main", "AGENT.md")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), "\ntools:") {
+		t.Fatal("generated coordinator must not declare a tools: allowlist")
+	}
+	fm := strings.Replace(string(data), "\nskills:", "\ntools: [message]\nskills:", 1)
+	if err := os.WriteFile(path, []byte(fm), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	results := Run(context.Background(), Options{Workspace: dir, Engine: fakeEngine{imageExists: true}})
+	r := find(results, "declares an AGENT.md tools: allowlist")
+	if r == nil || r.Status != WARN {
+		t.Fatalf("expected coordinator-allowlist WARN, got %v", results)
+	}
+	if !strings.Contains(r.Message, "mcp_<server>_<tool>") {
+		t.Fatalf("WARN must explain why the list cannot name MCP tools: %s", r.Message)
+	}
+}
+
+func TestDoctorReportsMCPReachableForGeneratedCoordinator(t *testing.T) {
+	dir := initWorkspace(t)
+	patchConfig(t, dir, func(cfg map[string]any) {
+		tools := cfg["tools"].(map[string]any)
+		tools["mcp"] = map[string]any{
+			"enabled": true,
+			"servers": map[string]any{
+				"google_workspace": map[string]any{"enabled": true, "command": "piccolo-gws"},
+			},
+		}
+	})
+	results := Run(context.Background(), Options{Workspace: dir, Engine: fakeEngine{imageExists: true}})
+	if r := find(results, "reachable by coordinator"); r == nil || r.Status != OK {
+		t.Fatalf("expected reachable OK, got %v", results)
+	}
+	if r := find(results, "tools.mcp.enabled is not true"); r != nil {
+		t.Fatalf("unexpected WARN while MCP is reachable: %s", r.Message)
+	}
+}
+
+// Nothing installed is not the same as something broken: a workspace without
+// integration servers gets no MCP finding at all.
+func TestDoctorStaysSilentOnMCPWithoutIntegrations(t *testing.T) {
+	dir := initWorkspace(t)
+	results := Run(context.Background(), Options{Workspace: dir, Engine: fakeEngine{imageExists: true}})
+	if r := find(results, "mcp:"); r != nil {
+		t.Fatalf("no integrations installed, so no MCP finding expected: %+v", *r)
+	}
+}
+
 func TestDoctorImageModelReferenceMustExist(t *testing.T) {
 	dir := initWorkspace(t)
 	patchConfig(t, dir, func(cfg map[string]any) {
@@ -467,8 +812,98 @@ func TestDoctorImageModelReferenceMustExist(t *testing.T) {
 	if !Failed(results) {
 		t.Fatal("expected failure for missing image_model reference")
 	}
-	if find(results, `model_name "vision-missing" is referenced but missing`) == nil {
+	if find(results, `agents.defaults.image_model references model "vision-missing" missing from model_list`) == nil {
 		t.Fatalf("expected missing image model FAIL, got %v", results)
+	}
+}
+
+// TestDoctorNamesEveryModelReferenceSite pins the two things the old check
+// could not say: which field held the dangling alias, and that the agent-level
+// field is "model" — the key Piccolo used to write, "model_name", is ignored by
+// PicoClaw, so a workspace carrying it must see a warning naming the fix.
+func TestDoctorNamesEveryModelReferenceSite(t *testing.T) {
+	dir := initWorkspace(t)
+	patchConfig(t, dir, func(cfg map[string]any) {
+		agents := cfg["agents"].(map[string]any)
+		agents["defaults"].(map[string]any)["model_fallbacks"] = []any{"ghost-fallback"}
+		list := agents["list"].([]any)
+		list[1].(map[string]any)["model"] = "ghost-agent"
+	})
+	results := Run(context.Background(), Options{Workspace: dir, Engine: fakeEngine{imageExists: true}})
+	if !Failed(results) {
+		t.Fatal("expected failures for dangling model references")
+	}
+	for _, want := range []string{
+		`agents.defaults.model_fallbacks[0] references model "ghost-fallback" missing from model_list`,
+		`agents.list[research].model references model "ghost-agent" missing from model_list`,
+	} {
+		if r := find(results, want); r == nil || r.Status != FAIL {
+			t.Errorf("missing FAIL %q in %v", want, results)
+		}
+	}
+}
+
+func TestDoctorModelObjectForm(t *testing.T) {
+	dir := initWorkspace(t)
+	patchConfig(t, dir, func(cfg map[string]any) {
+		list := cfg["agents"].(map[string]any)["list"].([]any)
+		list[1].(map[string]any)["model"] = map[string]any{
+			"primary":   "ghost-primary",
+			"fallbacks": []any{"gpt-5.4", "ghost-second"},
+		}
+	})
+	results := Run(context.Background(), Options{Workspace: dir, Engine: fakeEngine{imageExists: true}})
+	if find(results, `agents.list[research].model references model "ghost-primary"`) == nil {
+		t.Fatalf("object-form primary not checked: %v", results)
+	}
+	if find(results, `agents.list[research].model.fallbacks[1] references model "ghost-second"`) == nil {
+		t.Fatalf("object-form fallbacks not checked: %v", results)
+	}
+	// The valid fallback must NOT be reported.
+	if find(results, `"gpt-5.4"`) != nil {
+		t.Errorf("valid alias reported: %v", results)
+	}
+}
+
+func TestDoctorWarnsOnIgnoredAgentModelName(t *testing.T) {
+	dir := initWorkspace(t)
+	patchConfig(t, dir, func(cfg map[string]any) {
+		list := cfg["agents"].(map[string]any)["list"].([]any)
+		// A workspace written by an older Piccolo: the alias sits in the key
+		// PicoClaw never reads, so the agent silently uses the default model.
+		list[1].(map[string]any)["model_name"] = "gpt-5.4"
+	})
+	results := Run(context.Background(), Options{Workspace: dir, Engine: fakeEngine{imageExists: true}})
+	if Failed(results) {
+		t.Fatalf("a valid alias must not fail on the legacy key: %v", results)
+	}
+	r := find(results, `agent "research" sets model_name "gpt-5.4", which PicoClaw ignores`)
+	if r == nil || r.Status != WARN {
+		t.Fatalf("expected legacy-key WARN, got %v", results)
+	}
+}
+
+// TestDoctorChecksAgentMDModelPin: an AGENT.md frontmatter model outranks
+// config.json (verified v0.3.1 pkg/agent/instance.go:380-392), so a stale pin
+// there breaks the agent while config.json looks clean.
+func TestDoctorChecksAgentMDModelPin(t *testing.T) {
+	dir := initWorkspace(t)
+	path := filepath.Join(dir, "picoclaw", "agents", "research", "AGENT.md")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	content := strings.Replace(string(data), "tools:", "model: ghost-pin\ntools:", 1)
+	if !strings.Contains(content, "model: ghost-pin") {
+		t.Fatal("fixture AGENT.md has no tools: line to anchor the edit")
+	}
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	results := Run(context.Background(), Options{Workspace: dir, Engine: fakeEngine{imageExists: true}})
+	r := find(results, `agent "research": AGENT.md pins model "ghost-pin" missing from model_list`)
+	if r == nil || r.Status != FAIL {
+		t.Fatalf("expected pinned-model FAIL, got %v", results)
 	}
 }
 

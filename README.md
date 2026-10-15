@@ -331,8 +331,19 @@ piccolo runs: call X  → answers on STDIN · NDJSON events on STDOUT · logs on
 - **Credentials are values, not files.** Google Cloud Console shows a client ID and a client secret; Piccolo asks for those two fields (the secret masked) and the integration writes what its backend needs, mode `0600`, inside its own state directory. No download, no file browser, no copying into the workspace. Secrets travel on stdin only — argv is visible in `docker top`, env in `docker inspect`. (A `path` input still exists in the vocabulary for service-account-style integrations that genuinely need a key file.)
 - **Never register a redirect URI in Google Cloud Console.** Piccolo prints the callback port it is listening on (e.g. `http://localhost:43111`), and the integration re-picks it on **every** attempt, so a registered port works once and then breaks. The OAuth client must be of type **Desktop app**, which needs no registered redirect URI because Google's installed-app flow accepts a loopback redirect on any port. If you feel obliged to fill in a redirect URI, the client you created is a **Web application** — the wrong type. Nothing can pin the port either: the delegated backend binds an ephemeral one and exposes no option for it.
 - **Browser callbacks.** When an action emits `wait_redirect`, Piccolo binds the loopback port taken from that URL's own `redirect_uri`, captures exactly one request, and relays the raw query into the still-running container. Integrations publish no ports, and Piccolo never interprets or logs the credential material.
-- **Config writes are Piccolo's.** An integration *proposes* a `configPatch`; Piccolo validates it against a fixed allowlist (only that integration's `tools.mcp.servers.<key>` entry), shows a diff, asks for confirmation, then writes `config.json.bak` and the file atomically. A patch reaching any other path is refused.
+- **Config writes are Piccolo's.** An integration *proposes* a `configPatch`; Piccolo validates it against a fixed allowlist (only that integration's `tools.mcp.servers.<key>` entry), shows a diff, asks for confirmation, then writes `config.json.bak` and the file atomically. A patch reaching any other path is refused. That confinement is deliberate — an integration must not be able to flip tool toggles — so Piccolo owns the one toggle registration depends on, `tools.mcp.enabled`, and writes it only after it has verified the server itself.
 - **Headless** (no TTY, CI): Piccolo refuses rather than hanging, so setup stays deterministic.
+
+A registered integration is not automatically a usable one, and nothing used to say the difference out loud. Two gates stand between a server entry and a tool the model can call: `tools.mcp.enabled` (PicoClaw returns from MCP initialization before it reads the servers map while it is false, and it defaults to false), and a `tools:` line in an agent's `AGENT.md` — which PicoClaw treats as a strict, exact-name allowlist, while MCP tools are named `mcp_<server>_<tool>` only at runtime, so no written-out list can contain them. Piccolo generates the coordinator with **no `tools:` allowlist** so every tool `config.json` enables reaches it (specialists keep their reduced lists), and it verifies the handshake before the toggle is ever turned on: each registered server's recorded stdio command is started in a one-shot container, given one `initialize` request, and judged on the first line it writes back. Only a JSON-RPC result enables the tool — **on both paths**, `piccolo integration setup` applying a server entry and `piccolo setup` → Tools flipping the toggle by hand, because a manual enable is the one that can leave you with a verified-good image and a stale container. `piccolo doctor` reports the result as a status line — `[OK] mcp: 1 server(s) reachable by coordinator "main" (…)` — or names whichever gate is closed, and warns when an integration in `piccolo.yaml` was installed but never registered at all.
+
+The toggle is withheld rather than forced, because an enabled MCP tool with an unreachable server is worse than a disabled one: PicoClaw fails the **whole turn** when a registered server cannot initialize, so every chat message errors, not just the ones asking about that integration. One real example: `piccolo-gws` 0.3.4 accepted both framings on stdin but answered with LSP-style `Content-Length:` headers, which the MCP transport PicoClaw uses cannot read (`invalid character 'C' looking for beginning of value`); 0.3.5 answers one JSON line per message. That bug came back a second way worth knowing about: after upgrading, the **new image** handshook perfectly while the **still-running container** held the 0.3.4 binary, and chat failed anyway — because `integration add` bakes an image and rewrites `container.image`, but only a restart swaps the running binaries, while `config.json` is re-read immediately. So the enable check probes every image that could serve the toggle (the manifest's and the running container's), and both `piccolo doctor` and `piccolo status` now report the running container's image against `piccolo.yaml`:
+
+```text
+[OK]   running container image: piccolo/picoclaw-runtime:cd4c6f2a1baa
+[WARN] container "piccolo-gateway" serves image piccolo/picoclaw-runtime:5f6018fa00b8, but piccolo.yaml names …:cd4c6f2a1baa — the running gateway holds the OLD integration binaries while config.json is re-read immediately; run 'piccolo restart' before enabling anything the new image provides
+```
+
+If the verification fails on the manual path, Piccolo prints every failing server with its reason, says plainly that enabling anyway means all chat traffic fails, and asks — defaulting to keeping MCP off. On the registration path the server entry is still written, because it is the integration's own configuration output and worth keeping; only the enablement is withheld. If there is no daemon to ask, Piccolo reports the check as unverifiable rather than passing it silently.
 
 An integration that declares no actions keeps the previous TTY-attach behavior unchanged —
 the descriptor stays `piccolo.integration.v1`, so old integrations and old Piccolo builds both work.
@@ -341,11 +352,39 @@ the descriptor stays `piccolo.integration.v1`, so old integrations and old Picco
 
 The editing counterpart of `init` for an existing workspace. `piccolo setup` opens an arrow-navigable home menu (↑/↓ move, enter open, q quit); deep-links work too: `piccolo setup channels`, `piccolo setup channels discord`, `piccolo setup models`, `piccolo setup tools`.
 
-- **v1-editable**: channels (Discord/Telegram/Slack — list, add, toggle, edit with pre-filled values), `model_list` entries, web/exec/spawn/subagent/load_image toggles, and an advanced remote-exec toggle. Agents/container/identity sections are listed but require manual edits for now.
+- **v1-editable**: channels (Discord/Telegram/Slack — list, add, toggle, edit with pre-filled values), models (add, edit, rename, delete, and the default/image selection), web/exec/spawn/subagent/load_image/mcp toggles, an advanced remote-exec toggle, and the workspace path guard (`agents.defaults.restrict_to_workspace`, off by default). Agents/container/identity sections are listed but require manual edits for now.
 - Discord setup asks whether you already have an application, helps you create one when needed, requires the Application ID + bot token, validates the token with Discord when possible, and prints direct install/test links afterwards.
 - **Merge-patched writes**: unknown keys and untouched subtrees of your user-owned `config.json` are preserved; every change shows a diff preview, requires confirmation, and backs the previous file up to `config.json.bak`.
 - Bot tokens are stored plaintext in `config.json` (PicoClaw has no env expansion — verified). Non-secret setup metadata such as Discord Application ID is stored in `piccolo.yaml` so setup can regenerate links later.
 - If the gateway container is running afterwards, setup reminds you to `piccolo reload` (config.json) or `piccolo restart` (piccolo.yaml).
+
+#### Models
+
+`piccolo setup models` is where a workspace's models live:
+
+- **Set default text model** writes `agents.defaults.model_name` — the alias agents inherit unless their own `model` or `AGENT.md` frontmatter pins one. **Set image/vision model** writes `agents.defaults.image_model`, used for image attachments.
+- **Editing an entry's alias renames it in place** and re-points every reference: `model_name`, `image_model`, both fallback lists, and each agent's `model`. The confirmation lists what it re-pointed. An alias already in use is refused, and an `AGENT.md` that pins the old name is reported rather than edited — those files are yours.
+- **Delete a model** removes the entry, and refuses while something still needs it, naming the field to move first. Entries that appear only in a fallback list are dropped along with it.
+- The list marks which entry is the default and which is the image model, so a rename or delete shows what it will touch before you commit.
+
+Failover is worth configuring by hand in `config.json`, because a free model endpoint can empty out with no warning and every turn then fails with `No endpoints found`:
+
+```jsonc
+"agents": { "defaults": {
+  "model_name": "primary",
+  "model_fallbacks": ["spare"],          // tried when the primary has no endpoint
+  "image_model": "vision",
+  "image_model_fallbacks": ["vision2"]
+} }
+```
+
+An agent picks its own model with **`model`** on its `agents.list` entry — a bare alias, or `{ "primary": …, "fallbacks": … }`:
+
+```jsonc
+{ "id": "coder", "model": { "primary": "coder-model", "fallbacks": ["primary"] } }
+```
+
+`model_name` on a list entry is **not** that field: PicoClaw ignores it and the agent quietly keeps the default. `piccolo doctor` warns when it finds one.
 
 #### After adding Discord
 
@@ -441,7 +480,9 @@ There is deliberately no `runtime prune` or `runtime reset-cache`: garbage-colle
 
 For QR codes the package is `zbar`; other common mappings include image normalization with ImageMagick (`magick`, `convert`, `identify`), OCR with `tesseract`, PDF inspection/rendering with Poppler (`pdfinfo`, `pdftotext`, `pdftoppm`, `pdftocairo`), office conversion with LibreOffice (`soffice`/`libreoffice`), structured data parsing with Python/`jq`/`yq`/`xmllint`, archive listing before extraction, EXIF inspection with `exiftool`, and media inspection with `ffprobe`/`ffmpeg`. The skill tells agents to call these directly, avoid OpenCV/`cv2` unless explicitly needed, write intermediates under the workspace, and never install anything at runtime — a tool that is missing was left out of the image, and the fix is `piccolo image build` with the package added (`apt-get` is also the wrong package manager: the base image is Alpine).
 
-Piccolo also configures container-scoped media/debug settings: `agents.defaults.allow_read_outside_workspace` is enabled (this is a container, not a personal computer), and `agents.defaults.tool_feedback` is enabled with `max_args_length: 300` so tool execution is visible directly in chat. PicoClaw natively allows exec/read access to its upload dir `/tmp/picoclaw_media`, and Piccolo mirrors that media volume into each agent workspace as `media/` for convenience.
+Piccolo also configures container-scoped media/debug settings: `agents.defaults.restrict_to_workspace` is **disabled** and `agents.defaults.allow_read_outside_workspace` is enabled (this is a container, not a personal computer), and `agents.defaults.tool_feedback` is enabled with `max_args_length: 300` so tool execution is visible directly in chat. PicoClaw natively allows exec/read access to its upload dir `/tmp/picoclaw_media`, and Piccolo mirrors that media volume into each agent workspace as `media/` for convenience.
+
+The path guard is off because leaving it on makes `exec` unusable rather than safe. PicoClaw's shell guard takes the raw `restrict_to_workspace` flag, not the read access relaxed by `allow_read_outside_workspace` (`pkg/agent/instance.go:85-113`), and it inspects every absolute path in the command line (`pkg/tools/shell.go:1172,1278`) — so with exec on and the guard on, a command as ordinary as reading `/proc` or naming a binary's real path fails with `Command blocked by safety guard (path outside working dir)`, and the agent sees an error string with no remedy in it. Piccolo writes the flag explicitly `false` because PicoClaw defaults it to `true` when the key is absent (`pkg/config/defaults.go:29`); omitting it would silently put the guard back. The container is the security boundary. Turn it on deliberately from `piccolo setup` → **Tools** → **Workspace path guard** if you want per-agent confinement, and accept that shell commands touching other paths will be refused; `piccolo doctor` warns while the guard is on so the reason for those refusals is never a mystery.
 
 For QR decoding from Discord or another remote chat, the workspace must allow both image loading and shell execution from remote channels:
 
@@ -469,7 +510,10 @@ Validates the setup and prints `[OK]` / `[WARN]` / `[FAIL]` lines:
 [OK]   generated files: 7 as generated by piccolo 0.3.0
 [WARN] generated file predates the current template: picoclaw/skills/file-handling/SKILL.md — refresh with 'piccolo setup' (fix belongs in internal/generate/templates.go:FileHandlingSkillMD, not in the copy)
 [OK]   agent: main (default)
+[OK]   model: gpt-5.4 (gpt-5.4)
+[OK]   default model: gpt-5.4
 [WARN] model "gpt-5.4" has placeholder API key
+[FAIL] agents.defaults.model_fallbacks[0] references model "old-free-model" missing from model_list
 [FAIL] missing agent file: picoclaw/agents/research/AGENT.md
 ```
 

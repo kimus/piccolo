@@ -3,6 +3,11 @@
 // github.com/sipeed/picoclaw@v0.3.1 pkg/config.
 package picoclaw
 
+import (
+	"encoding/json"
+	"strings"
+)
+
 // SchemaVersion is the PicoClaw config schema version Piccolo targets.
 const SchemaVersion = 3
 
@@ -45,11 +50,17 @@ type Agents struct {
 
 // Defaults are shared agent defaults.
 type Defaults struct {
-	Workspace                 string       `json:"workspace"`
+	Workspace string `json:"workspace"`
+	// RestrictToWorkspace and AllowReadOutsideWorkspace carry NO omitempty on
+	// purpose. PicoClaw defaults restrict_to_workspace to true when the key is
+	// absent (pkg/config/defaults.go:29), so "unset" does not mean "off": Piccolo
+	// must always write the posture it intends out explicitly.
 	RestrictToWorkspace       bool         `json:"restrict_to_workspace"`
 	AllowReadOutsideWorkspace bool         `json:"allow_read_outside_workspace"`
 	ModelName                 string       `json:"model_name"`
+	ModelFallbacks            []string     `json:"model_fallbacks,omitempty"`
 	ImageModel                string       `json:"image_model,omitempty"`
+	ImageModelFallbacks       []string     `json:"image_model_fallbacks,omitempty"`
 	ToolFeedback              ToolFeedback `json:"tool_feedback,omitempty"`
 }
 
@@ -61,17 +72,71 @@ type ToolFeedback struct {
 
 // Agent is one entry in agents.list.
 type Agent struct {
-	ID        string     `json:"id"`
-	Default   bool       `json:"default,omitempty"`
-	Name      string     `json:"name,omitempty"`
-	Workspace string     `json:"workspace,omitempty"`
-	ModelName string     `json:"model_name,omitempty"`
-	Subagents *Subagents `json:"subagents,omitempty"`
+	ID        string      `json:"id"`
+	Default   bool        `json:"default,omitempty"`
+	Name      string      `json:"name,omitempty"`
+	Workspace string      `json:"workspace,omitempty"`
+	Model     *AgentModel `json:"model,omitempty"`
+	Subagents *Subagents  `json:"subagents,omitempty"`
 }
 
-// Subagents controls which agents this agent may delegate to.
+// ModelRef returns the alias this entry pins for its own model, or "" when it
+// inherits agents.defaults.model_name.
+func (a Agent) ModelRef() string {
+	if a.Model == nil {
+		return ""
+	}
+	return strings.TrimSpace(a.Model.Primary)
+}
+
+// Subagents controls which agents this agent may delegate to, and the model a
+// delegated turn runs on.
 type Subagents struct {
-	AllowAgents []string `json:"allow_agents,omitempty"`
+	AllowAgents []string    `json:"allow_agents,omitempty"`
+	Model       *AgentModel `json:"model,omitempty"`
+}
+
+// AgentModel mirrors PicoClaw's AgentModelConfig (verified v0.3.1
+// pkg/config/config.go:278-311). The field name on an agents.list entry is
+// "model", NOT "model_name" — upstream ignores the latter and the agent
+// silently keeps the default. PicoClaw accepts either a bare alias string or
+// {"primary": ..., "fallbacks": [...]}; MarshalJSON emits the bare string
+// whenever there are no fallbacks, mirroring upstream's own marshaller so a
+// round trip stays in the shape upstream documents.
+type AgentModel struct {
+	Primary   string   `json:"primary,omitempty"`
+	Fallbacks []string `json:"fallbacks,omitempty"`
+}
+
+// UnmarshalJSON accepts both the bare-string and object forms.
+func (m *AgentModel) UnmarshalJSON(data []byte) error {
+	var s string
+	if err := json.Unmarshal(data, &s); err == nil {
+		m.Primary = s
+		m.Fallbacks = nil
+		return nil
+	}
+	var raw struct {
+		Primary   string   `json:"primary"`
+		Fallbacks []string `json:"fallbacks"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	*m = AgentModel(raw)
+	return nil
+}
+
+// MarshalJSON writes the bare alias when it is the only fact to carry.
+func (m AgentModel) MarshalJSON() ([]byte, error) {
+	if len(m.Fallbacks) == 0 && m.Primary != "" {
+		return json.Marshal(m.Primary)
+	}
+	type raw struct {
+		Primary   string   `json:"primary,omitempty"`
+		Fallbacks []string `json:"fallbacks,omitempty"`
+	}
+	return json.Marshal(raw(m))
 }
 
 // Model is one model_list entry. Agents reference it by ModelName.

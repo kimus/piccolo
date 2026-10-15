@@ -201,6 +201,106 @@ func TestApplyIntegrationPatchNoServerEntryIsNoOp(t *testing.T) {
 	}
 }
 
+// Registering a server and enabling the MCP tool are separate writes on purpose.
+// PicoClaw skips all MCP initialization while tools.mcp.enabled is false
+// (pkg/agent/agent_mcp.go:79) and defaults it to false
+// (pkg/config/defaults.go:428-431), so registration alone is inert — but with the
+// toggle on and a server that cannot handshake, PicoClaw fails every chat message.
+// So the toggle is only written after a verified handshake, never as a side effect of
+// registration.
+func TestApplyIntegrationPatchRegistersWithoutEnabling(t *testing.T) {
+	doc, err := configdoc.Parse([]byte(`{"tools":{"mcp":{"servers":{"other":{"command":"keep"}}}}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	patch := json.RawMessage(`{"tools":{"mcp":{"servers":{"google_workspace":{"enabled":true,"command":"piccolo-gws","args":["mcp"]}}}}}`)
+	if _, err := ApplyIntegrationPatch(doc, patch, "google_workspace"); err != nil {
+		t.Fatal(err)
+	}
+	if got := MCPToolEnabled(doc); got != nil {
+		t.Fatalf("registration must not write the toggle; enabled = %v", *got)
+	}
+	if !strings.Contains(string(doc.Marshal()), "keep") {
+		t.Fatal("pre-existing server lost")
+	}
+}
+
+func TestEnableMCPTool(t *testing.T) {
+	doc, err := configdoc.Parse([]byte(`{"tools":{"mcp":{"enabled":false,"servers":{"google_workspace":{"command":"piccolo-gws"}}}}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !EnableMCPTool(doc) {
+		t.Fatal("first enable must report a change")
+	}
+	if got := MCPToolEnabled(doc); got == nil || !*got {
+		t.Fatalf("enabled = %v, want true", got)
+	}
+	if EnableMCPTool(doc) {
+		t.Fatal("second enable must be a no-op")
+	}
+	// Absent means false to PicoClaw, so MCPToolEnabled must report "absent" rather
+	// than guess "on".
+	bare, err := configdoc.Parse([]byte(`{"tools":{"mcp":{"servers":{"a":{"command":"x"}}}}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := MCPToolEnabled(bare); got != nil {
+		t.Fatalf("absent key = %v, want nil", *got)
+	}
+	if !EnableMCPTool(bare) {
+		t.Fatal("absent key must be written explicitly")
+	}
+	if out := string(bare.Marshal()); !strings.Contains(out, `"enabled": true`) {
+		t.Fatalf("enable not written:\n%s", out)
+	}
+}
+
+// MCPServerArgv feeds the handshake probe. Reading it wrong either skips a probe that
+// should have run — leaving the tool off forever — or spawns the wrong command.
+func TestMCPServerArgv(t *testing.T) {
+	doc, err := configdoc.Parse([]byte(`{"tools":{"mcp":{"servers":{
+		"google_workspace":{"enabled":true,"command":"piccolo-gws","args":["mcp","--config-dir","/root/.piccolo/integrations/kimus/piccolo-gws","--read-only"]},
+		"off":{"enabled":false,"command":"x"},
+		"remote":{"type":"sse","url":"http://example"},
+		"blank":{"command":"   "}
+	}}}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"piccolo-gws", "mcp", "--config-dir", "/root/.piccolo/integrations/kimus/piccolo-gws", "--read-only"}
+	got := MCPServerArgv(doc, "google_workspace")
+	if len(got) != len(want) {
+		t.Fatalf("argv = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("argv[%d] = %q, want %q", i, got[i], want[i])
+		}
+	}
+	// Nothing spawnable must be nil, and callers must read nil as "unverifiable".
+	for _, key := range []string{"off", "remote", "blank", "missing"} {
+		if got := MCPServerArgv(doc, key); got != nil {
+			t.Fatalf("MCPServerArgv(%q) = %v, want nil", key, got)
+		}
+	}
+}
+
+func TestApplyIntegrationPatchLeavesMCPAloneWithoutServerEntry(t *testing.T) {
+	// The no-op path must stay a no-op: touching tools.mcp.enabled when nothing was
+	// registered would flip a toggle for no reason.
+	doc, err := configdoc.Parse([]byte(`{"version":3}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ApplyIntegrationPatch(doc, json.RawMessage(`{"tools":{"mcp":{}}}`), "google_workspace"); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(doc.Marshal()), `"mcp"`) {
+		t.Fatalf("empty patch must not create tools.mcp:\n%s", doc.Marshal())
+	}
+}
+
 func TestAllowedIntegrationPatchPathShape(t *testing.T) {
 	if got := AllowedIntegrationPatchPath("google_workspace"); got != "tools.mcp.servers.google_workspace" {
 		t.Fatalf("path = %q", got)

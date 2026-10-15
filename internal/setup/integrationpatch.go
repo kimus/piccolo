@@ -101,19 +101,119 @@ func ApplyIntegrationPatch(doc *configdoc.Doc, raw json.RawMessage, serverKey st
 		return "", fmt.Errorf("parse mcp server entry: %w", err)
 	}
 
-	cur := doc
-	for _, key := range []string{"tools", "mcp", "servers"} {
-		next, ok := cur.GetObject(key)
-		if !ok {
-			next = configdoc.NewDoc()
-			cur.Set(key, next)
-		}
-		cur = next
-	}
+	tools := ensureChildDoc(doc, "tools")
+	mcp := ensureChildDoc(tools, "mcp")
+	servers := ensureChildDoc(mcp, "servers")
 	// Set preserves position on update, so re-registering a server does not
 	// reorder the user's other servers.
-	cur.Set(serverKey, sub)
+	servers.Set(serverKey, sub)
 	return serverKey, nil
+}
+
+// MCPServerArgv returns the command and arguments PicoClaw would run for one
+// registered server, read from tools.mcp.servers.<key>. Piccolo executes that argv to
+// test the handshake before enabling the MCP tool.
+//
+// Empty means there is nothing to probe and the caller must NOT treat that as a
+// pass: the entry is missing, individually disabled, declares no command (an
+// sse/streamable-http server, whose transport Piccolo cannot spawn), or is shaped
+// in a way Piccolo does not model. Unverifiable stays unverifiable.
+func MCPServerArgv(doc *configdoc.Doc, serverKey string) []string {
+	tools, ok := doc.GetObject("tools")
+	if !ok {
+		return nil
+	}
+	mcp, ok := tools.GetObject("mcp")
+	if !ok {
+		return nil
+	}
+	servers, ok := mcp.GetObject("servers")
+	if !ok {
+		return nil
+	}
+	entry, ok := servers.GetObject(serverKey)
+	if !ok {
+		return nil
+	}
+	if on, ok := entry.GetBool("enabled"); ok && !on {
+		return nil
+	}
+	command, _ := entry.GetString("command")
+	command = strings.TrimSpace(command)
+	if command == "" {
+		return nil
+	}
+	argv := []string{command}
+	if v, ok := entry.Get("args"); ok {
+		if list, ok := v.([]configdoc.Value); ok {
+			for _, el := range list {
+				if s, ok := el.(string); ok {
+					argv = append(argv, s)
+				}
+			}
+		}
+	}
+	return argv
+}
+
+// MCPToolEnabled reads tools.mcp.enabled. A nil result means the key is absent,
+// which PicoClaw treats as FALSE (pkg/config/defaults.go:428-431) — callers must
+// not read nil as "already on".
+func MCPToolEnabled(doc *configdoc.Doc) *bool {
+	tools, ok := doc.GetObject("tools")
+	if !ok {
+		return nil
+	}
+	mcp, ok := tools.GetObject("mcp")
+	if !ok {
+		return nil
+	}
+	b, ok := mcp.GetBool("enabled")
+	if !ok {
+		return nil
+	}
+	return &b
+}
+
+// EnableMCPTool writes tools.mcp.enabled: true and reports whether it changed
+// anything. It never turns the tool off — that stays the user's decision in
+// 'piccolo setup' \u2192 Tools.
+//
+// Enabling is deliberately a separate step from registering the server, so a caller
+// can gate it on a handshake. Two verified facts make that pairing necessary rather
+// than cosmetic:
+//
+//   - While the toggle is false, PicoClaw skips MCP initialization entirely
+//     (pkg/agent/agent_mcp.go:79 reads IsToolEnabled("mcp") and returns before it
+//     looks at servers), and it defaults to false — so a registered server is inert,
+//     and the integration cannot fix that itself, because the allowlist above
+//     confines it to its own server entry precisely so it cannot flip tool toggles.
+//   - With the toggle true and a server that cannot complete the handshake, PicoClaw
+//     fails the WHOLE turn: every chat message errors, not just the ones asking about
+//     that integration. Observed live with a server that answers in LSP-style
+//     Content-Length framing, which the MCP Go SDK (newline-delimited JSON) rejects.
+//
+// So registration and enablement are different promises, and only the verified one
+// gets written.
+func EnableMCPTool(doc *configdoc.Doc) bool {
+	tools := ensureChildDoc(doc, "tools")
+	mcp := ensureChildDoc(tools, "mcp")
+	if on, ok := mcp.GetBool("enabled"); ok && on {
+		return false
+	}
+	mcp.Set("enabled", true)
+	return true
+}
+
+// ensureChildDoc returns the named child object, creating and attaching it when
+// absent, without disturbing the parent's other keys.
+func ensureChildDoc(doc *configdoc.Doc, key string) *configdoc.Doc {
+	child, ok := doc.GetObject(key)
+	if !ok {
+		child = configdoc.NewDoc()
+		doc.Set(key, child)
+	}
+	return child
 }
 
 // pathWithin reports whether candidate is at or below the allowed prefix.

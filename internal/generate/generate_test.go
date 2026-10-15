@@ -117,6 +117,9 @@ func TestGeneratedPicoclawConfig(t *testing.T) {
 	if !cfg.Tools.Spawn.Enabled || !cfg.Tools.Subagent.Enabled || !cfg.Tools.LoadImage.Enabled {
 		t.Errorf("spawn/subagent/load_image must be enabled: %+v", cfg.Tools)
 	}
+	if cfg.Agents.Defaults.RestrictToWorkspace {
+		t.Error("restrict_to_workspace must be generated OFF: with exec enabled PicoClaw blocks any command naming a path outside the agent workspace")
+	}
 	if !cfg.Agents.Defaults.AllowReadOutsideWorkspace {
 		t.Error("allow_read_outside_workspace must be enabled for media handling")
 	}
@@ -131,6 +134,12 @@ func TestGeneratedPicoclawConfig(t *testing.T) {
 	}
 	if strings.Contains(string(data), "allow_remote") || strings.Contains(string(data), "allow_read_paths") || strings.Contains(string(data), "custom_allow_patterns") {
 		t.Fatalf("generated defaults should not emit allow_remote unless explicitly set: %s", data)
+	}
+	// PicoClaw defaults this flag to TRUE when the key is absent
+	// (pkg/config/defaults.go:29), so the OFF posture only exists if the literal
+	// false is written out.
+	if !strings.Contains(string(data), `"restrict_to_workspace": false`) {
+		t.Fatalf("generated config.json must state \"restrict_to_workspace\": false explicitly: %s", data)
 	}
 	var back picoclaw.Config
 	if err := json.Unmarshal(data, &back); err != nil {
@@ -236,20 +245,53 @@ func TestAgentMDFrontmatter(t *testing.T) {
 	if err != nil {
 		t.Fatalf("BuildPlan: %v", err)
 	}
-	var mainMD string
+	var mainMD, researchMD string
 	for _, f := range p.Files {
-		if f.Rel == "picoclaw/agents/main/AGENT.md" {
+		switch f.Rel {
+		case "picoclaw/agents/main/AGENT.md":
 			mainMD = string(f.Content)
+		case "picoclaw/agents/research/AGENT.md":
+			researchMD = string(f.Content)
 		}
 	}
 	if !strings.HasPrefix(mainMD, "---\n") {
 		t.Fatal("AGENT.md must start with frontmatter")
 	}
-	for _, want := range []string{"name: Piccolo", "web_search", "load_image", "spawn", "subagent", "skills: [file-handling]"} {
+	for _, want := range []string{"name: Piccolo", "skills: [file-handling]"} {
 		if !strings.Contains(mainMD, want) {
 			t.Errorf("main AGENT.md missing %q", want)
 		}
 	}
+	// The coordinator declares NO tool allowlist. PicoClaw reads a declared
+	// `tools:` key as a strict exact-name list, and MCP tools are named
+	// mcp_<server>_<tool> only at runtime, so any list Piccolo writes here silently
+	// revokes every tool an installed integration provides.
+	if hasFrontmatterKey(mainMD, "tools") {
+		t.Errorf("main AGENT.md must not declare a tools: allowlist:\n%s", mainMD)
+	}
+	// Specialists keep theirs — the reduced set is the point of a specialist.
+	if !hasFrontmatterKey(researchMD, "tools") {
+		t.Fatalf("research AGENT.md must declare its allowlist:\n%s", researchMD)
+	}
+	for _, want := range []string{"web_search", "load_image"} {
+		if !strings.Contains(researchMD, want) {
+			t.Errorf("research AGENT.md missing %q", want)
+		}
+	}
+}
+
+func hasFrontmatterKey(md, key string) bool {
+	rest := strings.TrimPrefix(md, "---\n")
+	end := strings.Index(rest, "\n---")
+	if end < 0 {
+		return false
+	}
+	for _, line := range strings.Split(rest[:end], "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), key+":") {
+			return true
+		}
+	}
+	return false
 }
 
 func TestFileHandlingSkillGenerated(t *testing.T) {

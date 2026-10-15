@@ -170,11 +170,36 @@ Piccolo SHALL support a `path` input by letting the user select a file on the ho
 
 ### Requirement: Apply integration-proposed configuration through a fixed allowlist
 
-Piccolo SHALL be the only writer of the PicoClaw configuration file. An action may propose a configuration patch in its result, and Piccolo SHALL apply it only if every affected path is inside a fixed, code-defined allowlist covering the integration's own MCP server entry, using the existing diff preview, confirmation, backup, and atomic write behavior.
+Piccolo SHALL be the only writer of the PicoClaw configuration file. An action may propose a configuration patch in its result, and Piccolo SHALL apply it only if every affected path is inside a fixed, code-defined allowlist covering the integration's own MCP server entry, using the existing diff preview, confirmation, backup, and atomic write behavior. Because that allowlist deliberately keeps an integration from touching tool toggles, Piccolo SHALL own `tools.mcp.enabled` — and SHALL set it only after the registered server completes an MCP `initialize` handshake, because enabling the tool against an unreachable server makes PicoClaw fail every chat turn.
 
 #### Scenario: Allowed patch is applied through the normal path
 - **WHEN** a successful result contains a patch touching only the integration's own MCP server entry
 - **THEN** Piccolo shows a diff, asks for confirmation, writes the previous file to the documented single backup name, and writes the new configuration atomically
+
+#### Scenario: A verified handshake opens the gate
+- **WHEN** Piccolo has written an integration's `tools.mcp.servers.<key>` entry and that server answers `initialize` with a JSON-RPC result
+- **THEN** the same confirmed write sets `tools.mcp.enabled` to true
+- **AND** the toggle appears in the diff the user reviews, with the answering server named
+
+#### Scenario: A failed handshake registers without enabling
+- **WHEN** the server does not answer, answers with something that is not a JSON-RPC response, or refuses initialization
+- **THEN** Piccolo still writes the server entry, leaves `tools.mcp.enabled` untouched, and states the reason it could not verify
+
+#### Scenario: Framing mismatch is named as such
+- **WHEN** the server's first reply line begins with a `Content-Length:` header
+- **THEN** Piccolo reports that MCP over stdio is newline-delimited JSON, rather than reporting an unreachable server
+
+#### Scenario: Verification is impossible
+- **WHEN** no container engine is wired into this path, or the entry declares no spawnable stdio command
+- **THEN** Piccolo registers, says it could not verify, and does not enable the tool
+
+#### Scenario: The probe leaves nothing behind
+- **WHEN** a handshake probe finishes, fails, or times out
+- **THEN** its container is removed, and a probe abandoned by a crashed Piccolo is reclaimed under the integration one-shot prefix that `doctor` already reports
+
+#### Scenario: A patch with no server entry changes nothing
+- **WHEN** a proposed patch is allowlisted but carries no server entry
+- **THEN** Piccolo writes nothing, including the MCP toggle
 
 #### Scenario: Out-of-allowlist patch is refused
 - **WHEN** a proposed patch would modify any other configuration path
@@ -182,7 +207,7 @@ Piccolo SHALL be the only writer of the PicoClaw configuration file. An action m
 
 #### Scenario: No patch proposed
 - **WHEN** a successful result contains no configuration patch
-- **THEN** Piccolo does not modify the configuration file
+- **THEN** Piccolo does not modify the configuration file, and does not enable the MCP tool
 
 #### Scenario: Integration state files stay integration-owned
 - **WHEN** an action writes its own credentials or provider state under the integration state directory

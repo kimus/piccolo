@@ -43,10 +43,9 @@ func toolsFor(role string, in Inputs) []string {
 	}
 	switch role {
 	case "main":
-		addWeb()
-		tools = append(tools, "message", "read_file", "list_dir")
-		addImage()
-		tools = append(tools, "spawn", "subagent")
+		// Deliberately NO tool list. The coordinator must reach every tool
+		// config.json enables, including the dynamically-named tools an
+		// integration registers over MCP — see agentMD.
 	case "research":
 		addWeb()
 		tools = append(tools, "message", "read_file")
@@ -152,8 +151,25 @@ live in memory/MEMORY.md inside your workspace, managed by PicoClaw.
 `, role, in.AssistantName, specialistMission(role, in), toneLine(in.Purpose))
 	}
 
-	return fmt.Sprintf("---\nname: %s\ndescription: %s\ntools: [%s]\nskills: [%s]\n---\n\n%s",
-		name, desc, strings.Join(tools, ", "), FileHandlingSkillName, body)
+	// Frontmatter is built line by line because one line is conditional, and the
+	// condition is a capability, not cosmetics. PicoClaw turns a DECLARED `tools:`
+	// key into a strict, exact-name allowlist (pkg/agent/tool_allowlist.go:143-164,
+	// consumed by pkg/tools/registry.go:171-184). MCP tools are named
+	// `mcp_<server>_<tool>` with a hash suffix whenever sanitization is lossy
+	// (pkg/tools/integration/mcp_tool.go:143-152), so no list Piccolo could write
+	// at generation time can ever contain them: declaring `tools:` silently filters
+	// out every tool an installed integration provides. Omitting the key leaves the
+	// allowlist nil = every tool config.json enables. Specialists keep their
+	// reduced lists — that reduction is the entire point of a specialist.
+	lines := []string{
+		fmt.Sprintf("name: %s", name),
+		fmt.Sprintf("description: %s", desc),
+	}
+	if role != "main" {
+		lines = append(lines, fmt.Sprintf("tools: [%s]", strings.Join(tools, ", ")))
+	}
+	lines = append(lines, fmt.Sprintf("skills: [%s]", FileHandlingSkillName))
+	return fmt.Sprintf("---\n%s\n---\n\n%s", strings.Join(lines, "\n"), body)
 }
 
 // FileHandlingToolNames is the tool list the file-handling skill advertises: the

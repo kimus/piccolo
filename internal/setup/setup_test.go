@@ -164,9 +164,16 @@ func TestSetChannelEnabled(t *testing.T) {
 
 func TestPatchModel(t *testing.T) {
 	d := parse(t)
-	PatchModel(d, "gpt-5.4", "openai", "gpt-5.4", "sk-new", "")
+	if err := PatchModel(d, "gpt-5.4", "gpt-5.4", "openai", "gpt-5.4", "sk-new", ""); err != nil {
+		t.Fatal(err)
+	}
 	// A redundant "<provider>/" prefix on model is stripped (explicit-provider form).
-	PatchModel(d, "llama", "ollama", "ollama/llama3", "", "http://192.168.1.5:11434/v1")
+	if err := PatchModel(d, "", "llama", "ollama", "ollama/llama3", "", "http://192.168.1.5:11434/v1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := PatchModel(d, "", "gpt-5.4", "openai", "gpt-5.4", "sk-new", ""); err != nil {
+		t.Fatal(err)
+	}
 
 	models := Models(d)
 	if len(models) != 2 {
@@ -194,6 +201,46 @@ func TestPatchModel(t *testing.T) {
 	// Existing entry position preserved (still before tools key etc).
 	if strings.Index(out, `"gpt-5.4"`) > strings.Index(out, `"llama"`) {
 		t.Error("entry order changed")
+	}
+}
+
+func TestPatchModelRenameEditsInPlace(t *testing.T) {
+	d := parse(t)
+	// Editing an entry's alias renames that entry. Appending a second one and
+	// leaving the original behind was the bug: the references still named the
+	// old alias, so the chat kept using the model the user meant to replace.
+	if err := PatchModel(d, "gpt-5.4", "gpt-5.5", "openai", "gpt-5.5", "sk-new", ""); err != nil {
+		t.Fatal(err)
+	}
+	models := Models(d)
+	if len(models) != 1 || models[0].Alias != "gpt-5.5" || models[0].Model != "gpt-5.5" {
+		t.Fatalf("rename did not edit in place: %+v", models)
+	}
+	// PatchModel alone leaves the reference behind — that is what RenameModelRefs
+	// is for, and the pair is what makes a rename a rename.
+	if touched := RenameModelRefs(d, "gpt-5.4", "gpt-5.5"); len(touched) != 1 || touched[0] != "agents.defaults.model_name" {
+		t.Fatalf("touched = %v", touched)
+	}
+	if out := string(d.Marshal()); strings.Contains(out, `"gpt-5.4"`) {
+		t.Errorf("old alias still present:\n%s", out)
+	}
+}
+
+func TestPatchModelRenameCollision(t *testing.T) {
+	d := parse(t)
+	if err := PatchModel(d, "", "spare", "openai", "gpt-4", "sk-spare", ""); err != nil {
+		t.Fatal(err)
+	}
+	err := PatchModel(d, "gpt-5.4", "spare", "openai", "gpt-5.5", "sk-new", "")
+	if err == nil || !strings.Contains(err.Error(), "already exists") {
+		t.Fatalf("want collision refusal, got %v", err)
+	}
+	// Neither entry moved.
+	if got := len(Models(d)); got != 2 {
+		t.Fatalf("models = %d, want 2", got)
+	}
+	if m := Models(d)[0]; m.Alias != "gpt-5.4" || m.Model != "openai/gpt-5.4" {
+		t.Errorf("refused rename still edited: %+v", m)
 	}
 }
 
@@ -281,6 +328,163 @@ func TestDefaultImageModel(t *testing.T) {
 	}
 	if !strings.Contains(out, `"model_name": "gpt-5.4"`) {
 		t.Fatal("existing defaults fields should survive")
+	}
+}
+
+// refConfig names aliases from every reference site PicoClaw resolves against
+// model_list, in both the bare-string and {primary,fallbacks} agent forms.
+const refConfig = `{
+  "version": 3,
+  "agents": {
+    "defaults": { "model_name": "fast", "model_fallbacks": ["slow", "other"], "image_model": "slow", "image_model_fallbacks": ["fast"] },
+    "list": [
+      { "id": "main", "default": true, "model": "fast" },
+      { "id": "coder", "model": { "primary": "slow", "fallbacks": ["fast"] }, "subagents": { "model": "other" } }
+    ]
+  },
+  "custom_key": { "kept": true },
+  "model_list": [
+    { "model_name": "fast", "model": "fast-m" },
+    { "model_name": "slow", "model": "slow-m" },
+    { "model_name": "other", "model": "other-m" }
+  ]
+}`
+
+func TestModelRefPaths(t *testing.T) {
+	d := Obj2(t, refConfig)
+	got := strings.Join(ModelRefPaths(d, "fast"), " | ")
+	want := "agents.defaults.model_name | agents.defaults.image_model_fallbacks[0] | agents.list[main].model | agents.list[coder].model.fallbacks[0]"
+	if got != want {
+		t.Fatalf("refs = %s\nwant %s", got, want)
+	}
+	if got := ModelRefPaths(d, "nope"); len(got) != 0 {
+		t.Fatalf("unknown alias should have no refs, got %v", got)
+	}
+}
+
+func TestRenameModelRefs(t *testing.T) {
+	d := Obj2(t, refConfig)
+	touched := RenameModelRefs(d, "fast", "faster")
+	if len(touched) != 4 {
+		t.Fatalf("touched = %v", touched)
+	}
+	if got := strings.Join(ModelRefPaths(d, "fast"), " | "); got != "" {
+		t.Fatalf("old alias still referenced: %s", got)
+	}
+	out := string(d.Marshal())
+	if !strings.Contains(out, `"model": "faster"`) {
+		t.Error("string-form model should stay a bare alias")
+	}
+	if !strings.Contains(out, `"primary": "slow"`) {
+		t.Error("object-form model should keep its {primary,fallbacks} shape")
+	}
+	if !strings.Contains(out, `"faster"`) {
+		t.Errorf("new alias not written:\n%s", out)
+	}
+	// model_list still DEFINES "fast" — renaming references is not renaming the
+	// entry, which is PatchModel's job (asserted in TestPatchModelRenameEditsInPlace).
+	// References to other aliases, and unrelated keys, are untouched.
+	for _, want := range []string{`"image_model": "slow"`, `"model_fallbacks": [`, `"subagents": {`, `"kept": true`} {
+		if !strings.Contains(out, want) {
+			t.Errorf("missing %q", want)
+		}
+	}
+}
+
+func TestRemoveModelRefusesLoadBearing(t *testing.T) {
+	d := Obj2(t, refConfig)
+	err := RemoveModel(d, "fast")
+	if err == nil || !strings.Contains(err.Error(), "agents.defaults.model_name") || !strings.Contains(err.Error(), "agents.list[main].model") {
+		t.Fatalf("want refusal naming every load-bearing path, got %v", err)
+	}
+	if len(Models(d)) != 3 {
+		t.Fatal("entry removed although the rename was refused")
+	}
+	// subagents.model is a real reference, so "other" is not deletable here.
+	if err := RemoveModel(d, "other"); err == nil {
+		t.Fatal("subagents.model reference should block deletion")
+	}
+}
+
+func TestRemoveModelDropsFallbackEntries(t *testing.T) {
+	d := Obj2(t, `{"agents":{"defaults":{"model_name":"a","model_fallbacks":["b","other"]}},"model_list":[{"model_name":"a"},{"model_name":"b"},{"model_name":"other"}]}`)
+	if err := RemoveModel(d, "other"); err != nil {
+		t.Fatal(err)
+	}
+	out := string(d.Marshal())
+	if strings.Contains(out, "other") {
+		t.Errorf("fallback entry not dropped:\n%s", out)
+	}
+	if len(Models(d)) != 2 {
+		t.Fatalf("model_list = %+v", Models(d))
+	}
+
+	// A fallback list emptied by the delete takes its key with it: upstream
+	// omits an empty fallbacks field rather than writing [].
+	empty := Obj2(t, `{"agents":{"defaults":{"model_name":"a","model_fallbacks":["other"]}},"model_list":[{"model_name":"a"},{"model_name":"other"}]}`)
+	if err := RemoveModel(empty, "other"); err != nil {
+		t.Fatal(err)
+	}
+	if out := string(empty.Marshal()); strings.Contains(out, "model_fallbacks") {
+		t.Errorf("emptied fallback list should be removed:\n%s", out)
+	}
+}
+
+func TestRemoveModelUnknown(t *testing.T) {
+	d := Obj2(t, refConfig)
+	if err := RemoveModel(d, "nope"); err == nil || !strings.Contains(err.Error(), "not in model_list") {
+		t.Fatalf("want unknown-alias error, got %v", err)
+	}
+}
+
+func TestWorkspaceRestriction(t *testing.T) {
+	// Absent is not false: PicoClaw defaults restrict_to_workspace to true when the
+	// key is missing (pkg/config/defaults.go:29). A nil result therefore means
+	// "restricted", and must never be read as unrestricted.
+	if got := WorkspaceRestricted(parse(t)); got != nil {
+		t.Fatalf("absent key = %v, want nil", *got)
+	}
+
+	d := configdoc.NewDoc()
+	SetWorkspaceRestricted(d, false)
+	p := WorkspaceRestricted(d)
+	if p == nil || *p {
+		t.Fatalf("after Set(false) = %v, want explicit false", p)
+	}
+	// The false has to survive into the file as a literal; a zero value that
+	// disappears on the way out would put the guard back on.
+	if out := string(d.Marshal()); !strings.Contains(out, `"restrict_to_workspace": false`) {
+		t.Fatalf("explicit false not written:\n%s", out)
+	}
+
+	SetWorkspaceRestricted(d, true)
+	if p := WorkspaceRestricted(d); p == nil || !*p {
+		t.Fatalf("after Set(true) = %v, want true", p)
+	}
+}
+
+func TestDefaultModel(t *testing.T) {
+	d := parse(t)
+	if got := DefaultModel(d); got != "gpt-5.4" {
+		t.Fatalf("DefaultModel = %q, want the fixture alias", got)
+	}
+	SetDefaultModel(d, "llama")
+	if got := DefaultModel(d); got != "llama" {
+		t.Fatalf("DefaultModel = %q", got)
+	}
+	out := string(d.Marshal())
+	if !strings.Contains(out, `"model_name": "llama"`) {
+		t.Fatalf("default not written: %s", out)
+	}
+	// The other defaults survive — this is a merge patch, not a re-emit.
+	if !strings.Contains(out, `"workspace": "~/.picoclaw/agents/main"`) {
+		t.Error("siblings of model_name were dropped")
+	}
+	// A workspace with no agents section at all gets one, and nothing else moves.
+	bare := Obj2(t, `{"version":3}`)
+	SetDefaultModel(bare, "x")
+	if got := DefaultModel(bare); got != "x" {
+		t.Fatalf("created parents did not hold the value: %s", bare.Marshal())
 	}
 }
 

@@ -698,7 +698,15 @@ func homeOr(fallback string) string {
 
 // applyIntegrationPatch validates and applies a proposed patch through the
 // existing preview/confirm/backup path. Piccolo is the only config.json writer.
-func applyIntegrationPatch(out io.Writer, configPath string, raw json.RawMessage, serverKey string, confirm func() (bool, error)) error {
+//
+// The MCP toggle is deliberately NOT written by ApplyIntegrationPatch. It is decided
+// here, after the freshly registered server has actually completed an initialize
+// handshake, because the two states mean different things to the user: a server entry
+// is configuration, while tools.mcp.enabled is a promise that agents can call the
+// integration. And a broken promise is worse than an unkept one — with the toggle on
+// and the server unreachable, PicoClaw fails the entire turn, so EVERY chat message
+// errors rather than only this integration's requests.
+func applyIntegrationPatch(ctx context.Context, out io.Writer, configPath string, raw json.RawMessage, serverKey string, probe mcpHandshake, confirm func() (bool, error)) error {
 	if len(raw) == 0 {
 		return nil
 	}
@@ -717,6 +725,31 @@ func applyIntegrationPatch(out io.Writer, configPath string, raw json.RawMessage
 	if written == "" {
 		return nil
 	}
+
+	// Probe before the diff is computed, so the verdict is part of what the user is
+	// about to confirm. A nil prober means this path was reached without a container
+	// engine: Piccolo registers, says it could not verify, and does not enable —
+	// silence here would recreate the "installed but unusable" state this exists to
+	// prevent, and enabling would gamble on the whole gateway.
+	switch {
+	case probe == nil:
+		fmt.Fprintf(out, "\n%s is registered. Piccolo could not run a handshake here, so tools.mcp.enabled was left as-is; 'piccolo setup' \u2192 Tools turns it on once you have confirmed the server answers.\n", serverKey)
+	default:
+		argv := setup.MCPServerArgv(doc, serverKey)
+		if len(argv) == 0 {
+			fmt.Fprintf(out, "\n%s is registered. Its entry declares no stdio command Piccolo can probe, so tools.mcp.enabled was left as-is.\n", serverKey)
+			break
+		}
+		fmt.Fprintf(out, "\nAsking %s to complete the MCP handshake...\n", serverKey)
+		if detail, perr := probe.Probe(ctx, serverKey, argv); perr != nil {
+			fmt.Fprintf(out, "  x registered, but PicoClaw cannot use it yet: %v\n", perr)
+			fmt.Fprintln(out, "    tools.mcp.enabled is deliberately left off: with the tool on and the server unreachable, PicoClaw fails every chat message, not just this integration's. Re-run setup after the integration ships a newline-delimited stdio server.")
+		} else {
+			fmt.Fprintf(out, "  \u2713 %s answered initialize (%s)\n", serverKey, detail)
+			setup.EnableMCPTool(doc)
+		}
+	}
+
 	after := doc.Marshal()
 	if string(before) == string(after) {
 		fmt.Fprintf(out, "config.json already registers %s; nothing to change\n", serverKey)
@@ -957,7 +990,7 @@ func runDeclarativeSetup(ctx context.Context, out io.Writer, runner integrationR
 	if len(pendingPatch) == 0 {
 		return nil
 	}
-	return applyIntegrationPatch(s.out, s.layout.Config(), pendingPatch, integrationServerKey(*found, desc), confirmApplyConfig)
+	return applyIntegrationPatch(ctx, s.out, s.layout.Config(), pendingPatch, integrationServerKey(*found, desc), dockerMCPProbe{runner: s.runner, base: s.specBase, out: s.out}, confirmApplyConfig)
 }
 
 // summarize prints what the session ended with. Severity lives here, in colour

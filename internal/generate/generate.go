@@ -133,8 +133,11 @@ func (in Inputs) PicoclawConfig() *picoclaw.Config {
 		Version: picoclaw.SchemaVersion,
 		Agents: picoclaw.Agents{
 			Defaults: picoclaw.Defaults{
-				Workspace:                 picoclaw.AgentWorkspace("main"),
-				RestrictToWorkspace:       true,
+				Workspace: picoclaw.AgentWorkspace("main"),
+				// Written explicitly FALSE. PicoClaw's own default is true
+				// (pkg/config/defaults.go:29), so an absent key means restricted;
+				// this field carries no omitempty and must stay that way.
+				RestrictToWorkspace:       false,
 				AllowReadOutsideWorkspace: true,
 				ModelName:                 in.Model.Alias,
 				ImageModel:                in.Model.Alias,

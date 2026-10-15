@@ -83,7 +83,7 @@ If Piccolo provides a setup flow for remote-chat file decoding, the flow SHALL c
 - **WHEN** a Piccolo setup flow enables shell execution for remote channels
 - **THEN** `config.json` contains `tools.exec.enabled` set to `true`
 - **AND** `config.json` contains `tools.exec.allow_remote` set to `true`
-- **AND** matching agent `AGENT.md` tool allowlists include `exec`
+- **AND** every agent that should run commands can: specialists list `exec` in their `AGENT.md` tool allowlist, and the coordinator reaches it by declaring no allowlist at all (a declared list is a strict exact-name set, which would also exclude runtime-named MCP tools)
 
 #### Scenario: Remote exec warning
 - **WHEN** Piccolo presents or applies a setting that enables `tools.exec.allow_remote`

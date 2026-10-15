@@ -4,11 +4,14 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 
@@ -18,6 +21,7 @@ import (
 	"golang.org/x/term"
 
 	"github.com/kimus/piccolo/internal/configdoc"
+	"github.com/kimus/piccolo/internal/docker"
 	"github.com/kimus/piccolo/internal/generate"
 	"github.com/kimus/piccolo/internal/manifest"
 	"github.com/kimus/piccolo/internal/runtimeimage"
@@ -66,6 +70,12 @@ type setupState struct {
 
 	manifestPath string
 	manifest     *manifest.Manifest
+
+	// notice carries a message into the next screen's help line. Printing while a
+	// form is on screen is invisible: huh runs in the alt screen, so text written
+	// between two screens is covered by the next frame before it can be read —
+	// which is exactly when a refusal reason matters most.
+	notice string
 
 	pendingDiscordApplicationID string
 	pendingDiscordMentionOnly   bool
@@ -325,7 +335,7 @@ func toolStateSummary(t setup.ToolsState) string {
 		}
 		return "off"
 	}
-	return fmt.Sprintf("web:%s exec:%s remote-exec:%s spawn:%s subagent:%s images:%s", on(t.Web), on(t.Exec), on(t.ExecAllowRemote), on(t.Spawn), on(t.Subagent), on(t.LoadImage))
+	return fmt.Sprintf("web:%s exec:%s remote-exec:%s spawn:%s subagent:%s images:%s mcp:%s", on(t.Web), on(t.Exec), on(t.ExecAllowRemote), on(t.Spawn), on(t.Subagent), on(t.LoadImage), on(t.MCP))
 }
 
 // ---------- channels ----------
@@ -786,29 +796,32 @@ func modelRef(m setup.ModelInfo) string {
 func (st *setupState) modelsScreen() error {
 	for {
 		models := setup.Models(st.doc)
+		defaultModel := strings.TrimSpace(setup.DefaultModel(st.doc))
 		imageModel := strings.TrimSpace(setup.DefaultImageModel(st.doc))
-		imageLabel := "not set"
-		if imageModel != "" {
-			imageLabel = imageModel
-		}
 		opts := []huh.Option[string]{huh.NewOption("+ Add a model…", "__add__")}
 		for _, m := range models {
-			state := "no key!"
-			if m.KeySet {
-				state = "key set"
-			}
-			opts = append(opts, huh.NewOption(fmt.Sprintf("%-16s %s (%s)", m.Alias, state, modelRef(m)), m.Alias))
+			opts = append(opts, huh.NewOption(modelListLabel(m, defaultModel, imageModel), m.Alias))
 		}
-		opts = append(opts,
-			huh.NewOption(fmt.Sprintf("Set image/vision model… (%s)", imageLabel), "__image_model__"),
-			huh.NewOption("← Back", "__back__"),
-		)
+		// A pick-list of models is meaningless without models: offering it and
+		// then erroring out would abort the whole setup session.
+		if len(models) > 0 {
+			opts = append(opts,
+				huh.NewOption(fmt.Sprintf("Set default text model… (%s)", modelSlotLabel(defaultModel)), "__default_model__"),
+				huh.NewOption(fmt.Sprintf("Set image/vision model… (%s)", modelSlotLabel(imageModel)), "__image_model__"),
+				huh.NewOption("- Delete a model…", "__delete__"),
+			)
+		}
+		opts = append(opts, huh.NewOption("← Back", "__back__"))
 
 		var pick string
+		desc := "agents use agents.defaults.model_name for text and agents.defaults.image_model for image attachments"
+		if st.notice != "" {
+			desc, st.notice = st.notice, ""
+		}
 		form := setupForm(huh.NewGroup(
 			huh.NewSelect[string]().
 				Title("Models").
-				Description("agents use agents.defaults.model_name for text and agents.defaults.image_model for image attachments").
+				Description(desc).
 				Options(opts...).
 				Value(&pick),
 		))
@@ -825,8 +838,22 @@ func (st *setupState) modelsScreen() error {
 				}
 				return err
 			}
+		case "__default_model__":
+			if err := st.defaultModelForm(); err != nil {
+				if isCancel(err) {
+					continue
+				}
+				return err
+			}
 		case "__image_model__":
 			if err := st.imageModelForm(); err != nil {
+				if isCancel(err) {
+					continue
+				}
+				return err
+			}
+		case "__delete__":
+			if err := st.deleteModelForm(); err != nil {
 				if isCancel(err) {
 					continue
 				}
@@ -843,7 +870,36 @@ func (st *setupState) modelsScreen() error {
 	}
 }
 
+// modelListLabel renders one model_list entry for a select, marking the entries
+// config.json currently points at so a rename or delete shows what it will touch
+// before the user commits to it.
+func modelListLabel(m setup.ModelInfo, defaultModel, imageModel string) string {
+	state := "no key!"
+	if m.KeySet {
+		state = "key set"
+	}
+	roles := ""
+	if m.Alias == defaultModel {
+		roles += " [default]"
+	}
+	if m.Alias == imageModel {
+		roles += " [image]"
+	}
+	return fmt.Sprintf("%-16s %s (%s)%s", m.Alias, state, modelRef(m), roles)
+}
+
+// modelSlotLabel renders the current value of a model field that may be unset.
+func modelSlotLabel(alias string) string {
+	if alias == "" {
+		return "not set"
+	}
+	return alias
+}
+
 func (st *setupState) modelForm(alias string) error {
+	// lookup is the alias being edited; alias may become a new one. They differ
+	// exactly when this is a rename.
+	lookup := alias
 	var provider, model, base, key string
 	if alias != "" {
 		provider, model, key, base, _ = setup.ReadModel(st.doc, alias)
@@ -853,6 +909,7 @@ func (st *setupState) modelForm(alias string) error {
 	form := setupForm(
 		huh.NewGroup(
 			huh.NewInput().Title("Model alias (model_name in config.json)").
+				Description("renaming re-points every reference: agents.defaults.model_name, image_model, the fallback lists, and agents.list[].model").
 				Placeholder("gpt-5.4").Value(&alias),
 			huh.NewInput().Title("Provider").
 				Description("e.g. openai, openrouter, anthropic — sent to config.json as an explicit provider").
@@ -877,40 +934,189 @@ func (st *setupState) modelForm(alias string) error {
 	if newKey != "" {
 		key = newKey
 	}
-	setup.PatchModel(st.doc, alias, strings.TrimSpace(provider), strings.TrimSpace(model), key, strings.TrimSpace(base))
-	return st.applyAndConfirm("model " + alias)
+	if err := setup.PatchModel(st.doc, lookup, alias, strings.TrimSpace(provider), strings.TrimSpace(model), key, strings.TrimSpace(base)); err != nil {
+		return err
+	}
+	what := "model " + alias
+	if lookup != "" && lookup != alias {
+		refs := setup.RenameModelRefs(st.doc, lookup, alias)
+		what = fmt.Sprintf("model %s (renamed from %s", alias, lookup)
+		if len(refs) > 0 {
+			what += "; re-pointing " + strings.Join(refs, ", ")
+		} else {
+			what += "; nothing referenced it"
+		}
+		what += ")"
+		// An AGENT.md `model:` pin outranks config.json for that agent, and
+		// renaming through it would rewrite a file the user owns.
+		if pins := st.agentFilesPinningModel(lookup); len(pins) > 0 {
+			st.setNotice("%s pin model %q in their own frontmatter — those files are yours to edit",
+				strings.Join(pins, ", "), lookup)
+		}
+	}
+	return st.applyAndConfirm(what)
 }
 
 func (st *setupState) imageModelForm() error {
+	pick, err := st.pickModelForm(
+		"Image/vision model",
+		"Recommended: choose a multimodal model. PicoClaw uses agents.defaults.image_model for image attachments from Discord/Telegram/etc.",
+		strings.TrimSpace(setup.DefaultImageModel(st.doc)),
+	)
+	if err != nil {
+		return err
+	}
+	setup.SetDefaultImageModel(st.doc, pick)
+	return st.applyAndConfirm("image model " + pick)
+}
+
+// defaultModelForm writes agents.defaults.model_name, the alias every agent
+// inherits. This slot had no editor at all before: repointing an entry or
+// hand-editing config.json were the only ways to move the default.
+func (st *setupState) defaultModelForm() error {
+	pick, err := st.pickModelForm(
+		"Default text model",
+		"agents.defaults.model_name is what agents use unless their AGENT.md frontmatter or their agents.list entry pins a model of its own. PicoClaw falls back to model_fallbacks when the chosen model has no endpoint — free models vanish without notice, so listing one or two here is cheap insurance.",
+		strings.TrimSpace(setup.DefaultModel(st.doc)),
+	)
+	if err != nil {
+		return err
+	}
+	setup.SetDefaultModel(st.doc, pick)
+	return st.applyAndConfirm("default model " + pick)
+}
+
+// pickModelForm asks for one alias among the configured models, starting from
+// current (the first entry when current is unset or points at a model that no
+// longer exists — a select whose value matches no option renders nothing).
+func (st *setupState) pickModelForm(title, description, current string) (string, error) {
 	models := setup.Models(st.doc)
 	if len(models) == 0 {
-		return fmt.Errorf("add a model before setting agents.defaults.image_model")
+		return "", fmt.Errorf("add a model first")
 	}
-	current := strings.TrimSpace(setup.DefaultImageModel(st.doc))
-	if current == "" {
+	known := false
+	for _, m := range models {
+		if m.Alias == current {
+			known = true
+			break
+		}
+	}
+	if !known {
 		current = models[0].Alias
 	}
 	opts := make([]huh.Option[string], 0, len(models))
 	for _, m := range models {
-		label := fmt.Sprintf("%s (%s)", m.Alias, modelRef(m))
-		opts = append(opts, huh.NewOption(label, m.Alias))
+		opts = append(opts, huh.NewOption(fmt.Sprintf("%s (%s)", m.Alias, modelRef(m)), m.Alias))
 	}
+	pick := current
 	form := setupForm(huh.NewGroup(
 		huh.NewSelect[string]().
-			Title("Image/vision model").
-			Description("Recommended: choose a multimodal model. PicoClaw uses this for image attachments from Discord/Telegram/etc.").
+			Title(title).
+			Description(description).
 			Options(opts...).
-			Value(&current),
+			Value(&pick),
+	))
+	if err := form.Run(); err != nil {
+		return "", err
+	}
+	pick = strings.TrimSpace(pick)
+	if pick == "" {
+		return "", fmt.Errorf("model alias is required")
+	}
+	return pick, nil
+}
+
+// deleteModelForm removes one model_list entry. setup.RemoveModel refuses while
+// the alias is still load-bearing — deleting the model a turn is about to use
+// would leave config.json pointing at an alias that no longer exists, which
+// doctor can only report after the fact.
+func (st *setupState) deleteModelForm() error {
+	models := setup.Models(st.doc)
+	if len(models) == 0 {
+		fmt.Fprintln(st.out, "no models configured to delete.")
+		return nil
+	}
+	defaultModel := strings.TrimSpace(setup.DefaultModel(st.doc))
+	imageModel := strings.TrimSpace(setup.DefaultImageModel(st.doc))
+	opts := make([]huh.Option[string], 0, len(models))
+	for _, m := range models {
+		label := modelListLabel(m, defaultModel, imageModel)
+		if n := len(setup.ModelRefPaths(st.doc, m.Alias)); n > 0 {
+			label += fmt.Sprintf(" — %d reference(s)", n)
+		}
+		opts = append(opts, huh.NewOption(label, m.Alias))
+	}
+	var pick string
+	form := setupForm(huh.NewGroup(
+		huh.NewSelect[string]().
+			Title("Delete which model?").
+			Description("A model still named as the default, the image model, or an agent's model cannot be deleted — move those first, then delete it. Entries in the fallback lists are dropped along with it.").
+			Options(opts...).
+			Value(&pick),
 	))
 	if err := form.Run(); err != nil {
 		return err
 	}
-	current = strings.TrimSpace(current)
-	if current == "" {
-		return fmt.Errorf("image model alias is required")
+	before := len(models)
+	if err := setup.RemoveModel(st.doc, pick); err != nil {
+		st.setNotice("cannot delete %s: %v", pick, err)
+		if pick == defaultModel {
+			st.notice += " — choose another default first with 'Set default text model…'"
+		}
+		if pick == imageModel {
+			st.notice += " — choose another image model first with 'Set image/vision model…'"
+		}
+		return nil
 	}
-	setup.SetDefaultImageModel(st.doc, current)
-	return st.applyAndConfirm("image model " + current)
+	if err := st.applyAndConfirm(fmt.Sprintf("delete model %s", pick)); err != nil {
+		return err
+	}
+	if before == 1 && len(setup.Models(st.doc)) == 0 {
+		st.setNotice("model_list is now empty — doctor will FAIL and no agent can answer until you add a model")
+	}
+	return nil
+}
+
+var modelLineRE = regexp.MustCompile(`(?m)^model:[ \t]*(\S*)`)
+
+// agentFrontmatterModel reads the model key out of an AGENT.md YAML header.
+// "" when the file has no frontmatter or no such key: Piccolo never generates
+// one, so a model pin is always something a person wrote.
+func agentFrontmatterModel(content string) string {
+	if !strings.HasPrefix(content, "---\n") {
+		return ""
+	}
+	rest := content[len("---\n"):]
+	end := strings.Index(rest, "\n---")
+	if end < 0 {
+		return ""
+	}
+	m := modelLineRE.FindStringSubmatch(rest[:end])
+	if m == nil {
+		return ""
+	}
+	return strings.Trim(strings.TrimSpace(m[1]), "\"'")
+}
+
+// agentFilesPinningModel lists the workspace-relative AGENT.md paths whose
+// frontmatter pins alias. A rename reports them instead of rewriting them.
+func (st *setupState) agentFilesPinningModel(alias string) []string {
+	var out []string
+	for _, path := range st.agentMDPaths() {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		if agentFrontmatterModel(string(data)) != alias {
+			continue
+		}
+		rel, err := filepath.Rel(st.dir, path)
+		if err != nil {
+			rel = path
+		}
+		out = append(out, filepath.ToSlash(rel))
+	}
+	return out
 }
 
 // ---------- tools ----------
@@ -919,7 +1125,7 @@ func (st *setupState) toolsScreen() error {
 	for {
 		cur := setup.GetTools(st.doc)
 		state := map[string]*bool{"web": cur.Web, "exec": cur.Exec, "spawn": cur.Spawn, "subagent": cur.Subagent, "load_image": cur.LoadImage}
-		opts := make([]huh.Option[string], 0, len(setup.ToolNames)+3)
+		opts := make([]huh.Option[string], 0, len(setup.ToolNames)+4)
 		opts = append(opts, huh.NewOption("Sync AGENT.md allowlists and file-handling skill…", "__sync__"))
 		for _, spec := range setup.ToolNames {
 			enabled := false
@@ -969,6 +1175,23 @@ func (st *setupState) toolsScreen() error {
 			fmt.Sprintf("%-22s [%s] — %s", "Remote shell execution", remoteStatus, "allow exec from Discord/Telegram/etc.; use only for trusted chats"),
 			"exec_remote:"+remoteVerb,
 		))
+
+		// Absent means restricted: PicoClaw defaults the flag to true
+		// (pkg/config/defaults.go:29), so show the default as ON, not off.
+		restricted := true
+		if p := setup.WorkspaceRestricted(st.doc); p != nil {
+			restricted = *p
+		}
+		restrictStatus := "off"
+		restrictVerb := "enable"
+		if restricted {
+			restrictStatus = "on"
+			restrictVerb = "disable"
+		}
+		opts = append(opts, huh.NewOption(
+			fmt.Sprintf("%-22s [%s] — %s", "Workspace path guard", restrictStatus, "when ON, shell commands and writes naming paths outside an agent workspace are blocked"),
+			"restrict_paths:"+restrictVerb,
+		))
 		opts = append(opts, huh.NewOption("← Back", "__back__"))
 
 		var pick string
@@ -1017,6 +1240,27 @@ func (st *setupState) toolsScreen() error {
 			}
 			continue
 		}
+		if key == "restrict_paths" {
+			if err := st.applyWorkspaceRestrictionChange(enabled); err != nil {
+				if isCancel(err) {
+					continue
+				}
+				return err
+			}
+			continue
+		}
+		if key == "mcp" && enabled {
+			// Turning MCP on is the one tool toggle that can break every message, so it
+			// does not go through the generic path: it verifies first. Handling it here
+			// also keeps the toggle from being written to the document before the check.
+			if err := st.applyMCPEnableChange(); err != nil {
+				if isCancel(err) {
+					continue
+				}
+				return err
+			}
+			continue
+		}
 		setup.SetTool(st.doc, key, enabled)
 		if err := st.applyToolChange(key, enabled); err != nil {
 			if isCancel(err) {
@@ -1043,7 +1287,7 @@ func (st *setupState) syncEnabledToolAllowlists() error {
 func (st *setupState) syncEnabledToolWorkspaceChanges() ([]agentFileChange, error) {
 	setup.EnsureMediaReadConfig(st.doc)
 	cur := setup.GetTools(st.doc)
-	state := map[string]*bool{"web": cur.Web, "exec": cur.Exec, "spawn": cur.Spawn, "subagent": cur.Subagent, "load_image": cur.LoadImage}
+	state := map[string]*bool{"web": cur.Web, "exec": cur.Exec, "spawn": cur.Spawn, "subagent": cur.Subagent, "load_image": cur.LoadImage, "mcp": cur.MCP}
 	var enabledTools []string
 	for _, spec := range setup.ToolNames {
 		if p := state[spec.Key]; p != nil && *p {
@@ -1051,6 +1295,7 @@ func (st *setupState) syncEnabledToolWorkspaceChanges() ([]agentFileChange, erro
 		}
 	}
 	var changes []agentFileChange
+	coord := st.coordinatorMDPath()
 	for _, path := range st.agentMDPaths() {
 		data, err := os.ReadFile(path)
 		if err != nil {
@@ -1059,6 +1304,11 @@ func (st *setupState) syncEnabledToolWorkspaceChanges() ([]agentFileChange, erro
 		content := string(data)
 		changed := false
 		for _, key := range enabledTools {
+			if path == coord {
+				// See agentToolAllowlistChanges: a declared list on the coordinator is
+				// a strict allowlist, and it would drop every dynamically-named MCP tool.
+				break
+			}
 			updated, oneChanged := updateAgentToolsFrontmatter(content, frontmatterToolsForConfigTool(key), true)
 			if oneChanged {
 				content = updated
@@ -1092,6 +1342,189 @@ func (st *setupState) applyToolFeedbackChange(enabled bool) error {
 	return st.applyConfigAndAgentChanges(fmt.Sprintf("tool feedback %s", yesNo(enabled)), nil)
 }
 
+// applyMCPEnableChange turns tools.mcp.enabled on only after the registered
+// integration servers have actually completed an MCP initialize handshake.
+//
+// The registration path already verifies this, but the toggle can also be flipped
+// here, and a manual enable that skips verification is how a workspace ends up with
+// every chat message failing: PicoClaw aborts the whole turn when a registered server
+// cannot connect. It also checks the container that is ACTUALLY SERVING TRAFFIC, not
+// just the image piccolo.yaml names, because the two can differ — `integration add`
+// bakes a new image and rewrites the manifest while the running gateway keeps the old
+// binaries until a restart, and config.json is re-read immediately. Observed live:
+// the new image answered initialize cleanly while the running 0.3.4 binary still
+// replied with LSP framing, so the toggle read as harmless and every turn failed.
+func (st *setupState) applyMCPEnableChange() error {
+	servers := st.registeredMCPServers()
+	if len(servers) == 0 {
+		// Nothing registered means nothing can fail the handshake, and refusing here
+		// would teach the user that MCP is broken when it is merely unused.
+		fmt.Fprintln(st.out, "note: no MCP server is registered yet, so there is nothing to verify — an integration registers one when it is added ('piccolo integration add <pkg>').")
+		return st.writeMCPEnabled(true, "mcp tool enabled (no servers registered yet)")
+	}
+
+	_, dir, runner, ctx, err := containerContext(st.cmd)
+	if err != nil {
+		return err
+	}
+	layout := workspace.NewLayout(dir)
+	m, err := manifest.Load(layout.Manifest())
+	if err != nil {
+		return err
+	}
+
+	problems, verified, unverifiable := verifyMCPEnableChange(ctx, runner, m.Container.Name, layout, m, servers, st.out)
+	if unverifiable {
+		return st.confirmUnverifiedMCPEnable(fmt.Errorf("no container engine reachable, so these servers could not be verified"), servers)
+	}
+
+	if len(problems) == 0 {
+		for _, line := range verified {
+			fmt.Fprintf(st.out, "  ✓ %s\n", line)
+		}
+		return st.writeMCPEnabled(true, "mcp tool enabled")
+	}
+
+	fmt.Fprintln(st.out, "x handshake verification failed:")
+	for _, p := range problems {
+		fmt.Fprintf(st.out, "    - %s\n", p)
+	}
+	for _, line := range verified {
+		fmt.Fprintf(st.out, "    - %s\n", line)
+	}
+	return st.confirmUnverifiedMCPEnable(errors.New(strings.Join(problems, "; ")), servers)
+}
+
+// mcpVerifyEngine is the daemon surface verifyMCPEnableChange needs, kept narrow so
+// the safety-critical decision is unit-testable without Docker — the same isolation
+// rule the rest of Piccolo's docker access follows.
+type mcpVerifyEngine interface {
+	Ping(context.Context) error
+	StateByName(context.Context, string) (docker.State, error)
+	Run(context.Context, docker.Spec) (docker.Process, error)
+	RemoveByPrefix(context.Context, string) ([]string, error)
+}
+
+// verifyMCPEnableChange handshakes every registered server in EACH image that could
+// end up serving it: the one piccolo.yaml names, and the one the gateway is running
+// when they differ. Probing only the manifest image is what would have let the real
+// failure through — the new image answered initialize while the still-running old
+// container replied in LSP framing, so a passing check sat beside a gateway that
+// failed every message.
+//
+// It returns the problems found and the servers verified, each naming the image it
+// was verified in: "verified" without a target is the claim that misled here.
+func verifyMCPEnableChange(ctx context.Context, eng mcpVerifyEngine, containerName string, layout workspacepkg.Layout, m *manifest.Manifest, servers []mcpServerEntry, out io.Writer) (problems, verified []string, unverifiable bool) {
+	if err := eng.Ping(ctx); err != nil {
+		return nil, nil, true
+	}
+
+	type target struct{ label, image string }
+	targets := []target{{"piccolo.yaml", m.Container.Image}}
+	// Only a RUNNING container is a second target: a stopped leftover will not serve
+	// the toggle, so probing its binaries would report a failure that cannot happen.
+	if state, serr := eng.StateByName(ctx, containerName); serr == nil && state.Found && state.Running && state.Image != "" && state.Image != m.Container.Image {
+		targets = append(targets, target{"the running gateway, which needs a restart", state.Image})
+	}
+
+	for _, t := range targets {
+		probe := dockerMCPProbe{runner: eng, base: docker.Spec{
+			Image:   t.image,
+			Network: m.Container.Network,
+			Source:  layout.PicoclawHome(),
+			Volumes: integrationSetupBinds(layout),
+			Labels:  map[string]string{docker.LabelWorkspace: layout.Root},
+		}, out: out}
+		for _, srv := range servers {
+			detail, perr := probe.Probe(ctx, srv.key, srv.argv)
+			if perr != nil {
+				problems = append(problems, fmt.Sprintf("%s in %s (%s): %v", srv.key, t.label, t.image, perr))
+				continue
+			}
+			verified = append(verified, fmt.Sprintf("%s answered initialize as %s — verified in %s (%s)", srv.key, detail, t.label, t.image))
+		}
+	}
+	return problems, verified, false
+}
+
+// confirmUnverifiedMCPEnable puts the decision where it belongs — with the user — but
+// defaults to No, because the known consequence of enabling against a server that
+// cannot answer is that every chat message fails, not just this integration's.
+func (st *setupState) confirmUnverifiedMCPEnable(reason error, servers []mcpServerEntry) error {
+	fmt.Fprintf(st.out, "\nEnabling MCP anyway means PicoClaw fails EVERY chat message while %d server(s) cannot initialize — not only the ones that use them.\n", len(servers))
+	confirm := false
+	form := setupForm(huh.NewGroup(
+		huh.NewConfirm().
+			Title("Enable tools.mcp.enabled despite the failed verification?").
+			Description(quoteForLog(reason.Error()) + "\n" + escBackHint + " — esc leaves MCP off").
+			Affirmative("Yes, enable anyway").
+			Negative("No, keep MCP off").
+			Value(&confirm),
+	))
+	if err := form.Run(); err != nil {
+		if errors.Is(err, huh.ErrUserAborted) {
+			// Backing out of a yes/no gate is a no, same as the config-write gate:
+			// esc must not sound like a crash.
+			fmt.Fprintln(st.out, "MCP left off.")
+			return nil
+		}
+		return err
+	}
+	if !confirm {
+		fmt.Fprintln(st.out, "MCP left off.")
+		return nil
+	}
+	fmt.Fprintln(st.out, "enabled at your request; 'piccolo restart' re-checks the container that will serve traffic after any image change.")
+	return st.writeMCPEnabled(true, "mcp tool enabled (verification declined by you)")
+}
+
+// writeMCPEnabled is the single place this screen turns the MCP tool on.
+func (st *setupState) writeMCPEnabled(enabled bool, what string) error {
+	setup.SetTool(st.doc, "mcp", enabled)
+	return st.applyConfigAndAgentChanges(what, nil)
+}
+
+type mcpServerEntry struct {
+	key  string
+	argv []string
+}
+
+// registeredMCPServers lists every tools.mcp.servers entry Piccolo can spawn, in
+// stable key order so a workspace with several integrations verifies them in the same
+// sequence every time.
+func (st *setupState) registeredMCPServers() []mcpServerEntry {
+	return mcpServersInDoc(st.doc)
+}
+
+// mcpServersInDoc is the same list without a setupState, so the registry read is
+// testable on its own: an entry with no spawnable command (sse, disabled, blank) is
+// skipped rather than reported as a failure it cannot have.
+func mcpServersInDoc(doc *configdoc.Doc) []mcpServerEntry {
+	tools, ok := doc.GetObject("tools")
+	if !ok {
+		return nil
+	}
+	mcp, ok := tools.GetObject("mcp")
+	if !ok {
+		return nil
+	}
+	servers, ok := mcp.GetObject("servers")
+	if !ok {
+		return nil
+	}
+	var out []mcpServerEntry
+	for _, key := range servers.Keys() {
+		if argv := setup.MCPServerArgv(doc, key); len(argv) > 0 {
+			out = append(out, mcpServerEntry{key: key, argv: argv})
+		}
+	}
+	// Sorted, so a workspace with several integrations verifies them in the same order
+	// every time: JSON object order is the user's, and a nondeterministic verification
+	// sequence makes both logs and comparisons unreliable.
+	sort.Slice(out, func(i, j int) bool { return out[i].key < out[j].key })
+	return out
+}
+
 func (st *setupState) applyRemoteExecChange(enabled bool) error {
 	setup.SetExecAllowRemote(st.doc, enabled)
 	var changes []agentFileChange
@@ -1102,6 +1535,22 @@ func (st *setupState) applyRemoteExecChange(enabled bool) error {
 		fmt.Fprintln(st.out, "warning: remote shell execution allows Discord/Telegram/etc. chats to request shell commands inside the container subject to PicoClaw safety checks; enable only for trusted channels/users. Tool feedback was enabled for audit/debug visibility.")
 	}
 	return st.applyConfigAndAgentChanges(fmt.Sprintf("remote exec %s", yesNo(enabled)), changes)
+}
+
+// applyWorkspaceRestrictionChange writes agents.defaults.restrict_to_workspace.
+// Disabling it is Piccolo's generated default and its recommendation: the
+// container is the security boundary, and PicoClaw's exec guard trips on ordinary
+// commands (any absolute path) while leaving the agent with an error it cannot
+// read. Enabling it is a legitimate hardening choice, so only the loosening
+// direction carries a note.
+func (st *setupState) applyWorkspaceRestrictionChange(enabled bool) error {
+	setup.SetWorkspaceRestricted(st.doc, enabled)
+	if !enabled {
+		fmt.Fprintln(st.out, "note: agents can now read, write, and run commands anywhere in the container; the container boundary is the only guard. Apply with: piccolo reload (or piccolo restart if reload fails)")
+	} else {
+		fmt.Fprintln(st.out, "note: with the path guard ON, PicoClaw refuses shell commands naming paths outside each agent workspace, and allow_read_outside_workspace does not relax that exec check. Apply with: piccolo reload (or piccolo restart if reload fails)")
+	}
+	return st.applyConfigAndAgentChanges(fmt.Sprintf("workspace path guard %s", yesNo(enabled)), nil)
 }
 
 func (st *setupState) applyConfigAndAgentChanges(what string, agentChanges []agentFileChange) error {
@@ -1199,8 +1648,16 @@ func (st *setupState) agentToolAllowlistChanges(configTool string, enabled bool)
 	if len(frontTools) == 0 {
 		return nil
 	}
+	coord := st.coordinatorMDPath()
 	var changes []agentFileChange
 	for _, path := range st.agentMDPaths() {
+		if path == coord {
+			// The coordinator declares no allowlist on purpose, so that every tool
+			// config.json enables — including the mcp_<server>_<tool> names no static
+			// list can predict — reaches it. Writing a name here would convert "no
+			// allowlist" into a strict one and silently revoke every integration tool.
+			continue
+		}
 		data, err := os.ReadFile(path)
 		if err != nil {
 			continue
@@ -1225,9 +1682,56 @@ func frontmatterToolsForConfigTool(configTool string) []string {
 		return []string{"subagent"}
 	case "load_image":
 		return []string{"load_image"}
+	case "mcp":
+		// No frontmatter name exists for MCP. The registry matches tool names
+		// exactly (pkg/tools/registry.go:182), and MCP tools are named
+		// mcp_<server>_<tool> at runtime, so writing "mcp" here would declare an
+		// allowlist that admits nothing. Enabling the toggle is the whole action.
+		return nil
 	default:
 		return nil
 	}
+}
+
+// coordinatorMDPath returns the AGENT.md of the default agent — the coordinator
+// Piccolo generates as `main` — or "" when no entry is marked default.
+func (st *setupState) coordinatorMDPath() string {
+	agents, ok := st.doc.GetObject("agents")
+	if !ok {
+		return ""
+	}
+	defaults, _ := agents.GetObject("defaults")
+	defaultWS := ""
+	if defaults != nil {
+		defaultWS, _ = defaults.GetString("workspace")
+	}
+	listRaw, ok := agents.Get("list")
+	if !ok {
+		return ""
+	}
+	list, ok := listRaw.([]configdoc.Value)
+	if !ok {
+		return ""
+	}
+	for _, item := range list {
+		ag, ok := item.(*configdoc.Doc)
+		if !ok {
+			continue
+		}
+		if isDefault, ok := ag.GetBool("default"); !ok || !isDefault {
+			continue
+		}
+		ws, _ := ag.GetString("workspace")
+		if ws == "" {
+			ws = defaultWS
+		}
+		host, ok := setupWorkspacePath(st.dir, ws)
+		if !ok {
+			return ""
+		}
+		return filepath.Join(host, "AGENT.md")
+	}
+	return ""
 }
 
 func (st *setupState) agentMDPaths() []string {
@@ -1366,6 +1870,11 @@ func updateAgentFrontmatterList(content string, lineRE *regexp.Regexp, key strin
 }
 
 // ---------- write path ----------
+
+// setNotice stages a message for the next screen's help line.
+func (st *setupState) setNotice(format string, args ...any) {
+	st.notice = fmt.Sprintf(format, args...)
+}
 
 func (st *setupState) applyManifestAndConfirm(what string) error {
 	confirm := true
