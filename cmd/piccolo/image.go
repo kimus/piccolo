@@ -43,7 +43,7 @@ func newImageCmd() *cobra.Command {
 		Short: "Build, list, and reclaim Piccolo runtime images",
 	}
 	cmd.AddCommand(newImageBuildCmd(), newImageListCmd(), newImagePruneCmd())
-	return cmd
+	return rejectUnknownArgs(cmd)
 }
 
 // refreshInstalledIdentity aligns the recorded integration metadata with the

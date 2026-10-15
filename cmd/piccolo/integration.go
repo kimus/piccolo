@@ -58,8 +58,28 @@ var newIntegrationRunner = func() integrationRunner { return docker.New() }
 
 func newIntegrationCmd() *cobra.Command {
 	cmd := &cobra.Command{Use: "integration", Short: "Install and set up containerized integrations"}
-	cmd.AddCommand(newIntegrationAddCmd(), newIntegrationListCmd(), newIntegrationSetupCmd(), newIntegrationUpgradeCmd(), newIntegrationStatusCmd(), newIntegrationRollbackCmd())
-	return cmd
+	cmd.AddCommand(newIntegrationAddCmd(), newIntegrationListCmd(), newIntegrationSetupCmd(), newIntegrationUpgradeCmd(), newIntegrationStatusCmd(), newIntegrationRollbackCmd(), newRetiredIntegrationBuildCmd())
+	return rejectUnknownArgs(cmd)
+}
+
+// newRetiredIntegrationBuildCmd keeps `integration build` failing loudly instead
+// of silently printing help with exit 0. The command went away with the
+// Devbox/Nix toolchain because it resolved a Nix flake reference, and muscle
+// memory plus a zero exit code in a script is the worst possible outcome.
+func newRetiredIntegrationBuildCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:    "build <package-ref>",
+		Short:  "Removed: source-built integrations are no longer supported",
+		Hidden: true,
+		Args:   cobra.ArbitraryArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			target := "<owner/repo>"
+			if len(args) > 0 {
+				target = args[0]
+			}
+			return fmt.Errorf("'piccolo integration build' has been removed: source builds resolved a Devbox/Nix flake reference, and the runtime image installs its toolchain with the base distribution's package manager. Install from a published release instead: 'piccolo integration add %s'", target)
+		},
+	}
 }
 
 func newIntegrationAddCmd() *cobra.Command {

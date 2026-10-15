@@ -20,7 +20,7 @@ func newRuntimeCmd() *cobra.Command {
 		Short: "Inspect the Piccolo runtime toolchain",
 	}
 	cmd.AddCommand(newRuntimeStatusCmd(), newRuntimeApplyCmd())
-	return cmd
+	return rejectUnknownArgs(cmd)
 }
 
 func newRuntimeStatusCmd() *cobra.Command {

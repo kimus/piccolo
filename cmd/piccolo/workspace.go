@@ -27,7 +27,7 @@ func newWorkspaceCmd() *cobra.Command {
 	}
 	migrate.Flags().BoolVar(&f.yes, "yes", false, "confirm file moves without prompting")
 	cmd.AddCommand(migrate)
-	return cmd
+	return rejectUnknownArgs(cmd)
 }
 
 func runWorkspaceMigrate(cmd *cobra.Command, f workspaceFlags) error {
