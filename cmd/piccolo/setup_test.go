@@ -82,9 +82,16 @@ func TestSyncEnabledToolWorkspaceChangesWritesNoWorkspacePackageConfig(t *testin
 	}
 	foundSkill := false
 	foundAgentMD := false
+	// The skill lives under picoclaw/ — PicoClaw's home. It once resolved to the
+	// workspace root, so "sync" wrote a copy nothing loads, left the real file
+	// stale, and still reported success.
+	wantSkill := filepath.Join(dir, "picoclaw", "skills", "file-handling", "SKILL.md")
 	for _, ch := range changes {
-		if ch.path == filepath.Join(dir, "skills", "file-handling", "SKILL.md") {
+		if ch.path == wantSkill {
 			foundSkill = true
+		}
+		if ch.path == filepath.Join(dir, "skills", "file-handling", "SKILL.md") {
+			t.Fatalf("sync must not write outside PicoClaw's home: %s", ch.path)
 		}
 		if ch.path == agentPath {
 			foundAgentMD = true
@@ -94,7 +101,7 @@ func TestSyncEnabledToolWorkspaceChangesWritesNoWorkspacePackageConfig(t *testin
 		}
 	}
 	if !foundSkill {
-		t.Fatalf("missing file-handling skill change: %+v", changes)
+		t.Fatalf("missing file-handling skill change at %s", wantSkill)
 	}
 	if !foundAgentMD {
 		t.Fatalf("missing AGENT.md allowlist change: %+v", changes)

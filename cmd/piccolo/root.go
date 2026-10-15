@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"github.com/kimus/piccolo/internal/generate"
 	"github.com/spf13/cobra"
 	"runtime"
 	"strings"
@@ -107,6 +108,10 @@ func editDistance(a, b string) int {
 }
 
 func newRootCmd() *cobra.Command {
+	// Stamp the generation package so a workspace record names the Piccolo that
+	// wrote it. Done here rather than in main() so the value is set for every
+	// construction of the command tree, including tests.
+	generate.SetVersion(version)
 	root := &cobra.Command{
 		Use:           "piccolo",
 		Short:         "Setup and launcher for PicoClaw multi-agent assistants",

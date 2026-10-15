@@ -29,12 +29,19 @@ const (
 // Layout centralizes host and container paths for a Piccolo workspace.
 type Layout struct{ Root string }
 
-func NewLayout(root string) Layout              { return Layout{Root: root} }
-func (l Layout) Manifest() string               { return filepath.Join(l.Root, ManifestName) }
-func (l Layout) PicoclawHome() string           { return filepath.Join(l.Root, PicoclawDir) }
-func (l Layout) Config() string                 { return filepath.Join(l.PicoclawHome(), ConfigName) }
-func (l Layout) PidFile() string                { return filepath.Join(l.PicoclawHome(), PidFileName) }
-func (l Layout) Agents() string                 { return filepath.Join(l.PicoclawHome(), "agents") }
+func NewLayout(root string) Layout    { return Layout{Root: root} }
+func (l Layout) Manifest() string     { return filepath.Join(l.Root, ManifestName) }
+func (l Layout) PicoclawHome() string { return filepath.Join(l.Root, PicoclawDir) }
+func (l Layout) Config() string       { return filepath.Join(l.PicoclawHome(), ConfigName) }
+func (l Layout) PidFile() string      { return filepath.Join(l.PicoclawHome(), PidFileName) }
+func (l Layout) Agents() string       { return filepath.Join(l.PicoclawHome(), "agents") }
+
+// Skills is the generated PicoClaw skill root inside PicoClaw's home. It is a
+// method rather than an inline join because the layout restructure moved skills
+// under picoclaw/, and one call site kept building the old path — which wrote a
+// skill copy nothing loads and left the real one stale, while still reporting
+// success.
+func (l Layout) Skills() string                 { return filepath.Join(l.PicoclawHome(), "skills") }
 func (l Layout) Integrations() string           { return filepath.Join(l.Root, IntegrationsDir) }
 func (l Layout) Integration(name string) string { return filepath.Join(l.Integrations(), name) }
 func (l Layout) Runtime() string                { return filepath.Join(l.Root, RuntimeDir) }

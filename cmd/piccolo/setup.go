@@ -24,6 +24,7 @@ import (
 	"github.com/kimus/piccolo/internal/setup"
 	"github.com/kimus/piccolo/internal/wizard"
 	"github.com/kimus/piccolo/internal/workspace"
+	workspacepkg "github.com/kimus/piccolo/internal/workspace"
 )
 
 func newSetupCmd() *cobra.Command {
@@ -1073,7 +1074,7 @@ func (st *setupState) syncEnabledToolWorkspaceChanges() ([]agentFileChange, erro
 			changes = append(changes, agentFileChange{path: path, content: []byte(content)})
 		}
 	}
-	skillPath := filepath.Join(st.dir, "skills", generate.FileHandlingSkillName, "SKILL.md")
+	skillPath := st.skillPath()
 	skillContent := []byte(generate.FileHandlingSkillMD())
 	if data, err := os.ReadFile(skillPath); err != nil || !bytes.Equal(data, skillContent) {
 		changes = append(changes, agentFileChange{path: skillPath, content: skillContent})
@@ -1149,6 +1150,15 @@ func (st *setupState) applyConfigAndAgentChanges(what string, agentChanges []age
 		if err := os.WriteFile(ch.path, ch.content, 0o644); err != nil {
 			return err
 		}
+		// Only content Piccolo RENDERED is worth a provenance entry. The agent
+		// allowlist edits are merges into the user's file, so recording them would
+		// label a user-customised file as pristine generation output — the one
+		// distinction this record exists to keep.
+		if rel, ok := st.renderedSkillRel(ch.path); ok {
+			if err := generate.RecordGenerated(st.dir, rel, generate.SourceFileHandlingSkill, ch.content); err != nil {
+				return err
+			}
+		}
 	}
 	st.write = true
 	fmt.Fprintf(st.out, "✓ wrote %s", what)
@@ -1157,6 +1167,27 @@ func (st *setupState) applyConfigAndAgentChanges(what string, agentChanges []age
 	}
 	fmt.Fprintln(st.out)
 	return nil
+}
+
+// skillPath is the one generated skill root Piccolo loads: PicoClaw's home, not
+// the workspace root. Deriving it here keeps the sync target and the provenance
+// match on the same rule.
+func (st *setupState) skillPath() string {
+	return filepath.Join(workspacepkg.NewLayout(st.dir).Skills(), generate.FileHandlingSkillName, "SKILL.md")
+}
+
+// renderedSkillRel reports whether an absolute path is the workspace's generated
+// file-handling skill, and returns its workspace-relative form.
+func (st *setupState) renderedSkillRel(path string) (string, bool) {
+	want := filepath.Join(workspacepkg.PicoclawDir, "skills", generate.FileHandlingSkillName, "SKILL.md")
+	got, err := filepath.Rel(st.dir, path)
+	if err != nil {
+		return "", false
+	}
+	if filepath.ToSlash(filepath.Clean(got)) == filepath.ToSlash(filepath.Clean(want)) {
+		return want, true
+	}
+	return "", false
 }
 
 func (st *setupState) applyAgentFileChanges(what string, agentChanges []agentFileChange) error {

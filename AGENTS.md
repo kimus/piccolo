@@ -158,6 +158,25 @@ The web console is optional and enabled solely by a `:18800` binding in `piccolo
 
 Generated once by `init`; user-owned afterwards.
 
+### A copy is an output — fix the source
+
+Every file in this section is rendered from `internal/generate/templates.go`. **Editing a workspace copy is not a fix**, in the repo or in a scratch workspace like `.data/`: it changes one output while the template still renders the old thing for everyone else, and no review or CI step sees an untracked scratch directory. The rule of thumb: a fix is real only when a fresh `piccolo init` produces it.
+
+| workspace copy | source to change |
+|---|---|
+| `picoclaw/skills/file-handling/SKILL.md` | `generate.FileHandlingSkillMD()`; its tool list comes from `runtimeimage.DefaultCommands` |
+| `picoclaw/agents/<id>/AGENT.md` | `generate.agentMD()` |
+| `picoclaw/agents/<id>/SOUL.md` | `generate.soulMD()` |
+| `picoclaw/agents/main/USER.md` | `generate.userMD()` |
+| `picoclaw/agents/main/memory/MEMORY.md` | `generate.memoryMD()` |
+
+Because the copies are user-owned and create-only, a template fix never reaches an existing workspace. Piccolo records what it wrote in `piccolo.provenance.json` (workspace root: digest + source template per generated file) so `piccolo doctor` can tell the two states apart and report them differently:
+
+- **customised** — the user's bytes. Reported as user-owned; Piccolo never suggests refreshing it, because that would advertise destroying their work.
+- **stale** — byte-identical to what Piccolo wrote, but the current template renders something else. WARNed, naming the template to fix and `piccolo setup` as the remedy. Never a `FAIL`.
+
+Currency is claimed only for templates that need no wizard answers (today: the file-handling skill). Agent files depend on inputs Piccolo does not retain, so doctor reports edited-or-not and stays silent about their currency rather than inferring it from a version string.
+
 ### Main agent (`agents/main`)
 
 `AGENT.md` frontmatter:

@@ -214,6 +214,11 @@ func runInit(cmd *cobra.Command, f initFlags) error {
 	} else if changed {
 		written = append(written, ".gitignore")
 	}
+	// Record what this run actually wrote, so a later 'piccolo doctor' can tell a
+	// hand-edited copy from an untouched one that predates a template fix.
+	if err := plan.RecordProvenance(dir, written); err != nil {
+		return err
+	}
 
 	for _, rel := range written {
 		fmt.Fprintf(stdout, "created %s\n", rel)

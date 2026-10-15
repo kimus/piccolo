@@ -2,7 +2,10 @@ package generate
 
 import (
 	"fmt"
+	"sort"
 	"strings"
+
+	"github.com/kimus/piccolo/internal/runtimeimage"
 )
 
 // agentFile is one rendered agent workspace file, in deterministic order.
@@ -153,6 +156,28 @@ live in memory/MEMORY.md inside your workspace, managed by PicoClaw.
 		name, desc, strings.Join(tools, ", "), FileHandlingSkillName, body)
 }
 
+// FileHandlingToolNames is the tool list the file-handling skill advertises: the
+// runtime image's own configured command list, never a hand-maintained copy of
+// it. Skill prose once drifted from what the image installed, and both directions
+// of that drift are silent — a listed tool that is absent sends the agent to a
+// command that cannot run, while an installed tool that is unlisted stays
+// invisible to it. Sorted for a byte-stable render.
+func FileHandlingToolNames() []string {
+	out := append([]string(nil), runtimeimage.DefaultCommands...)
+	sort.Strings(out)
+	return out
+}
+
+// toolListMarkdown renders the advertised tools as inline code items.
+func toolListMarkdown() string {
+	names := FileHandlingToolNames()
+	quoted := make([]string, 0, len(names))
+	for _, name := range names {
+		quoted = append(quoted, "`"+name+"`")
+	}
+	return strings.Join(quoted, ", ")
+}
+
 // FileHandlingSkillName is the generated PicoClaw skill that teaches agents how
 // to perform exact extraction/decoding/parsing for common file types.
 const FileHandlingSkillName = "file-handling"
@@ -174,7 +199,7 @@ Use this skill when the user asks to read, decode, extract, parse, inspect, or i
 - Use image understanding for visual descriptions.
 - Use deterministic tools for exact payloads, URLs, identifiers, numbers, tables, metadata, or structured data.
 - Do not guess exact hidden or machine-readable contents from vision alone.
-- In the Piccolo runtime image, the file-handling tools are baked in and available directly on PATH from any working directory: ` + "`zbarimg`" + `, ` + "`file`" + `, ` + "`identify`" + `, ` + "`magick`" + `, ` + "`convert`" + `, ` + "`python3`" + `, ` + "`pdftotext`" + `, ` + "`pdfinfo`" + `, ` + "`pdftoppm`" + `, ` + "`pdftocairo`" + `, ` + "`tesseract`" + `, ` + "`soffice`" + `, ` + "`libreoffice`" + `, ` + "`pandoc`" + `, ` + "`jq`" + `, ` + "`yq`" + `, ` + "`xmllint`" + `, ` + "`exiftool`" + `, ` + "`ffprobe`" + `, ` + "`ffmpeg`" + `, ` + "`sqlite3`" + `, ` + "`unzip`" + `, ` + "`7z`" + `. Call them directly with relative or absolute paths; they behave like ordinary commands.
+- In the Piccolo runtime image, the file-handling tools are baked in and available directly on PATH from any working directory: ` + toolListMarkdown() + `. Call them directly with relative or absolute paths; they behave like ordinary commands.
 - Do not use ` + "`apt-get`" + ` (the base image is Alpine) and do not guess exact contents from vision.
 - Prefer the deterministic CLI tools above over Python image libraries. Do not import ` + "`cv2`" + ` for QR/barcode/OCR/image normalization unless the user explicitly asks for OpenCV-style processing or the simpler tools fail.
 - If a tool is unexpectedly missing, the runtime image was built without it: say so in your answer instead of trying to install anything. Do not run any package manager (apk, apt-get, nix-env) and do not install tooling at runtime: the container's toolchain is fixed by the image build, so adding a tool is a host-side 'piccolo image build' with the package listed in runtime.toolchain.packages, followed by a restart.
