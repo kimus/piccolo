@@ -8,7 +8,7 @@ Piccolo SHALL include file and image interpretation guidance as a generated Pico
 
 #### Scenario: New workspace contains skill
 - **WHEN** `piccolo init` generates a workspace
-- **THEN** the workspace contains `skills/file-handling/SKILL.md`
+- **THEN** the workspace contains `picoclaw/skills/file-handling/SKILL.md`, inside PicoClaw's home
 - **AND** generated agent `AGENT.md` frontmatter includes `skills: [file-handling]`
 - **AND** the skill guidance distinguishes visual understanding from exact extraction
 
