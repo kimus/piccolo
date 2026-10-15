@@ -192,7 +192,7 @@ The PicoClaw gateway always runs; the **web console** is an optional add-on. It 
 
 - Create-only: existing files are never overwritten without explicit per-file confirmation.
 - Non-interactive flags (`--name`, `--owner`, `--purpose`, `--yes`, ...) are supported for scripting.
-- Ensures `config.json` is git-ignored.
+- Ensures `config.json`, PicoClaw runtime files, integration auth state, runtime caches, and OS metadata such as `.DS_Store` are git-ignored (missing lines are appended; existing lines, including yours, are never rewritten).
 
 
 ### `piccolo integration`

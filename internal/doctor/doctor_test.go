@@ -98,6 +98,11 @@ func initWorkspace(t *testing.T) string {
 	if err := os.MkdirAll(filepath.Join(dir, "integrations"), 0o755); err != nil {
 		t.Fatal(err)
 	}
+	// Real init writes the ignore file; a fixture that skips it would make every
+	// workspace look half-generated to doctor.
+	if _, err := generate.EnsureGitignore(dir); err != nil {
+		t.Fatal(err)
+	}
 	for _, rel := range []string{filepath.Join("runtime", "devbox"), filepath.Join("runtime", "nix"), filepath.Join("runtime", "media")} {
 		if err := os.MkdirAll(filepath.Join(dir, rel), 0o755); err != nil {
 			t.Fatal(err)

@@ -352,10 +352,15 @@ func (p *Plan) Write(dir string, overwrite map[string]bool) (written, skipped []
 
 // EnsureGitignore creates or appends to dir/.gitignore so sensitive and
 // runtime files (config.json holds API keys; .picoclaw.pid holds the gateway
-// reload token) are never committed. It reports whether a change was made.
+// reload token) and OS directory metadata are never committed. It reports
+// whether a change was made.
+//
+// Callers that write generated content OUTSIDE init (a workspace heal, a future
+// migration) must call this too: it is the only writer of the file, and it is
+// append-only for missing entries, so a curated .gitignore is never rewritten.
 func EnsureGitignore(dir string) (bool, error) {
 	path := filepath.Join(dir, ".gitignore")
-	entries := []string{"picoclaw/config.json", "picoclaw/.security.yml", "picoclaw/.picoclaw.pid", "picoclaw/launcher-auth.db", "picoclaw/logs/", "integrations/*/auth/", "runtime/"}
+	entries := []string{"picoclaw/config.json", "picoclaw/.security.yml", "picoclaw/.picoclaw.pid", "picoclaw/launcher-auth.db", "picoclaw/logs/", "integrations/*/auth/", "runtime/", GitignoreOSMetadata}
 	data, err := os.ReadFile(path)
 	if err != nil && !os.IsNotExist(err) {
 		return false, err
@@ -383,4 +388,37 @@ func EnsureGitignore(dir string) (bool, error) {
 		return false, err
 	}
 	return true, nil
+}
+
+// GitignoreOSMetadata is the ignore rule for Finder/Explorer directory
+// databases. It is a bare pattern (no slash) so one entry covers every depth,
+// which is exactly how this repository shipped: two .DS_Store files were
+// tracked with no rule, and any `git add -A` in a macOS workspace commits
+// directory metadata alongside the user's agent files.
+const GitignoreOSMetadata = ".DS_Store"
+
+// MissingGitignoreEntries reports required entries a workspace's .gitignore does
+// not carry. It exists because EnsureGitignore runs only during init: a workspace
+// created before an entry was required never gains it, and without a read-only
+// check that gap is invisible rather than merely unfixed.
+func MissingGitignoreEntries(dir string) ([]string, error) {
+	data, err := os.ReadFile(filepath.Join(dir, ".gitignore"))
+	if err != nil && !os.IsNotExist(err) {
+		return nil, err
+	}
+	present := map[string]bool{}
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		present[line] = true
+	}
+	var missing []string
+	for _, entry := range []string{"picoclaw/config.json", "picoclaw/logs/", "integrations/*/auth/", "runtime/", GitignoreOSMetadata} {
+		if !present[entry] {
+			missing = append(missing, entry)
+		}
+	}
+	return missing, nil
 }

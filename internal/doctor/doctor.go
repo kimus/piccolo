@@ -147,6 +147,7 @@ func Run(ctx context.Context, opts Options) []Result {
 	}
 
 	results = append(results, checkGeneratedProvenance(opts.Workspace)...)
+	results = append(results, checkGitignoreHygiene(opts.Workspace)...)
 
 	// 3. Image presence (warning only).
 	imagePresent := true
@@ -410,6 +411,27 @@ func orUnknownVersion(v string) string {
 		return "an unstamped build"
 	}
 	return "piccolo " + v
+}
+
+// checkGitignoreHygiene reports required .gitignore entries the workspace does
+// not carry. Read-only by design: EnsureGitignore only runs during init, so a
+// workspace created before an entry was required never gains it, and the normal
+// way that surfaces is the junk appearing in the user's own git status — after
+// it is already tracked, at which point ignoring it does not untrack it.
+func checkGitignoreHygiene(dir string) []Result {
+	var results []Result
+	missing, err := generate.MissingGitignoreEntries(dir)
+	if err != nil {
+		return append(results, Result{Status: WARN, Message: fmt.Sprintf("workspace .gitignore: unreadable: %v", err)})
+	}
+	if len(missing) == 0 {
+		return append(results, Result{Status: OK, Message: "workspace .gitignore: secrets, caches, and OS metadata ignored"})
+	}
+	quoted := make([]string, 0, len(missing))
+	for _, entry := range missing {
+		quoted = append(quoted, fmt.Sprintf("%q", entry))
+	}
+	return append(results, Result{Status: WARN, Message: fmt.Sprintf("workspace .gitignore is missing %s — run 'piccolo init' here (it appends missing entries and never overwrites your files) or add them by hand", strings.Join(quoted, ", "))})
 }
 
 func checkRuntimeToolchain(m *manifest.Manifest) []Result {

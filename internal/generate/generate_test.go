@@ -364,7 +364,7 @@ func TestEnsureGitignore(t *testing.T) {
 		t.Fatalf("create: changed=%v err=%v", changed, err)
 	}
 	data, _ := os.ReadFile(filepath.Join(dir, ".gitignore"))
-	if strings.TrimSpace(string(data)) != "picoclaw/config.json\npicoclaw/.security.yml\npicoclaw/.picoclaw.pid\npicoclaw/launcher-auth.db\npicoclaw/logs/\nintegrations/*/auth/\nruntime/" {
+	if strings.TrimSpace(string(data)) != "picoclaw/config.json\npicoclaw/.security.yml\npicoclaw/.picoclaw.pid\npicoclaw/launcher-auth.db\npicoclaw/logs/\nintegrations/*/auth/\nruntime/\n.DS_Store" {
 		t.Fatalf("gitignore = %q", data)
 	}
 
@@ -381,7 +381,7 @@ func TestEnsureGitignore(t *testing.T) {
 		t.Fatalf("append: changed=%v err=%v", changed, err)
 	}
 	data, _ = os.ReadFile(filepath.Join(dir2, ".gitignore"))
-	if string(data) != "*.log\npicoclaw/config.json\npicoclaw/.security.yml\npicoclaw/.picoclaw.pid\npicoclaw/launcher-auth.db\npicoclaw/logs/\nintegrations/*/auth/\nruntime/\n" {
+	if string(data) != "*.log\npicoclaw/config.json\npicoclaw/.security.yml\npicoclaw/.picoclaw.pid\npicoclaw/launcher-auth.db\npicoclaw/logs/\nintegrations/*/auth/\nruntime/\n.DS_Store\n" {
 		t.Fatalf("appended gitignore = %q", data)
 	}
 
@@ -392,8 +392,84 @@ func TestEnsureGitignore(t *testing.T) {
 		t.Fatalf("partial append: changed=%v err=%v", changed, err)
 	}
 	data, _ = os.ReadFile(filepath.Join(dir2, ".gitignore"))
-	if string(data) != "picoclaw/config.json\npicoclaw/.security.yml\npicoclaw/.picoclaw.pid\npicoclaw/launcher-auth.db\npicoclaw/logs/\nintegrations/*/auth/\nruntime/\n" {
+	if string(data) != "picoclaw/config.json\npicoclaw/.security.yml\npicoclaw/.picoclaw.pid\npicoclaw/launcher-auth.db\npicoclaw/logs/\nintegrations/*/auth/\nruntime/\n.DS_Store\n" {
 		t.Fatalf("partial appended gitignore = %q", data)
+	}
+}
+
+// A workspace created before .DS_Store was a required entry keeps the hole, and
+// re-running init is the documented remedy only if the missing line is appended
+// without touching anything else. Both halves are asserted: an existing rule is
+// left alone, and a user's own entry survives.
+func TestEnsureGitignoreHealsOSMetadataWithoutRewriting(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, ".gitignore"), []byte("picoclaw/config.json\npicoclaw/logs/\nintegrations/*/auth/\nruntime/\n/my-own-rule\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	changed, err := EnsureGitignore(dir)
+	if err != nil || !changed {
+		t.Fatalf("heal must report a change: changed=%v err=%v", changed, err)
+	}
+	data, _ := os.ReadFile(filepath.Join(dir, ".gitignore"))
+	for _, want := range []string{".DS_Store", "/my-own-rule"} {
+		if !strings.Contains(string(data), want) {
+			t.Errorf("missing %q in %q", want, data)
+		}
+	}
+	if strings.Count(string(data), ".DS_Store") != 1 {
+		t.Errorf("heal is not idempotent: %q", data)
+	}
+	if _, err := EnsureGitignore(dir); err != nil {
+		t.Fatal(err)
+	}
+	again, _ := os.ReadFile(filepath.Join(dir, ".gitignore"))
+	if string(again) != string(data) {
+		t.Errorf("second heal changed the file:\n%q\n%q", data, again)
+	}
+}
+
+func TestMissingGitignoreEntries(t *testing.T) {
+	dir := t.TempDir()
+	missing, err := MissingGitignoreEntries(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(missing) == 0 {
+		t.Fatal("an absent .gitignore must report missing entries, not 'all good'")
+	}
+
+	if _, err := EnsureGitignore(dir); err != nil {
+		t.Fatal(err)
+	}
+	if missing, err := MissingGitignoreEntries(dir); err != nil || len(missing) != 0 {
+		t.Fatalf("fully generated workspace should report nothing missing: %v (%v)", missing, err)
+	}
+
+	// Drop the OS rule and confirm it is the one named.
+	data, _ := os.ReadFile(filepath.Join(dir, ".gitignore"))
+	kept := []string{}
+	for _, line := range strings.Split(string(data), "\n") {
+		if strings.TrimSpace(line) != GitignoreOSMetadata {
+			kept = append(kept, line)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(dir, ".gitignore"), []byte(strings.Join(kept, "\n")), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	missing, err = MissingGitignoreEntries(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(missing) != 1 || missing[0] != GitignoreOSMetadata {
+		t.Fatalf("missing = %v, want just %q", missing, GitignoreOSMetadata)
+	}
+
+	// A commented line is not a rule.
+	if err := os.WriteFile(filepath.Join(dir, ".gitignore"), []byte("# .DS_Store\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if missing, err := MissingGitignoreEntries(dir); err != nil || len(missing) == 0 {
+		t.Fatalf("a comment must not count as an ignore rule: %v (%v)", missing, err)
 	}
 }
 

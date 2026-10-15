@@ -179,3 +179,76 @@ func TestDoctorRunIncludesProvenanceCheck(t *testing.T) {
 		t.Errorf("recorded workspace must not fail doctor: %+v", results)
 	}
 }
+
+// The hole this closes: EnsureGitignore runs only during init, so a workspace
+// predating a required entry keeps it missing, and the first sign is usually the
+// junk already committed. One line, because a legacy workspace can lack several.
+func TestGitignoreHygieneReportsMissingEntries(t *testing.T) {
+	dir := t.TempDir()
+	if _, err := generate.EnsureGitignore(dir); err != nil {
+		t.Fatal(err)
+	}
+	results := checkGitignoreHygiene(dir)
+	if len(results) != 1 || results[0].Status != OK {
+		t.Fatalf("complete ignore file should be one OK, got %+v", results)
+	}
+
+	data, err := os.ReadFile(filepath.Join(dir, ".gitignore"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var kept []string
+	for _, line := range strings.Split(string(data), "\n") {
+		if strings.TrimSpace(line) != generate.GitignoreOSMetadata {
+			kept = append(kept, line)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(dir, ".gitignore"), []byte(strings.Join(kept, "\n")), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	results = checkGitignoreHygiene(dir)
+	warn := find(results, ".gitignore is missing")
+	if warn == nil {
+		t.Fatalf("missing entry must be reported: %+v", results)
+	}
+	if warn.Status != WARN || Failed(results) {
+		t.Errorf("a missing ignore rule is a warning, never a failure: %+v", *warn)
+	}
+	if !strings.Contains(warn.Message, generate.GitignoreOSMetadata) {
+		t.Errorf("report must name the rule: %q", warn.Message)
+	}
+	if !strings.Contains(warn.Message, "piccolo init") {
+		t.Errorf("report must name the remedy: %q", warn.Message)
+	}
+	if len(results) != 1 {
+		t.Errorf("several missing rules must collapse to one line, got %d", len(results))
+	}
+}
+
+// Calling the check directly proves nothing about the report a user sees. This
+// goes through Run, so deleting the wiring fails the suite.
+func TestDoctorRunIncludesGitignoreCheck(t *testing.T) {
+	dir := initWorkspace(t)
+	results := Run(context.Background(), Options{
+		Workspace: dir,
+		Engine:    fakeEngine{imageExists: true},
+		LookupEnv: func(string) (string, bool) { return "", false },
+	})
+	if find(results, "workspace .gitignore") == nil {
+		t.Errorf("doctor must report the ignore-file check: %+v", results)
+	}
+	if err := os.WriteFile(filepath.Join(dir, ".gitignore"), []byte("picoclaw/config.json\npicoclaw/logs/\nintegrations/*/auth/\nruntime/\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	results = Run(context.Background(), Options{
+		Workspace: dir,
+		Engine:    fakeEngine{imageExists: true},
+		LookupEnv: func(string) (string, bool) { return "", false },
+	})
+	r := find(results, "workspace .gitignore is missing")
+	if r == nil {
+		t.Errorf("Run must surface the missing OS-metadata rule: %+v", results)
+	} else if !strings.Contains(r.Message, generate.GitignoreOSMetadata) {
+		t.Errorf("Run report must name the rule: %q", r.Message)
+	}
+}
