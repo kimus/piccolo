@@ -8,8 +8,51 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/kimus/piccolo/internal/credential"
+	"github.com/kimus/piccolo/internal/generate"
 	"github.com/kimus/piccolo/internal/picoclaw"
+	"github.com/kimus/piccolo/internal/workspace"
 )
+
+// initEncryptedWorkspace produces the same state `piccolo init --encrypt-keys`
+// leaves behind — key file, ciphertext in config.json, recorded route — built
+// through the generators rather than by hand, so a fixture cannot drift from what
+// init actually writes.
+func initEncryptedWorkspace(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	in := generate.Inputs{
+		AssistantName: "Piccolo", OwnerName: "Kimus", Purpose: "personal",
+		Model:         generate.ModelInput{Alias: "gpt-5.4", Provider: "openai", Model: "gpt-4o", APIKey: "sk-real-key"},
+		WebSearch:     true,
+		EncryptKeys:   true,
+		PassphraseEnv: "PICCOLO_KEY_PASSPHRASE",
+	}
+	// Encryption at render time needs a key, which init generates after the plan is
+	// confirmed; do the same here so config.json carries a real ciphertext.
+	layout := workspace.NewLayout(dir)
+	if err := layout.EnsureDirs(); err != nil {
+		t.Fatal(err)
+	}
+	keyPath, err := credential.Generate(layout.Keys())
+	if err != nil {
+		t.Fatal(err)
+	}
+	in.Encrypt = func(plain string) (string, error) {
+		return credential.Encrypt("fixture-passphrase", keyPath, plain)
+	}
+	plan, err := generate.BuildPlan(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := plan.Write(dir, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := generate.EnsureGitignore(dir); err != nil {
+		t.Fatal(err)
+	}
+	return dir
+}
 
 // sidecar writes picoclaw/.security.yml next into a workspace.
 func writeSidecar(t *testing.T, dir, body string) {
@@ -463,6 +506,101 @@ func TestDoctorChecksSecondaryChannelSecrets(t *testing.T) {
 		}
 		if !strings.Contains(r.Message, fmt.Sprintf("%q", field)) {
 			t.Errorf("field %q: warning does not name the field: %s", field, r.Message)
+		}
+	}
+}
+
+// A workspace whose key was deleted after encryption looks identical to a healthy
+// one from config.json, and fails at boot with an error saying "cannot read SSH
+// key". doctor and status are where a user looks when the gateway misbehaves.
+func TestDoctorReportsCredentialDeliveryState(t *testing.T) {
+	lookupSet := func(string) (string, bool) { return "something", true }
+	lookupUnset := func(string) (string, bool) { return "", false }
+
+	// Healthy encrypted workspace.
+	dir := initEncryptedWorkspace(t)
+	results := Run(context.Background(), Options{Workspace: dir, Engine: fakeEngine{imageExists: true}, LookupEnv: lookupSet})
+	if r := find(results, "credential encryption"); r == nil || r.Status != OK {
+		t.Fatalf("healthy encrypted workspace not reported OK: %v", results)
+	}
+	if r := find(results, "placeholder or empty API key"); r != nil {
+		t.Errorf("the enc:// value was judged an empty key: %s", r.Message)
+	}
+
+	// Variable unset.
+	results = Run(context.Background(), Options{Workspace: dir, Engine: fakeEngine{imageExists: true}, LookupEnv: lookupUnset})
+	r := find(results, "is unset")
+	if r == nil || r.Status != WARN {
+		t.Fatalf("unset passphrase not warned: %v", results)
+	}
+	if !strings.Contains(r.Message, "PICCOLO_KEY_PASSPHRASE") {
+		t.Errorf("warning must name the variable: %s", r.Message)
+	}
+	// Never phrase it as a broken config file: that sends the user to the wrong
+	// file, which is the misdirection this check exists to remove.
+	if strings.Contains(r.Message, "does not parse") || strings.Contains(r.Message, "malformed") {
+		t.Errorf("misattributed to config.json: %s", r.Message)
+	}
+	if Failed(results) {
+		t.Error("an unset passphrase must warn, not fail: it is supplied by whoever runs serve")
+	}
+
+	// Key file removed.
+	if err := os.RemoveAll(filepath.Join(dir, "picoclaw", "keys")); err != nil {
+		t.Fatal(err)
+	}
+	results = Run(context.Background(), Options{Workspace: dir, Engine: fakeEngine{imageExists: true}, LookupEnv: lookupSet})
+	r = find(results, "key file")
+	if r == nil || r.Status != WARN {
+		t.Fatalf("missing key file not warned: %v", results)
+	}
+	if !strings.Contains(r.Message, "derives its AES key") {
+		t.Errorf("warning should explain why the file matters: %s", r.Message)
+	}
+}
+
+// A plaintext workspace gets no credential-encryption finding at all. Warning on
+// every non-opted-in workspace is how warnings get ignored everywhere.
+func TestDoctorSilentOnUnencryptedWorkspace(t *testing.T) {
+	dir := initWorkspace(t)
+	results := Run(context.Background(), Options{Workspace: dir, Engine: fakeEngine{imageExists: true}, LookupEnv: func(string) (string, bool) { return "", false }})
+	if r := find(results, "credential encryption"); r != nil {
+		t.Errorf("plaintext workspace got an encryption finding: %s", r.Message)
+	}
+	if r := find(results, "enc://"); r != nil {
+		t.Errorf("plaintext workspace was warned about enc://: %s", r.Message)
+	}
+}
+
+// Task 6.3: no doctor line may carry a credential, in either form. Run over every
+// state an encrypted workspace can be in and assert on the whole output, since a
+// leaked value in one branch among many is exactly what a per-line test misses.
+func TestDoctorNeverPrintsCredentialValues(t *testing.T) {
+	dir := initEncryptedWorkspace(t)
+	secret := "sk-MUST-NOT-APPEAR"
+	// Put a plaintext credential in too, so both forms are present at once.
+	patchConfig(t, dir, func(cfg map[string]any) {
+		cfg["channel_list"] = map[string]any{
+			"discord": map[string]any{
+				"enabled": true, "type": "discord",
+				"allow_from": []any{"1"},
+				"settings":   map[string]any{"token": secret},
+			},
+		}
+	})
+	writeSidecar(t, dir, "model_list:\n  gpt-5.4:0:\n    api_keys:\n      - sk-SIDECAR-SECRET\n")
+
+	for name, lookup := range map[string]func(string) (string, bool){
+		"passphrase set":   func(string) (string, bool) { return "pw", true },
+		"passphrase unset": func(string) (string, bool) { return "", false },
+	} {
+		results := Run(context.Background(), Options{Workspace: dir, Engine: fakeEngine{imageExists: true}, LookupEnv: lookup})
+		for _, r := range results {
+			for _, forbidden := range []string{secret, "sk-SIDECAR-SECRET", "pw"} {
+				if strings.Contains(r.Message, forbidden) {
+					t.Errorf("%s: output leaked %q: %s", name, forbidden, r.Message)
+				}
+			}
 		}
 	}
 }

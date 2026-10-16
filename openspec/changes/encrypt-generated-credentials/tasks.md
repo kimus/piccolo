@@ -42,10 +42,10 @@
 
 ## 6. Reporting
 
-- [ ] 6.1 Add a doctor check beside the secret-sidecar check: no `enc://` → silent `[OK]`; resolvable → `[OK]` naming the host variable; unset variable, missing key file → `[WARN]` naming what is missing
-- [ ] 6.2 Phrase every encrypted-workspace message so the missing thing is named as the variable or key file, never as a malformed `config.json`
-- [ ] 6.3 Verify doctor never prints a credential value in either form, plaintext or `enc://`, in every new line
-- [ ] 6.4 Add doctor and `status` coverage for a workspace whose key file was deleted after encryption
+- [x] 6.1 Added beside the sidecar check. Warning, not failure, on purpose: the passphrase is exported by whoever runs serve and Piccolo never stores it, so failing would turn every `doctor` in a fresh shell into a red board. Missing key file is also a warning here and fatal at serve. A plaintext workspace gets no finding at all
+- [x] 6.2 Phrase every encrypted-workspace message so the missing thing is named as the variable or key file, never as a malformed `config.json`
+- [x] 6.3 `TestDoctorNeverPrintsCredentialValues` sweeps every result line across both delivery states with a plaintext secret, a sidecar secret, and the passphrase present; verified it fails when a value is deliberately leaked into the `[OK]` message
+- [x] 6.4 Add doctor and `status` coverage for a workspace whose key file was deleted after encryption
 
 ## 7. Documentation and verification
 

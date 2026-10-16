@@ -15,6 +15,8 @@ import (
 
 	"gopkg.in/yaml.v3"
 
+	"github.com/kimus/piccolo/internal/configdoc"
+	"github.com/kimus/piccolo/internal/credential"
 	"github.com/kimus/piccolo/internal/docker"
 	"github.com/kimus/piccolo/internal/generate"
 	"github.com/kimus/piccolo/internal/manifest"
@@ -261,6 +263,13 @@ func Run(ctx context.Context, opts Options) []Result {
 	} else if secrets.Present {
 		add(OK, "secret sidecar: picoclaw/.security.yml (secure fields here override config.json)")
 	}
+
+	// 6c. Credential encryption. An enc:// value is only as good as the two things
+	// that unlock it, and both are checked before the gateway ever starts: a
+	// passphrase that reaches the container, and the exact key file whose bytes feed
+	// the derivation. Neither failure is visible from config.json, and both end the
+	// same way — the gateway exits on a config error that names config.json.
+	results = append(results, checkCredentialEncryption(opts.Workspace, configPath, data, m, lookup)...)
 
 	// 7. Agents.
 	results = append(results, checkAgents(opts.Workspace, cfg)...)
@@ -1233,4 +1242,83 @@ func checkRunningImage(ctx context.Context, engine Engine, m *manifest.Manifest)
 		verb = "was created from"
 	}
 	return []Result{{Status: WARN, Message: fmt.Sprintf("container %q %s image %q, but piccolo.yaml names %q — the running gateway holds the OLD integration binaries while config.json is re-read immediately; run 'piccolo restart' before enabling anything the new image provides", m.Container.Name, verb, state.Image, m.Container.Image)}}
+}
+
+// checkCredentialEncryption reports whether an encrypted workspace can actually be
+// decrypted by the gateway it will start.
+//
+// Warnings, never failures: unlike an unparseable sidecar, an undeliverable
+// passphrase is a state the user is entitled to be in between commands (the
+// variable is exported by whoever runs serve, not stored by Piccolo), and making it
+// a FAIL would turn every daemon-free `doctor` run in a fresh shell into a red
+// board. `serve` is where it becomes fatal, and that guard already exists.
+func checkCredentialEncryption(workspaceDir, configPath string, configData []byte, m *manifest.Manifest, lookup func(string) (string, bool)) []Result {
+	var results []Result
+	add := func(s Status, format string, args ...any) {
+		results = append(results, Result{Status: s, Message: fmt.Sprintf(format, args...)})
+	}
+
+	n := countEncryptedValues(configData)
+	if n == 0 {
+		// Silent by design: a plaintext workspace is a valid one, and warning on
+		// every workspace that never opted in would train users to ignore the
+		// findings that matter.
+		return results
+	}
+	envVar := strings.TrimSpace(m.PassphraseVar())
+	if envVar == "" {
+		add(WARN, "config.json holds %d enc:// credential(s) but piccolo.yaml names no secrets.passphrase_env — serve cannot deliver the passphrase and the gateway will not start", n)
+		return results
+	}
+	v, found := lookup(envVar)
+	if !found || strings.TrimSpace(v) == "" {
+		add(WARN, "config.json holds %d enc:// credential(s) and host variable %s is unset — export it before 'piccolo serve', which will otherwise refuse to start", n, envVar)
+		// The key file is still worth reporting on this branch: two missing things
+		// is a different remedy list than one.
+	}
+	if _, err := os.Stat(filepath.Join(workspaceDir, workspace.PicoclawDir, workspace.KeysDirName, workspace.KeyFileName)); err != nil {
+		add(WARN, "config.json holds %d enc:// credential(s) but the key file %s is missing or unreadable — PicoClaw derives its AES key from that file's bytes, so no credential can be decrypted without it", n, workspace.KeysDirName+"/"+workspace.KeyFileName)
+		return results
+	}
+	if found && strings.TrimSpace(v) != "" {
+		add(OK, "credential encryption: %d enc:// value(s), passphrase from %s, key present", n, envVar)
+		return results
+	}
+	return results
+}
+
+// countEncryptedValues counts enc:// values across the whole document, not the
+// typed config: channel_list is user-owned and absent from picoclaw.Config, and a
+// channel token is exactly as undecryptable as a model key.
+func countEncryptedValues(configData []byte) int {
+	doc, err := configdoc.Parse(configData)
+	if err != nil {
+		return 0
+	}
+	n := 0
+	var walk func(any)
+	walk = func(v any) {
+		switch t := v.(type) {
+		case string:
+			if credential.IsEncrypted(t) {
+				n++
+			}
+		case []configdoc.Value:
+			for _, e := range t {
+				walk(e)
+			}
+		case *configdoc.Doc:
+			for _, k := range t.Keys() {
+				if child, ok := t.Get(k); ok {
+					walk(child)
+				}
+			}
+		}
+	}
+	for _, k := range doc.Keys() {
+		if v, ok := doc.Get(k); ok {
+			walk(v)
+		}
+	}
+	return n
 }

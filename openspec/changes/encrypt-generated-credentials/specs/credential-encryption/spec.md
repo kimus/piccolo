@@ -131,3 +131,28 @@ PicoClaw needs the passphrase AND the exact key file whose bytes feed its deriva
 #### Scenario: The key is not left to PicoClaw's search
 - **WHEN** credential environment is composed
 - **THEN** the key path is given explicitly, because PicoClaw's default location is `~/.ssh`, which inside the container is image content that does not survive a recreate
+
+### Requirement: Reporting states the missing input, not a broken config file
+Doctor and status SHALL report an encrypted workspace's delivery state, and every message SHALL name the missing host variable or key file rather than describing `config.json` as malformed. Neither SHALL print a credential value in either form.
+
+#### Scenario: Healthy encrypted workspace
+- **WHEN** `config.json` holds `enc://` values, the named host variable resolves, and the key file is readable
+- **THEN** doctor reports an `[OK]` line naming the variable the passphrase comes from
+- **AND** does not report the ciphertext as a placeholder or empty key
+
+#### Scenario: Passphrase variable unset
+- **WHEN** the named host variable is unset or empty
+- **THEN** doctor warns and names the variable, as a warning and never a failure
+- **AND** `piccolo status` shows the same gap, because the symptom a user notices is chat failing rather than an image or config error
+
+#### Scenario: Key file gone after encryption
+- **WHEN** the workspace key file has been deleted or is unreadable
+- **THEN** doctor warns that no credential can be decrypted, and explains the file feeds the key derivation
+
+#### Scenario: A plaintext workspace says nothing
+- **WHEN** `config.json` holds no `enc://` value
+- **THEN** neither doctor nor status reports a credential-encryption finding
+
+#### Scenario: Values stay out of output
+- **WHEN** any credential-encryption line is produced, in any state
+- **THEN** no plaintext token, `enc://` payload, or passphrase appears in the message

@@ -106,6 +106,15 @@ func newStatusCmd() *cobra.Command {
 				if m.Container.PreviousImage != "" {
 					fmt.Fprintf(out, "rollback:  %s (piccolo integration rollback)\n", m.Container.PreviousImage)
 				}
+				// A passphrase the running container never received is a gateway that
+				// could not decrypt its own config, and the symptom is chat failing, not
+				// an image error — same reasoning as the stale line above. Only reported
+				// when the workspace is encrypted at all.
+				if m.PassphraseVar() != "" {
+					if v, found := os.LookupEnv(m.PassphraseVar()); !found || v == "" {
+						fmt.Fprintf(out, "encrypt:   host variable %s is unset — a gateway started now would refuse to boot on this workspace's enc:// credentials\n", m.PassphraseVar())
+					}
+				}
 			}
 			return nil
 		},
