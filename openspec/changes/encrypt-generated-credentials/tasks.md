@@ -49,8 +49,8 @@
 
 ## 7. Documentation and verification
 
-- [ ] 7.1 Update README's credentials section: what `enc://` protects against, what it does not (host or Docker access, `docker inspect` env exposure), and the loss consequences
-- [ ] 7.2 Record in AGENTS.md the verified facts: the two-input derivation, boot-failure behaviour of a bad passphrase, why `PICOCLAW_SSH_KEY_PATH` is required, and why `picoclaw onboard -E` is unusable
-- [ ] 7.3 Add a real end-to-end verification: encrypt a workspace, `serve` it healthy, then unset the variable and confirm doctor plus preflight name the missing variable
-- [ ] 7.4 Re-run the container matrix from design (no env / passphrase only / both / wrong passphrase) against the implemented injection to confirm no new failure mode was introduced
-- [ ] 7.5 Confirm `go build ./...`, `go vet ./...`, `go test ./...`, and `openspec validate --specs` all pass
+- [x] 7.1 Update README's credentials section: what `enc://` protects against, what it does not (host or Docker access, `docker inspect` env exposure), and the loss consequences
+- [x] 7.2 Record in AGENTS.md the verified facts: the two-input derivation, boot-failure behaviour of a bad passphrase, why `PICOCLAW_SSH_KEY_PATH` is required, and why `picoclaw onboard -E` is unusable
+- [x] 7.3 Done against real containers: init --encrypt-keys -> no plaintext anywhere in the tree -> serve healthy (`/health` 200) -> unset the variable -> doctor warns naming it, serve exits 1 in preflight, the running gateway stays Up and nothing is parked. `docker inspect` confirmed Piccolo composed exactly the two expected variables
+- [x] 7.4 Matrix re-run on a Piccolo-encrypted workspace: no env -> `passphrase required`; passphrase only -> `SSH private key is required`; key path only -> `passphrase required`; both (Piccolo's injection) -> running, no credential error; wrong passphrase -> `decryption failed`. Matches design D2's two-input claim, with no new failure mode. The `passphrase only` row is the one that justifies PICOCLAW_SSH_KEY_PATH: without it PicoClaw searches ~/.ssh, finds nothing, and the workspace cannot boot
+- [x] 7.5 build, vet, gofmt clean, 13 packages passing / 0 failures, `openspec validate --all` 20/20

@@ -17,6 +17,7 @@ piccolo integration add kimus/piccolo-gws
 piccolo integration setup kimus/piccolo-gws
                   run the integration-owned setup command in a temporary
                   container from the configured image
+piccolo secrets   encrypt this workspace's credentials (enc://) / check they decrypt
 piccolo doctor    validates Docker, workspace, and generated files
 piccolo serve     starts the PicoClaw gateway container in the background,
                   waits until http://127.0.0.1:18790/health answers
