@@ -1,12 +1,14 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 	"golang.org/x/term"
@@ -166,6 +168,22 @@ func runSecretsEncrypt(cmd *cobra.Command, flagPassphrase string, yes bool) erro
 		}
 	}
 
+	// Recorded before anything is sealed, so a failure part-way through cannot
+	// leave ciphertext that nothing can open: see setupState.applyEncryptionChange
+	// for the same ordering and the reason.
+	if err := ensurePassphrase(m, passphrase, layout.Manifest(), out); err != nil {
+		return err
+	}
+
+	// The overlay is written here, after the confirmation and the passphrase
+	// record: it overrides config.json on load, so writing it during the planning
+	// pass would let a declined run leave the workspace half-sealed.
+	if len(res.SidecarBytes) > 0 {
+		if err := setup.WriteSidecarBytes(res.SidecarPath, res.SidecarBytes); err != nil {
+			return err
+		}
+	}
+
 	if res.NothingChanged() {
 		// Still record the passphrase: a workspace with a key and nothing to
 		// decrypt with is one that cannot boot once something IS encrypted.
@@ -178,9 +196,6 @@ func runSecretsEncrypt(cmd *cobra.Command, flagPassphrase string, yes bool) erro
 		fmt.Fprintf(out, "wrote %s\n", rel(dir, layout.Config()))
 	}
 
-	if err := ensurePassphrase(m, passphrase, layout.Manifest(), out); err != nil {
-		return err
-	}
 	if _, err := generate.EnsureGitignore(dir); err != nil {
 		fmt.Fprintf(out, "warning: could not update .gitignore: %v\n", err)
 	}
@@ -192,7 +207,17 @@ func runSecretsEncrypt(cmd *cobra.Command, flagPassphrase string, yes bool) erro
 	if len(res.Refused) > 0 {
 		fmt.Fprintf(out, "  those fields are decided by picoclaw/%s; edit them there to protect them\n", picoclaw.SecurityFileName)
 	}
-	fmt.Fprint(out, "\nnext: piccolo serve\n")
+	// Same reasoning as setup's closing advice: reload cannot deliver a passphrase
+	// to a container that was started without one, and it reports success while
+	// doing nothing. The command is spelled out per state so nobody picks reload out
+	// of a list.
+	if running, checked := gatewayIsRunning(cmd); checked && running {
+		fmt.Fprint(out, "\nnext: piccolo restart\n")
+		fmt.Fprint(out, "  the RUNNING gateway predates this passphrase and cannot decrypt the new credentials;")
+		fmt.Fprint(out, " 'piccolo reload' will report success while the gateway fails to reload its config.\n")
+	} else {
+		fmt.Fprint(out, "\nnext: piccolo serve\n")
+	}
 	fmt.Fprint(out, "the passphrase is stored in piccolo.yaml, so nothing needs exporting — and that file is the one a workspace commit includes, so treat the directory as a secret.\n")
 	fmt.Fprintf(out, "remember: %s holds the plaintext it replaced — delete it or keep it knowingly.\n", rel(dir, layout.Config()+".bak"))
 	return nil
@@ -222,6 +247,23 @@ func printEncryptionWarning(out io.Writer, res setup.EncryptResult, src, dir, ke
 // piccolo.yaml, and every credential sealed with it becomes permanently
 // undecryptable with no recovery path and no way to tell what was typed.
 // initPassphrase and this share the rule through confirmPassphrase.
+// gatewayIsRunning reports the container's state and whether the question could be
+// answered at all; a daemon that will not answer must not change the advice into a
+// confident wrong statement, so callers only branch when checked is true.
+func gatewayIsRunning(cmd *cobra.Command) (running, checked bool) {
+	name, _, runner, _, err := containerContext(cmd)
+	if err != nil {
+		return false, false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), runner.ProbeTimeout+2*time.Second)
+	defer cancel()
+	state, err := runner.StateByName(ctx, name)
+	if err != nil {
+		return false, false
+	}
+	return state.Found && state.Running, true
+}
+
 func promptPassphrase(out io.Writer) (string, error) {
 	if !stdinIsTerminal() {
 		return "", errors.New("no passphrase to encrypt with and no terminal to ask for one — pass --passphrase, or run this interactively")

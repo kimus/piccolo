@@ -442,3 +442,50 @@ func TestContainerScreenOptionsCoverBothToggles(t *testing.T) {
 		}
 	}
 }
+
+// The closing advice must not offer reload where it cannot work. After encryption is
+// turned on, the running container predates the passphrase entirely, and reload
+// answers 200 from a cached config while the reload itself failed — so the message
+// has to name restart as required and say the alternative will mislead.
+func TestFinishAdviceAfterTurningOnEncryption(t *testing.T) {
+	var out bytes.Buffer
+	st := &setupState{out: &out, write: true, encryptionTurnedOn: true}
+	if !st.encryptionTurnedOn {
+		t.Fatal("flag not set by the toggle path")
+	}
+	// The advice itself is a pure decision so it is testable without a daemon.
+	plain := restartAdvice(true)
+	if !strings.Contains(plain, "REQUIRED") || !strings.Contains(plain, "will NOT work") {
+		t.Errorf("advice still offers reload as an option: %q", plain)
+	}
+	if strings.Contains(restartAdvice(false), "REQUIRED") {
+		t.Error("ordinary config changes should keep the reload/restart choice")
+	}
+	// Wiring: finish() must actually use the advice, or the helper is decoration.
+	// containerContext is unreachable from a test without a daemon, so finish()
+	// must still reach the message through a path the test can drive.
+	var sink bytes.Buffer
+	f := &setupState{out: &sink, write: true, encryptionTurnedOn: true, cmd: newRootCmd(),
+		runningProbe: func() bool { return true }}
+	if err := f.finish(); err != nil {
+		t.Fatalf("finish: %v", err)
+	}
+	got := sink.String()
+	if !strings.Contains(got, "REQUIRED") {
+		t.Errorf("finish() did not surface the restart-required advice: %q", got)
+	}
+	if strings.Contains(got, "piccolo reload    apply") {
+		t.Errorf("restart-required advice still offers reload as the in-place option: %q", got)
+	}
+
+	// The ordinary path must keep offering both, or the fix would have traded one
+	// wrong message for a worse universal one.
+	var normal bytes.Buffer
+	g := &setupState{out: &normal, write: true, cmd: newRootCmd(), runningProbe: func() bool { return true }}
+	if err := g.finish(); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(normal.String(), "piccolo reload") || strings.Contains(normal.String(), "REQUIRED") {
+		t.Errorf("non-encryption change got the wrong advice: %q", normal.String())
+	}
+}

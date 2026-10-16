@@ -371,3 +371,41 @@ func TestEncryptCoversEveryListedSecretField(t *testing.T) {
 		}
 	}
 }
+
+// The refusal and the seal must not contradict each other. Sealing the overlay
+// means a shadowed config.json field is protected, so reporting it as left in
+// plaintext is a false alarm — and the summary's refusal count is what a user
+// reads as "do I still have a problem?".
+func TestRefusedButSealedInTheOverlayIsNotReportedAsPlaintext(t *testing.T) {
+	key := encryptFixtureKey(t)
+	sidecar := secretsFromSidecar(t, "model_list:\n  m1:0:\n    api_keys:\n      - sk-sidecar-plain\n")
+	doc, err := configdoc.Parse([]byte(`{"version":3,"model_list":[{"model_name":"m1","api_keys":["sk-in-config"]}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	scPath := filepath.Join(dir, "sidecar.yml")
+	if err := os.WriteFile(scPath, []byte("model_list:\n  m1:0:\n    api_keys:\n      - sk-sidecar-plain\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	res, err := EncryptWorkspace(doc, sidecar, key, "PASS", scPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The overlay value was sealed...
+	if len(res.Sidecar.Encrypted) == 0 {
+		t.Fatal("overlay was not sealed")
+	}
+	// ...so nothing may be reported as left in plaintext.
+	for _, r := range res.Refused {
+		t.Errorf("reported %q as left in place, though the overlay sealed it: %s", r.Field, r.Reason)
+	}
+	if strings.Contains(res.Summary(), "left in place") {
+		t.Errorf("summary still claims a plaintext remainder: %s", res.Summary())
+	}
+	// And config.json must not have gained a bogus empty credential.
+	if strings.Contains(string(doc.Marshal()), `""`) {
+		t.Errorf("config.json gained an empty credential:\n%s", doc.Marshal())
+	}
+}

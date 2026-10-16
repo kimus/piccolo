@@ -320,3 +320,100 @@ func TestConfirmDestructiveRefusesWithoutTerminal(t *testing.T) {
 		t.Errorf("error should name the non-interactive route: %v", err)
 	}
 }
+
+// The ordering is the claim, so force the failure and check which half survives.
+// A config.json the run could not write is fine; a config.json holding ciphertext
+// that piccolo.yaml cannot unlock is an unbootable workspace.
+func TestSecretsEncryptFailsTowardBootable(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("chmod-based write denial is not enforced for root")
+	}
+	dir := encryptWorkspaceShell(t)
+	// The picoclaw DIRECTORY is made unwritable. Denying config.json itself would
+	// prove nothing: configdoc.Write creates a temp file and renames over the
+	// target, and a rename is governed by the directory's permissions, not the
+	// file's.
+	home := filepath.Join(dir, "picoclaw")
+	cfgPath := filepath.Join(home, "config.json")
+
+	// Generate the key FIRST: it is written inside picoclaw/, so an unwritable
+	// directory would fail the run before the config write, testing the wrong step.
+	keyPath, err := credential.Generate(filepath.Join(home, "keys"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(keyPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(home, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(home, 0o755) })
+
+	before := readFile(t, cfgPath)
+	_, err = runSecrets(t, dir, "encrypt", "--yes", "--passphrase", "horse")
+	_ = os.Chmod(home, 0o755)
+	if err == nil {
+		t.Fatal("expected the config write to fail")
+	}
+
+	// The passphrase was recorded first, so the workspace is still bootable and
+	// self-healing: plaintext config plus a passphrase guarding nothing.
+	m, lerr := manifest.Load(filepath.Join(dir, "piccolo.yaml"))
+	if lerr != nil {
+		t.Fatal(lerr)
+	}
+	if m.Passphrase() != "horse" {
+		t.Errorf("passphrase not recorded before the failed write: %q", m.Passphrase())
+	}
+	if after := readFile(t, cfgPath); after != before {
+		t.Error("config.json was rewritten even though the write was reported as failed")
+	}
+	if strings.Contains(before, credential.Scheme) {
+		t.Error("fixture was already ciphertext, so the test proved nothing")
+	}
+}
+
+// A failed passphrase recording must stop the run before anything is sealed;
+// otherwise the ciphertext it just wrote has no way in.
+func TestSecretsEncryptStopsWhenPassphraseCannotBeRecorded(t *testing.T) {
+	dir := encryptWorkspaceShell(t)
+	manifestPath := filepath.Join(dir, "piccolo.yaml")
+	if err := os.Chmod(manifestPath, 0o444); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(manifestPath, 0o644) })
+
+	before := readFile(t, filepath.Join(dir, "picoclaw", "config.json"))
+	if _, err := runSecrets(t, dir, "encrypt", "--yes", "--passphrase", "horse"); err == nil {
+		t.Fatal("run continued after piccolo.yaml could not be written")
+	}
+	if got := readFile(t, filepath.Join(dir, "picoclaw", "config.json")); got != before {
+		t.Error("credentials were sealed although the passphrase could not be recorded — ciphertext with no way in")
+	}
+}
+
+// A declined run must leave nothing behind — including the overlay, which is the
+// file that overrides config.json on load. Writing it during the planning pass
+// would mean "discarded; nothing was written" was false.
+func TestSecretsEncryptDeclineWritesNothingAtAll(t *testing.T) {
+	dir := encryptWorkspaceShell(t)
+	// A sidecar exists, as it would after any save through PicoClaw.
+	sidecar := filepath.Join(dir, "picoclaw", ".security.yml")
+	body := "model_list:\n  m1:0:\n    api_keys:\n      - sk-PLAIN-OVERRIDE\n"
+	if err := os.WriteFile(sidecar, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfgBefore := readFile(t, filepath.Join(dir, "picoclaw", "config.json"))
+
+	// No --yes and no terminal: the confirmation cannot be given, so the run stops.
+	if _, err := runSecrets(t, dir, "encrypt", "--passphrase", "horse"); err == nil {
+		t.Fatal("expected the run to stop without a terminal for confirmation")
+	}
+	if got := readFile(t, sidecar); got != body {
+		t.Errorf("the overlay was rewritten by a run that never got confirmed:\n%s", got)
+	}
+	if got := readFile(t, filepath.Join(dir, "picoclaw", "config.json")); got != cfgBefore {
+		t.Error("config.json was rewritten by a declined run")
+	}
+}

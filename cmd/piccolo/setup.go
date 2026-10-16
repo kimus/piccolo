@@ -89,6 +89,17 @@ type setupState struct {
 	// must say where the value will actually go.
 	encrypted bool
 
+	// runningProbe answers "is the gateway container up right now?". A field rather
+	// than a direct containerRunning call so the closing advice — the part that
+	// tells a user reload will lie to them — is reachable from a test.
+	runningProbe func() bool
+
+	// encryptionTurnedOn marks that this session took a workspace from no-passphrase
+	// to passphrase. It is what makes the closing advice honest: a running container
+	// predates the manifest entry, so its environment cannot hold the passphrase and
+	// only a recreate can deliver it.
+	encryptionTurnedOn bool
+
 	// notice carries a message into the next screen's help line. Printing while a
 	// form is on screen is invisible: huh runs in the alt screen, so text written
 	// between two screens is covered by the next frame before it can be read —
@@ -192,16 +203,39 @@ func runSetup(cmd *cobra.Command, args []string) error {
 	}
 }
 
+// restartAdvice is the closing guidance, as a pure function because the difference
+// it encodes is the whole point and a Docker daemon must not be needed to pin it.
+//
+// After encryption is turned on, the running container predates the passphrase: it
+// has no PICOCLAW_KEY_PASSPHRASE in its environment, so reload cannot work. Worse,
+// reload REPORTS SUCCESS, because /health answers from a process that cached its
+// config while the reload itself failed in the log — verified against a real
+// container. Offering reload as an option in that state is a lie of omission.
+func restartAdvice(encryptionJustTurnedOn bool) string {
+	if encryptionJustTurnedOn {
+		return "warning: the gateway container is RUNNING — it was started before this workspace had a passphrase, so it cannot decrypt the new credentials.\n" +
+			"  piccolo restart   REQUIRED: recreate the container so the passphrase reaches it\n" +
+			"  (piccolo reload will NOT work here, and reports success while the gateway fails to reload its config)\n"
+	}
+	return "warning: the gateway container is RUNNING — config changes are not applied yet.\n" +
+		"  piccolo reload    apply config.json in place (channels/models/tools restart inside the gateway)\n" +
+		"  piccolo restart   recreate the container (needed for piccolo.yaml changes)\n"
+}
+
 func (st *setupState) finish() error {
 	if !st.write {
 		fmt.Fprintln(st.out, "no changes written.")
 		return nil
 	}
 	fmt.Fprintf(st.out, "\n\u2713 config.json updated (previous copy: config.json.bak); piccolo.yaml setup metadata may also be updated\n")
-	if running := st.containerRunning(); running {
-		fmt.Fprintf(st.out, "warning: the gateway container is RUNNING — config changes are not applied yet.\n"+
-			"  piccolo reload    apply config.json in place (channels/models/tools restart inside the gateway)\n"+
-			"  piccolo restart   recreate the container (needed for piccolo.yaml changes)\n")
+	running := false
+	if st.runningProbe != nil {
+		running = st.runningProbe()
+	} else {
+		running = st.containerRunning()
+	}
+	if running {
+		fmt.Fprint(st.out, restartAdvice(st.encryptionTurnedOn))
 	} else {
 		fmt.Fprintln(st.out, "next: piccolo serve   (starts the gateway with your new configuration)")
 	}
@@ -2310,12 +2344,18 @@ func (st *setupState) applyEncryptionChange(enable bool) error {
 	if err != nil {
 		return err
 	}
-	if err := st.encryptExistingCredentials(passphrase); err != nil {
-		return err
-	}
+	// The passphrase is recorded BEFORE anything is sealed, deliberately. The
+	// inverse order turns a failed manifest write into ciphertext with no way to
+	// open it — an unbootable workspace produced by a command that only printed an
+	// error. This order's failure mode is a recorded passphrase guarding plaintext,
+	// which still boots, still works, and is healed by the next write.
 	st.manifest.Secrets.Passphrase = passphrase
 	if err := st.manifest.Write(st.manifestPath); err != nil {
 		return fmt.Errorf("write piccolo.yaml: %w", err)
+	}
+	st.encryptionTurnedOn = true
+	if err := st.encryptExistingCredentials(passphrase); err != nil {
+		return err
 	}
 	st.recomputeEncrypted()
 	st.write = true
@@ -2350,6 +2390,13 @@ func (st *setupState) encryptExistingCredentials(passphrase string) error {
 	res, err := setup.EncryptWorkspace(st.doc, st.secrets, keyPath, passphrase, "")
 	if err != nil {
 		return err
+	}
+	// config.json and the overlay commit together, after the passphrase is already
+	// recorded. Either both moved or neither did.
+	if len(res.SidecarBytes) > 0 {
+		if err := setup.WriteSidecarBytes(res.SidecarPath, res.SidecarBytes); err != nil {
+			return err
+		}
 	}
 	if res.NothingChanged() {
 		fmt.Fprintln(st.out, "nothing left to encrypt: every credential in config.json is already ciphertext or empty.")

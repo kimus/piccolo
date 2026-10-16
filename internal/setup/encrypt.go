@@ -24,9 +24,31 @@ import (
 // silently leave the file that OVERRIDES config.json in plaintext, which is the
 // exact failure this pass exists to close.
 func EncryptWorkspace(doc *configdoc.Doc, secrets picoclaw.Secrets, keyPath, passphrase, sidecarPath string) (res EncryptResult, err error) {
+	res.SidecarPath = sidecarPath
 	if passphrase == "" {
 		return res, credential.ErrPassphraseRequired
 	}
+
+	// The overlay pass runs FIRST: whether a config.json field is "refused and left
+	// plaintext" depends on whether the overlay sealed it a moment later, and
+	// reporting a sealed value as still-readable is a false alarm the user would go
+	// chasing.
+	var sc SidecarResult
+	if sidecarPath != "" {
+		// Sealed in memory: this function runs before the caller's confirmation, and
+		// writing here would mean a declined run had already rewritten the file that
+		// overrides config.json.
+		var serr error
+		res.SidecarBytes, sc, serr = SealSidecarFile(sidecarPath, keyPath, passphrase)
+		if serr != nil {
+			return res, serr
+		}
+		for _, f := range sc.Encrypted {
+			res.addChanged(fmt.Sprintf("picoclaw/%s %s", picoclaw.SecurityFileName, f))
+		}
+	}
+	res.Sidecar = sc
+	sealed := sealedTargets(sc.Encrypted)
 
 	// Model keys. The sidecar decides per model_list entry, keyed by the alias
 	// plus its duplicate ordinal, so this walks the entries positionally rather
@@ -70,7 +92,17 @@ func EncryptWorkspace(doc *configdoc.Doc, secrets picoclaw.Secrets, keyPath, pas
 			}
 			if shields[i].Matched {
 				// The sidecar replaces this entry's whole list on load, so a fresh
-				// enc:// value here would be dead the moment it was written.
+				// enc:// value here would be dead the moment it was written. But if the
+				// overlay pass sealed that entry, the credential is protected — saying
+				// it was left in plaintext would send the user hunting a problem that
+				// does not exist.
+				if sealed["model:"+alias] {
+					// Nothing to write here: the overlay now carries the sealed value,
+					// and config.json keeps whatever it held. Appending anything would
+					// add a credential the gateway does not use.
+					res.addChanged(fmt.Sprintf("model %q api_keys (in picoclaw/%s)", alias, picoclaw.SecurityFileName))
+					continue
+				}
 				res.addRefused(name, fmt.Sprintf("picoclaw/.security.yml %s governs this model's api_keys", shields[i].Key))
 				// Leave the entry exactly as it was: writing an enc:// value the
 				// sidecar discards would make the workspace look encrypted while the
@@ -129,17 +161,6 @@ func EncryptWorkspace(doc *configdoc.Doc, secrets picoclaw.Secrets, keyPath, pas
 	// would mean reporting a workspace encrypted while the gateway still loads
 	// plaintext. Refusing the shadowed field is correct for a WRITE and wrong for a
 	// HEAL, which is why the two are separate operations.
-	var sc SidecarResult
-	if sidecarPath != "" {
-		sc, err = EncryptSidecar(sidecarPath, keyPath, passphrase)
-		if err != nil {
-			return res, err
-		}
-		for _, f := range sc.Encrypted {
-			res.addChanged(fmt.Sprintf("picoclaw/%s %s", picoclaw.SecurityFileName, f))
-		}
-	}
-	res.Sidecar = sc
 	return res, nil
 }
 
@@ -175,6 +196,13 @@ type EncryptResult struct {
 	// deciding whether their workspace is protected needs to know the overlay was
 	// handled at all — silence there would look like it was skipped.
 	Sidecar SidecarResult
+	// SidecarBytes is the sealed overlay, or nil when there was nothing to change.
+	// The caller writes it after its own confirmation, next to the config.json
+	// write, so a declined or failed run leaves the previous bytes in place.
+	SidecarBytes []byte
+	// SidecarPath is where SidecarBytes belongs, echoed back so the caller does not
+	// have to remember which of its own paths to write.
+	SidecarPath string
 }
 
 // RefusedField names one credential left in plaintext and why.
@@ -231,6 +259,32 @@ func docModelAliases(doc *configdoc.Doc) []string {
 			// missing alias here would shift every later entry onto the wrong
 			// sidecar key, so record the hole rather than dropping it.
 			out = append(out, "")
+		}
+	}
+	return out
+}
+
+// sealedTargets indexes the overlay paths the seal pass encrypted into the same
+// vocabulary the config.json refusals use, so "refused here" and "sealed there" can
+// be told apart. Names come from SealSidecarFile's dotted paths, e.g.
+// "model_list.gpt-4o:0.api_keys[0]" -> "model:gpt-4o" and
+// "channel_list.discord.settings.token" -> "channel:discord.token".
+func sealedTargets(paths []string) map[string]bool {
+	out := map[string]bool{}
+	for _, p := range paths {
+		parts := strings.Split(p, ".")
+		if len(parts) < 2 {
+			continue
+		}
+		switch parts[0] {
+		case "model_list":
+			alias := strings.SplitN(parts[1], ":", 2)[0]
+			out["model:"+alias] = true
+		case "channel_list", "channels":
+			if len(parts) >= 4 {
+				field := strings.TrimSuffix(parts[3], "[0]")
+				out["channel:"+parts[1]+"."+field] = true
+			}
 		}
 	}
 	return out
