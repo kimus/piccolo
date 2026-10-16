@@ -21,6 +21,7 @@ import (
 	"golang.org/x/term"
 
 	"github.com/kimus/piccolo/internal/configdoc"
+	"github.com/kimus/piccolo/internal/credential"
 	"github.com/kimus/piccolo/internal/docker"
 	"github.com/kimus/piccolo/internal/generate"
 	"github.com/kimus/piccolo/internal/manifest"
@@ -35,11 +36,12 @@ import (
 func newSetupCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "setup [section] [name]",
-		Short: "Edit an existing workspace (channels, models, tools)",
+		Short: "Edit an existing workspace (channels, models, tools, container)",
 		Long: "Interactive counterpart of piccolo init: an arrow-navigable editor for " +
 			"config.json settings. Open 'piccolo setup' for the home menu, or deep-link: " +
 			"'piccolo setup channels', 'piccolo setup channels discord', " +
-			"'piccolo setup models', 'piccolo setup tools'.\n\n" +
+			"'piccolo setup models', 'piccolo setup tools', 'piccolo setup container'.\n\n" +
+			"Credential encryption is on by default and toggled under 'piccolo setup container'.\n\n" +
 			"Every write is a merge-patch behind a diff preview + confirmation: unknown " +
 			"keys and untouched subtrees of your user-owned config.json are preserved, " +
 			"and the previous file is kept as config.json.bak.",
@@ -277,6 +279,10 @@ func (st *setupState) containerScreen() error {
 			status = "on"
 			verb = "disable"
 		}
+		encStatus, encVerb := "off", "enable"
+		if st.encrypted {
+			encStatus, encVerb = "on", "disable"
+		}
 		var pick string
 		form := setupForm(huh.NewGroup(
 			huh.NewSelect[string]().
@@ -284,6 +290,7 @@ func (st *setupState) containerScreen() error {
 				Description("Container launch settings; esc back.").
 				Options(
 					huh.NewOption(fmt.Sprintf("Web console [%s] — %s browser dashboard", status, verb), "web_console:"+verb),
+					huh.NewOption(fmt.Sprintf("Credential encryption [%s] — %s enc:// for this workspace", encStatus, encVerb), "encrypt:"+encVerb),
 					huh.NewOption("← Back", "__back__"),
 				).
 				Value(&pick),
@@ -294,8 +301,19 @@ func (st *setupState) containerScreen() error {
 		if pick == "__back__" {
 			return nil
 		}
-		_, verb, ok := strings.Cut(pick, ":")
+		feature, verb, ok := strings.Cut(pick, ":")
 		if !ok {
+			continue
+		}
+		if feature == "encrypt" {
+			// The posture flag is re-derived by the caller loop, so the model list
+			// and every credential field's help text follow the new state at once.
+			if err := st.applyEncryptionChange(verb == "enable"); err != nil {
+				if isCancel(err) {
+					continue
+				}
+				return err
+			}
 			continue
 		}
 		if err := st.applyWebConsoleChange(verb == "enable"); err != nil {
@@ -2157,4 +2175,153 @@ func orDefault(s, def string) string {
 		return def
 	}
 	return s
+}
+
+// applyEncryptionChange turns enc:// credential storage on or off for this
+// workspace.
+//
+// Enabling asks for a passphrase, then encrypts whatever plaintext is already in
+// config.json — a toggle that only affected future writes would leave the
+// credentials sitting exactly where they were while the menu said "on".
+//
+// Disabling is deliberately incomplete: Piccolo cannot decrypt the existing
+// enc:// values back to plaintext without also rewriting the file, and it has no
+// way to hand them to anything else first. So it records the choice, leaves the
+// ciphertext alone, and says so. Reverting a workspace to plaintext is
+// re-entering the credentials, which is the user's call to make knowingly rather
+// than something a toggle does underneath them.
+func (st *setupState) applyEncryptionChange(enable bool) error {
+	if !enable {
+		if st.manifest.Passphrase() == "" {
+			fmt.Fprintln(st.out, "credential encryption is already off.")
+			return nil
+		}
+		confirm := false
+		err := setupForm(huh.NewGroup(
+			huh.NewConfirm().
+				Title("Turn off credential encryption?").
+				Description("Existing enc:// values stay as they are — Piccolo will not decrypt and rewrite them. " +
+					"Credentials entered from now on would be plaintext in config.json.").
+				Affirmative("Yes, turn it off").
+				Negative("No, keep it on").
+				Value(&confirm),
+		)).Run()
+		if err != nil {
+			return err
+		}
+		if !confirm {
+			return errCancel
+		}
+		st.manifest.Secrets.Passphrase = ""
+		if err := st.manifest.Write(st.manifestPath); err != nil {
+			return fmt.Errorf("write piccolo.yaml: %w", err)
+		}
+		st.recomputeEncrypted()
+		fmt.Fprintln(st.out, "✓ encryption off; any enc:// credential still in config.json stays encrypted and keeps working")
+		st.setNotice("Encryption is off, but existing enc:// values were not rewritten. To return to plaintext, re-enter each credential through 'piccolo setup' → Models")
+		st.write = true
+		return nil
+	}
+
+	if st.manifest.Passphrase() != "" {
+		// Already on. Offer to encrypt anything added since, rather than pretending
+		// the toggle did nothing.
+		if err := st.encryptExistingCredentials(""); err != nil {
+			return err
+		}
+		st.recomputeEncrypted()
+		return nil
+	}
+
+	passphrase, err := st.promptForNewPassphrase()
+	if err != nil {
+		return err
+	}
+	if err := st.encryptExistingCredentials(passphrase); err != nil {
+		return err
+	}
+	st.manifest.Secrets.Passphrase = passphrase
+	if err := st.manifest.Write(st.manifestPath); err != nil {
+		return fmt.Errorf("write piccolo.yaml: %w", err)
+	}
+	st.recomputeEncrypted()
+	st.write = true
+	fmt.Fprintln(st.out, "✓ recorded secrets.passphrase in piccolo.yaml")
+	fmt.Fprintln(st.out, "  note: that file is committed on purpose, so a copy of this workspace can still be decrypted.")
+	return nil
+}
+
+// encryptExistingCredentials generates the key if the workspace has none and
+// seals every plaintext credential in config.json. Passing "" uses the passphrase
+// already recorded, which is the re-run path.
+func (st *setupState) encryptExistingCredentials(passphrase string) error {
+	if passphrase == "" {
+		passphrase = st.manifest.Passphrase()
+	}
+	if strings.TrimSpace(passphrase) == "" {
+		return errors.New("no passphrase to encrypt with")
+	}
+	layout := workspace.NewLayout(st.dir)
+	keyPath := layout.KeyFile()
+	if _, err := os.Stat(keyPath); err != nil {
+		if !os.IsNotExist(err) {
+			return fmt.Errorf("inspect key file: %w", err)
+		}
+		generated, err := credential.Generate(layout.Keys())
+		if err != nil {
+			return err
+		}
+		keyPath = generated
+		fmt.Fprintf(st.out, "credential key: %s\n", rel(st.dir, keyPath))
+	}
+	res, err := setup.EncryptWorkspace(st.doc, st.secrets, keyPath, passphrase)
+	if err != nil {
+		return err
+	}
+	if res.NothingChanged() {
+		fmt.Fprintln(st.out, "nothing left to encrypt: every credential in config.json is already ciphertext or empty.")
+	} else {
+		if err := configdoc.Write(st.path, st.doc); err != nil {
+			return err
+		}
+		st.orig = st.doc.Marshal()
+		fmt.Fprintf(st.out, "✓ encrypted %d credential(s) in %s\n", len(res.Changed), rel(st.dir, st.path))
+	}
+	for _, r := range res.Refused {
+		fmt.Fprintf(st.out, "  left in plaintext: %s — %s\n", r.Field, r.Reason)
+	}
+	return nil
+}
+
+// promptForNewPassphrase asks twice: the value is about to be written into a file
+// the user may commit without thinking again, and a typo becomes the only way in.
+func (st *setupState) promptForNewPassphrase() (string, error) {
+	var pass, conf string
+	err := setupForm(
+		huh.NewGroup(huh.NewInput().
+			Title("Passphrase for this workspace's credentials").
+			Description("Stored in piccolo.yaml so the gateway starts without any host setup.\n"+
+				"Losing it is permanent: the credentials must then be re-entered.").
+			EchoMode(huh.EchoModePassword).Value(&pass)),
+		huh.NewGroup(huh.NewInput().
+			Title("Confirm the passphrase").
+			EchoMode(huh.EchoModePassword).Value(&conf)),
+	).Run()
+	if err != nil {
+		return "", err
+	}
+	if strings.TrimSpace(pass) == "" {
+		return "", errors.New("a blank passphrase would seal credentials nothing can later decrypt")
+	}
+	if pass != conf {
+		return "", errors.New("the passphrase and its confirmation did not match")
+	}
+	return pass, nil
+}
+
+// recomputeEncrypted re-derives the posture flag after piccolo.yaml or the key
+// file moved, so menus, field help and sealing all follow the new state.
+func (st *setupState) recomputeEncrypted() {
+	_, statErr := os.Stat(workspace.NewLayout(st.dir).KeyFile())
+	st.encrypted = statErr == nil && st.manifest.Passphrase() != ""
 }
