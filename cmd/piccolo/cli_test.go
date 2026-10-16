@@ -17,6 +17,7 @@ func TestGroupCommandsRejectUnknownSubcommands(t *testing.T) {
 		{"image", "typo"},
 		{"runtime", "typo"},
 		{"workspace", "typo"},
+		{"secrets", "typo"},
 	} {
 		root := newRootCmd()
 		root.SetOut(io.Discard)
@@ -35,7 +36,7 @@ func TestGroupCommandsRejectUnknownSubcommands(t *testing.T) {
 
 // A bare group is not a mistake: it shows help and succeeds.
 func TestGroupCommandsWithoutArgsPrintHelp(t *testing.T) {
-	for _, name := range []string{"integration", "image", "runtime", "workspace"} {
+	for _, name := range []string{"integration", "image", "runtime", "workspace", "secrets"} {
 		var out strings.Builder
 		root := newRootCmd()
 		root.SetOut(&out)

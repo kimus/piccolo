@@ -62,6 +62,22 @@ This reuses the existing `picoclaw/` mount, so no new bind mount is added and th
 
 ### D4: One explicit opt-in command; `init` offers but never requires
 
+**Amended while implementing group 3.** The command is `piccolo secrets encrypt`
+alone, with no `secrets init`: generating a key that protects nothing is a half
+state, and `secrets check` would then have to distinguish "has a key" from "is
+encrypted" for no user benefit. Key generation happens inside `encrypt` when the
+key file is absent. A read-only `piccolo secrets check` was added as its
+companion, because the failure this command prevents (a container that exits on a
+passphrase it cannot reach) is exactly what a user wants to test before booting.
+
+A second asymmetry is deliberate: `encrypt` refuses to seal an unfilled
+`ALL_CAPS_EXAMPLE` template value even though doctor currently reports such a value
+as usable (the KNOWN GAP in `internal/picoclaw/secrets_test.go`). Encrypting a
+non-secret would give a workspace the appearance of protected credentials while
+leaving the real problem untouched. Widening the warning rule is task 4.5, with its
+own blast radius; `TestPlaceholderIsRefusedEvenThoughDoctorWarnsDifferently` pins
+both halves so neither silently becomes the other.
+
 `piccolo secrets encrypt` walks `config.json`, encrypts every plaintext credential in place, writes the key file, records `secrets.passphrase_env`, and prints the export line for the host variable. `init` gains a wizard question and a non-interactive `--encrypt-keys` flag; the default stays plaintext so nothing changes for existing users or scripted init.
 
 Encryption happens on the host at write time, so plaintext is never written to disk first. Because the passphrase must exist to encrypt, `secrets encrypt` accepts it from the host variable named in the manifest or from a `term.ReadPassword` prompt, matching the existing wizard's password handling.

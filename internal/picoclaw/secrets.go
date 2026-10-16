@@ -35,6 +35,11 @@ import (
 // SecurityFileName is PicoClaw's sidecar, always beside config.json.
 const SecurityFileName = ".security.yml"
 
+// FileSchemePrefix marks a credential value that PicoClaw reads from a sibling
+// file instead of carrying inline. Like enc:// it is already indirect, so nothing
+// that writes credentials should treat it as plaintext to be wrapped.
+const FileSchemePrefix = "file://"
+
 // notHereSentinel is the literal `SecureString.MarshalJSON` writes into
 // config.json in place of a field PicoClaw keeps in the sidecar. Decoded from
 // JSON it arrives as the bare string, brackets included.

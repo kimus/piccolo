@@ -17,12 +17,12 @@
 
 ## 3. Write paths: opt in and store encrypted
 
-- [ ] 3.1 Implement `piccolo secrets init` (or the generate half of `secrets encrypt`): create the key file, record `secrets.passphrase_env`, append the gitignore entry, and print the export line the user must set
-- [ ] 3.2 Implement `piccolo secrets encrypt`: read `config.json`, encrypt each plaintext model key and channel token in place, write via the existing create-only-safe atomic path with `config.json.bak`
-- [ ] 3.3 Show the irreversible-loss warning before rewriting anything, including that `config.json.bak` holds the plaintext values (spec: "Warning precedes the rewrite")
-- [ ] 3.4 Reuse the sidecar check from `e0a0581` so a field governed by `picoclaw/.security.yml` is declined with its sidecar key named, and the summary does not claim a whole-workspace success when fields were skipped
-- [ ] 3.5 Accept the passphrase from the named host variable, else `term.ReadPassword`, in the existing `IsTerminal`-guarded style; never from a flag argument
-- [ ] 3.6 Test that a workspace with no opt-in produces a byte-identical `config.json` to today's output
+- [x] 3.1 Implemented as one command, `piccolo secrets encrypt`, which generates the key when absent, records `secrets.passphrase_env`, appends the gitignore entry, and prints the export line. No separate `secrets init`: a key with nothing encrypted under it is a half state that makes `secrets check` report a workspace as encrypted when it is not. `secrets check` was added as the read-only companion
+- [x] 3.2 Implement `piccolo secrets encrypt`: read `config.json`, encrypt each plaintext model key and channel token in place, write via the existing create-only-safe atomic path with `config.json.bak`
+- [x] 3.3 Show the irreversible-loss warning before rewriting anything, including that `config.json.bak` holds the plaintext values (spec: "Warning precedes the rewrite")
+- [x] 3.4 Reuse the sidecar check from `e0a0581` so a field governed by `picoclaw/.security.yml` is declined with its sidecar key named, and the summary does not claim a whole-workspace success when fields were skipped
+- [x] 3.5 Accept the passphrase from the named host variable, else `term.ReadPassword`, in the existing `IsTerminal`-guarded style; never from a flag argument
+- [x] 3.6 Verified no-opt-in byte-identity two ways: `TestEncryptWorkspaceNoCredentialsIsByteIdentical` (unit) and the existing init/doctor suites still passing unchanged. `TestSecretsRefusalLeavesWorkspaceConsistent` additionally pins that a refused run writes neither ciphertext nor a `secrets:` block
 
 ## 4. Generation and interactive setup
 
