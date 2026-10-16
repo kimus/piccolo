@@ -84,3 +84,24 @@ The record SHALL associate each generated copy with the template that produced i
 - **THEN** the record names the template path and function for that path
 - **AND** a staleness report repeats that source so the fix is applied in code rather than in the copy
 
+
+### Requirement: The record lives at a fixed name and survives a rename
+Piccolo SHALL keep the record at `piccolo.lock` in the workspace root. If the record is renamed again, writing it SHALL adopt the entries stored under the previous name rather than starting empty, and SHALL remove the superseded file.
+
+#### Scenario: Adopted on the first write after a rename
+- **WHEN** a workspace has a record under the previous name and none at the current one
+- **THEN** the next write carries the old entries into the new record
+- **AND** the superseded file is removed, so no two records can disagree
+
+#### Scenario: An unusable predecessor is discarded, not fatal
+- **WHEN** the record under the previous name cannot be parsed
+- **THEN** it is discarded and generation proceeds
+- **AND** the workspace is not left unable to write its record
+
+#### Scenario: Report names what it found
+- **WHEN** doctor finds a record only under the previous name
+- **THEN** it says so and names that file, rather than reporting that the workspace never had a record
+
+#### Scenario: One definition of the predecessor's name
+- **WHEN** the record's previous name is referenced by more than one package
+- **THEN** it comes from a single exported constant, not a duplicated string

@@ -95,7 +95,7 @@ func TestLoadProvenanceAbsentIsNotAnError(t *testing.T) {
 
 func TestLoadProvenanceCorruptIsAnError(t *testing.T) {
 	dir := t.TempDir()
-	if err := os.WriteFile(ProvenancePath(dir), []byte("{not json"), 0o644); err != nil {
+	if err := os.WriteFile(LockPath(dir), []byte("{not json"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := LoadProvenance(dir); err == nil {
@@ -256,5 +256,65 @@ func TestRecordProvenanceSkipsUnwrittenFiles(t *testing.T) {
 	}
 	if p.Files[toSlash(skillRel)].SHA256 != Digest([]byte(FileHandlingSkillMD())) {
 		t.Error("written file must be recorded")
+	}
+}
+
+// The rename must not lose what the old record knew. A workspace that had
+// entries under piccolo.provenance.json must keep them after the next write, and
+// must not be left holding two records that can disagree.
+func TestRenameSeedsFromLegacyAndRemovesIt(t *testing.T) {
+	dir := t.TempDir()
+	legacy := Provenance{Version: ProvenanceSchemaVersion, Piccolo: "0.3.0", Files: map[string]ProvenanceFile{
+		"picoclaw/agents/main/AGENT.md": {SHA256: "sha256:abc", Source: "internal/generate/templates.go:agentMD"},
+	}}
+	data, err := legacy.Marshal()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, LegacyFileName), data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Nothing reads the legacy file as a live record.
+	if p, err := LoadProvenance(dir); err != nil || p != nil {
+		t.Fatalf("legacy file was loaded as the record: %v %v", p, err)
+	}
+
+	seeded, err := SeedFromLegacy(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if seeded == nil {
+		t.Fatal("nothing adopted from the legacy record")
+	}
+	if got := seeded.Source("picoclaw/agents/main/AGENT.md"); got != "internal/generate/templates.go:agentMD" {
+		t.Errorf("entry lost in the rename: source = %q", got)
+	}
+	if _, err := os.Stat(filepath.Join(dir, LegacyFileName)); !os.IsNotExist(err) {
+		t.Error("legacy record still present after adoption; two records can now disagree")
+	}
+	// Adoption is one-shot: with a new record absent again, a second call is a no-op.
+	again, err := SeedFromLegacy(dir)
+	if err != nil || again != nil {
+		t.Errorf("second adoption = %+v, %v", again, err)
+	}
+}
+
+// A corrupt legacy record must not wedge generation: it is discarded, and the
+// rename proceeds.
+func TestRenameDiscardsCorruptLegacy(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, LegacyFileName), []byte("{ nope"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	p, err := SeedFromLegacy(dir)
+	if err != nil {
+		t.Fatalf("corrupt legacy record blocked the rename: %v", err)
+	}
+	if p != nil {
+		t.Error("corrupt record was adopted as if trustworthy")
+	}
+	if _, err := os.Stat(filepath.Join(dir, LegacyFileName)); !os.IsNotExist(err) {
+		t.Error("unusable legacy file left behind")
 	}
 }

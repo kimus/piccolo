@@ -121,7 +121,7 @@ func TestGeneratedProvenanceMissingFileIsWarned(t *testing.T) {
 
 func TestGeneratedProvenanceCorruptRecordWarns(t *testing.T) {
 	dir := t.TempDir()
-	if err := os.WriteFile(generate.ProvenancePath(dir), []byte("{ nope"), 0o644); err != nil {
+	if err := os.WriteFile(generate.LockPath(dir), []byte("{ nope"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	results := checkGeneratedProvenance(dir)
@@ -250,5 +250,25 @@ func TestDoctorRunIncludesGitignoreCheck(t *testing.T) {
 		t.Errorf("Run must surface the missing OS-metadata rule: %+v", results)
 	} else if !strings.Contains(r.Message, generate.GitignoreOSMetadata) {
 		t.Errorf("Run report must name the rule: %q", r.Message)
+	}
+}
+
+// The rename must not make an old workspace claim it never had a record while a
+// perfectly good one sits under the previous name.
+func TestProvenanceNamesTheLegacyFileWhenFound(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, generate.LegacyFileName), []byte(`{"version":1,"files":{}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	results := checkGeneratedProvenance(dir)
+	r := find(results, "old name")
+	if r == nil {
+		t.Fatalf("legacy record not reported: %+v", results)
+	}
+	if !strings.Contains(r.Message, generate.LegacyFileName) {
+		t.Errorf("message must name the file it found: %s", r.Message)
+	}
+	if r.Status == FAIL {
+		t.Error("a renamed record is informational, never a failure")
 	}
 }

@@ -4,20 +4,24 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 )
 
-// ProvenanceFileName is the workspace-root record of the exact bytes generation
-// wrote, and which template produced each one. It exists because the copies are
-// user-owned and create-only: a template fix never reaches an existing
-// workspace, and without this record there is no way to tell a hand-edited file
-// apart from an untouched one that predates the fix. Those two facts demand
-// opposite responses — leave one alone, refresh the other — so they cannot share
-// a single "differs from template" warning.
-const ProvenanceFileName = "piccolo.provenance.json"
+// LockFileName is the workspace-root record of the exact bytes generation wrote,
+// and which template produced each one. The contents are provenance (see
+// Provenance); the name says only what the file is for the workspace: a lock
+// beside piccolo.yaml recording what the tool last produced.
+//
+// It exists because the copies are user-owned and create-only: a template fix
+// never reaches an existing workspace, and without this record there is no way to
+// tell a hand-edited file apart from an untouched one that predates the fix. Those
+// two facts demand opposite responses — leave one alone, refresh the other — so they
+// cannot share a single "differs from template" warning.
+const LockFileName = "piccolo.lock"
 
 // version is stamped by the CLI at startup so a record can name the Piccolo that
 // wrote it. Staleness itself is decided by digests, never by this string, so an
@@ -56,9 +60,9 @@ func Digest(content []byte) string {
 	return "sha256:" + hex.EncodeToString(sum[:])
 }
 
-// ProvenancePath is the absolute record location in a workspace.
-func ProvenancePath(dir string) string {
-	return filepath.Join(dir, ProvenanceFileName)
+// LockPath is the absolute record location in a workspace.
+func LockPath(dir string) string {
+	return filepath.Join(dir, LockFileName)
 }
 
 // NewProvenance starts an empty record.
@@ -90,11 +94,49 @@ func (p *Provenance) Paths() []string {
 	return out
 }
 
+// LegacyPath is the record's previous file name (piccolo.provenance.json).
+func LegacyPath(dir string) string { return filepath.Join(dir, LegacyFileName) }
+
+// LegacyFileName is the name the record shipped under before the rename. It is
+// read once, on the first write after the rename, so entries are not silently
+// lost; nothing reads it afterwards, because carrying two formats forever is the
+// compatibility work this project's rules exclude. Exported so doctor names the
+// same file this package reads rather than keeping its own copy of the string.
+const LegacyFileName = "piccolo.provenance.json"
+
+// SeedFromLegacy adopts the record under its old name when no new one exists, and
+// removes the old file so a workspace is not left holding two records that can
+// disagree. Returns the record to keep writing to.
+func SeedFromLegacy(dir string) (*Provenance, error) {
+	if _, err := os.Stat(LockPath(dir)); err == nil {
+		return nil, nil // new record already exists; nothing to adopt
+	}
+	data, err := os.ReadFile(LegacyPath(dir))
+	if err != nil {
+		return nil, nil // no old record either: not a problem, just nothing to do
+	}
+	var old Provenance
+	if err := json.Unmarshal(data, &old); err != nil {
+		// A corrupt legacy record is dropped rather than propagated: it cannot be
+		// trusted, and refusing to write would leave the workspace stuck.
+		return nil, os.Remove(LegacyPath(dir))
+	}
+	if err := os.Remove(LegacyPath(dir)); err != nil && !os.IsNotExist(err) {
+		return nil, fmt.Errorf("remove %s: %w", LegacyFileName, err)
+	}
+	p := &old
+	if p.Files == nil {
+		p.Files = map[string]ProvenanceFile{}
+	}
+	p.Version = ProvenanceSchemaVersion
+	return p, nil
+}
+
 // LoadProvenance reads the record. A missing or unreadable file yields (nil,
 // nil): the absence of a record is a normal state for a workspace created before
 // provenance existed, and callers must report it without failing.
 func LoadProvenance(dir string) (*Provenance, error) {
-	data, err := os.ReadFile(ProvenancePath(dir))
+	data, err := os.ReadFile(LockPath(dir))
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, nil
@@ -119,7 +161,7 @@ func (p *Provenance) Save(dir string) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(ProvenancePath(dir), data, 0o644)
+	return os.WriteFile(LockPath(dir), data, 0o644)
 }
 
 // provenanceWire is the on-disk shape. Marshalling through it (rather than the

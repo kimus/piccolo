@@ -198,7 +198,7 @@ Every file in this section is rendered from `internal/generate/templates.go`. **
 | `picoclaw/agents/main/USER.md` | `generate.userMD()` |
 | `picoclaw/agents/main/memory/MEMORY.md` | `generate.memoryMD()` |
 
-Because the copies are user-owned and create-only, a template fix never reaches an existing workspace. Piccolo records what it wrote in `piccolo.provenance.json` (workspace root: digest + source template per generated file) so `piccolo doctor` can tell the two states apart and report them differently:
+Because the copies are user-owned and create-only, a template fix never reaches an existing workspace. Piccolo records what it wrote in `piccolo.lock` (workspace root: digest + source template per generated file) so `piccolo doctor` can tell the two states apart and report them differently:
 
 - **customised** — the user's bytes. Reported as user-owned; Piccolo never suggests refreshing it, because that would advertise destroying their work.
 - **stale** — byte-identical to what Piccolo wrote, but the current template renders something else. WARNed, naming the template to fix and `piccolo setup` as the remedy. Never a `FAIL`.

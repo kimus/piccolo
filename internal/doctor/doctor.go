@@ -548,10 +548,19 @@ func checkGeneratedProvenance(dir string) []Result {
 
 	prov, err := generate.LoadProvenance(dir)
 	if err != nil {
-		add(WARN, "generated-file provenance: unreadable %s: %v", generate.ProvenanceFileName, err)
+		add(WARN, "generated-file provenance: unreadable %s: %v", generate.LockFileName, err)
 		return results
 	}
 	if prov == nil {
+		// A workspace created before the record was renamed has a perfectly good
+		// piccolo.provenance.json sitting next to a missing piccolo.lock, and the
+		// plain "no record" line would tell that user their provenance never existed
+		// when it plainly does. Say which file was found, so the remedy is obvious
+		// rather than a mystery to debug.
+		if _, err := os.Stat(filepath.Join(dir, generate.LegacyFileName)); err == nil {
+			add(OK, "generated-file provenance: record found under the old name %s — 'piccolo setup' rewrites it as %s on the next change", generate.LegacyFileName, generate.LockFileName)
+			return results
+		}
 		add(OK, "generated-file provenance: no record (workspace generated before provenance existed) — 'piccolo setup' writes it on the next change")
 		return results
 	}
@@ -561,7 +570,7 @@ func checkGeneratedProvenance(dir string) []Result {
 		data, readErr := os.ReadFile(filepath.Join(dir, filepath.FromSlash(rel)))
 		if readErr != nil {
 			missing++
-			add(WARN, "generated file is missing: %s (source %s) — restore it or delete its entry from %s", rel, prov.Source(rel), generate.ProvenanceFileName)
+			add(WARN, "generated file is missing: %s (source %s) — restore it or delete its entry from %s", rel, prov.Source(rel), generate.LockFileName)
 			continue
 		}
 		rendered, _ := generate.CurrentRender(prov.Source(rel))

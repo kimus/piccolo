@@ -117,7 +117,7 @@ The gateway always runs. If you enabled the optional **web console** (launcher i
 ```text
 <workspace>/
   piccolo.yaml       # Piccolo-owned launch config and non-secret setup metadata
-  piccolo.provenance.json # what generation wrote: digest + source template per generated file
+  piccolo.lock       # what generation wrote: digest + source template per generated file
   .gitignore         # ignores secrets and runtime caches
   picoclaw/          # PicoClaw-owned home, mounted to /root/.picoclaw
     config.json      # PicoClaw config (JSON schema v3, generated once, then yours)
@@ -156,7 +156,7 @@ There is **no duplicated configuration** between the two files:
 
 `picoclaw/config.json` and the agent files are generated **once** by `piccolo init` and are yours afterwards — edit them directly to change models, add agents, or tune tools. Piccolo never silently regenerates or overwrites them.
 
-Because your copies are yours to keep, a fix to Piccolo's own templates does not reach an existing workspace. Piccolo therefore records what it wrote in `piccolo.provenance.json` — digest plus source template per generated file — and `piccolo doctor` reports the two very different states separately:
+Because your copies are yours to keep, a fix to Piccolo's own templates does not reach an existing workspace. Piccolo therefore records what it wrote in `piccolo.lock` — digest plus source template per generated file — and `piccolo doctor` reports the two very different states separately:
 
 | Finding | Meaning | What to do |
 |---|---|---|

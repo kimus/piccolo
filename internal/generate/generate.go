@@ -359,6 +359,17 @@ func (p *Plan) RecordProvenance(dir string, written []string) error {
 		return err
 	}
 	if prov == nil {
+		// First write after the rename: carry the old record's entries forward
+		// rather than starting empty, or every file it described would silently
+		// become "no record" and doctor would stop telling customised copies from
+		// stale ones.
+		if seeded, serr := SeedFromLegacy(dir); serr != nil {
+			return serr
+		} else if seeded != nil {
+			prov = seeded
+		}
+	}
+	if prov == nil {
 		prov = NewProvenance(VersionStamp())
 	} else if VersionStamp() != "" {
 		prov.Piccolo = VersionStamp()
