@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"io"
 	"os"
+
+	"gopkg.in/yaml.v3"
 	"path/filepath"
 	"strings"
 
@@ -66,19 +68,62 @@ func countEncrypted(cfg *picoclaw.Config) int {
 // workspace. Taking any single credential rather than all of them is deliberate:
 // one failure is enough to say the route is broken, and decrypting all of them
 // would hold every secret in memory at once for no extra signal.
-func verifyOneDecrypts(passphrase, keyPath string, cfg *picoclaw.Config) error {
+// verifyOneDecrypts proves the passphrase and key open a credential this
+// workspace actually relies on. It checks the overlay as well as config.json: with
+// the credentials deliberately living only in the overlay, checking config.json
+// alone would verify nothing at all and report that as a pass.
+func verifyOneDecrypts(passphrase, keyPath string, cfg *picoclaw.Config, overlayPath string) error {
 	for _, m := range cfg.ModelList {
 		for _, k := range m.APIKeys {
-			if !credential.IsEncrypted(k) {
-				continue
+			if credential.IsEncrypted(k) {
+				if _, err := credential.Decrypt(passphrase, keyPath, k); err != nil {
+					return fmt.Errorf("model %q: %w", m.ModelName, err)
+				}
+				return nil
 			}
-			if _, err := credential.Decrypt(passphrase, keyPath, k); err != nil {
-				return fmt.Errorf("model %q: %w", m.ModelName, err)
-			}
-			return nil
 		}
 	}
+	for _, v := range encryptedValuesInFile(overlayPath) {
+		if _, err := credential.Decrypt(passphrase, keyPath, v); err != nil {
+			return fmt.Errorf("picoclaw overlay: %w", err)
+		}
+		return nil
+	}
 	return nil
+}
+
+// encryptedValuesInFile collects every enc:// scalar in a YAML file. Only the
+// values are returned; nothing here reports where they came from, so a diagnostic
+// cannot echo a ciphertext back into a terminal log.
+func encryptedValuesInFile(path string) []string {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	var root any
+	if err := yaml.Unmarshal(data, &root); err != nil {
+		return nil
+	}
+	var out []string
+	var walk func(any)
+	walk = func(v any) {
+		switch t := v.(type) {
+		case string:
+			if credential.IsEncrypted(t) {
+				out = append(out, t)
+			}
+		case map[string]any:
+			for _, child := range t {
+				walk(child)
+			}
+		case []any:
+			for _, child := range t {
+				walk(child)
+			}
+		}
+	}
+	walk(root)
+	return out
 }
 
 // within reports whether path sits inside root after cleaning both, so a key file

@@ -2,6 +2,7 @@ package setup
 
 import (
 	"fmt"
+	"path/filepath"
 	"strings"
 
 	"github.com/kimus/piccolo/internal/configdoc"
@@ -33,13 +34,45 @@ func EncryptWorkspace(doc *configdoc.Doc, secrets picoclaw.Secrets, keyPath, pas
 	// plaintext" depends on whether the overlay sealed it a moment later, and
 	// reporting a sealed value as still-readable is a false alarm the user would go
 	// chasing.
+	// Every secure value in config.json is queued to move into the overlay before
+	// anything is sealed, because the overlay is where the loader looks first: a copy
+	// left behind in config.json is never read and stays readable on disk. Deletion
+	// happens only for values the overlay accepted, so a failed seal cannot lose a
+	// credential.
+	// An empty sidecarPath means this caller has no overlay in play, and nothing is
+	// invented for it: deriving a path from the key location would silently send
+	// credentials to a file nobody reads back.
+	ordinals := map[string]int{}
+	var moves []CredentialMove
+	if sidecarPath != "" {
+		for _, e := range modelEntries(doc) {
+			for _, k := range e.values {
+				if !encryptable(k) {
+					continue
+				}
+				moves = append(moves, CredentialMove{Model: e.alias, Ordinal: ordinals[e.alias], Value: k})
+			}
+			ordinals[e.alias]++
+		}
+		for _, c := range channelEntries(doc) {
+			for _, f := range picoclaw.SecretFieldName {
+				raw, ok := c.settings.GetString(f)
+				if !ok || !encryptable(raw) {
+					continue
+				}
+				moves = append(moves, CredentialMove{Channel: c.name, Field: f, Value: raw})
+			}
+		}
+	}
+	live := liveOverlayFor(doc, secrets, len(moves) > 0)
+
 	var sc SidecarResult
 	if sidecarPath != "" {
 		// Sealed in memory: this function runs before the caller's confirmation, and
 		// writing here would mean a declined run had already rewritten the file that
 		// overrides config.json.
 		var serr error
-		res.SidecarBytes, sc, serr = SealSidecarFile(sidecarPath, keyPath, passphrase)
+		res.SidecarBytes, sc, serr = SealSidecarFile(sidecarPath, keyPath, passphrase, live, moves)
 		if serr != nil {
 			return res, serr
 		}
@@ -48,12 +81,27 @@ func EncryptWorkspace(doc *configdoc.Doc, secrets picoclaw.Secrets, keyPath, pas
 		}
 	}
 	res.Sidecar = sc
+	res.Pruned = append(res.Pruned, sc.Pruned...)
 	// A config.json value may only be DISCARDED when the overlay provably holds a
 	// usable value for the same field: sealed by this run, or already ciphertext
 	// there. If the overlay's own copy is still plaintext, deleting config.json's
 	// would destroy the only readable form of the credential, so those fields are
 	// refused instead.
-	sealed := sealedTargets(append(append([]string(nil), sc.Encrypted...), secrets.EncryptedSecureValues()...))
+	// Two vocabularies, deliberately kept apart. Moved entries are ALREADY locators
+	// ("<model:a>", "<channel:discord.token>") because the writer produced them; the
+	// other two are dotted overlay paths ("model_list.gpt-4o:0.api_keys[0]") that
+	// sealedTargets translates. Passing locators through sealedTargets matches
+	// nothing and fails silently, which is exactly how the first version of this
+	// code left both copies in place while reporting success.
+	sealed := map[string]bool{}
+	for _, l := range sc.Moved {
+		sealed[l] = true
+	}
+	for k, v := range sealedTargets(append(append([]string(nil), sc.Encrypted...), secrets.EncryptedSecureValues()...)) {
+		if v {
+			sealed[k] = true
+		}
+	}
 
 	// Model keys. The sidecar decides per model_list entry, keyed by the alias
 	// plus its duplicate ordinal, so this walks the entries positionally rather
@@ -84,7 +132,7 @@ func EncryptWorkspace(doc *configdoc.Doc, secrets picoclaw.Secrets, keyPath, pas
 		alias, _ := entry.GetString("model_name")
 		name := fmt.Sprintf("model %q api_keys", alias)
 
-		if shields[i].Matched && sealed["model:"+alias] {
+		if sealed["model:"+alias] {
 			// The overlay replaces this entry's WHOLE list on load, so every value
 			// here is dead whether plaintext or ciphertext. A dead plaintext value is
 			// worse than dead: it is a readable copy of a credential that already
@@ -148,18 +196,22 @@ func EncryptWorkspace(doc *configdoc.Doc, secrets picoclaw.Secrets, keyPath, pas
 					continue
 				}
 				name := fmt.Sprintf("channel %q settings.%s", channel, field)
+				if sealed["channel:"+channel+"."+field] {
+					settings.Delete(field)
+					res.addChanged(fmt.Sprintf("channel %q settings.%s (only copy now in picoclaw/%s)", channel, field, picoclaw.SecurityFileName))
+					res.Redundant = append(res.Redundant, name)
+					continue
+				}
 				if sc := secrets.ChannelSecret(channel, field); sc.Matched {
-					if sealed["channel:"+channel+"."+field] {
-						// The overlay owns this field; the copy here is a readable
-						// duplicate of a credential that is already sealed there.
-						settings.Delete(field)
-						res.addChanged(fmt.Sprintf("channel %q settings.%s (only copy now in picoclaw/%s)", channel, field, picoclaw.SecurityFileName))
-						res.Redundant = append(res.Redundant, name)
-						continue
-					}
+					// The overlay governs this field and its own copy is still
+					// plaintext, so this value is the only usable one: it stays, and
+					// the overlay has to be sealed before it can be dropped.
 					res.addRefused(name, "picoclaw/.security.yml sets this field and still holds it as plaintext; seal it first")
 					continue
 				}
+				// No overlay involvement: seal in place. The move queue had no value
+				// for this field, which happens when encryption was already refused
+				// here, so leaving a second encrypted copy in config.json is correct.
 				enc, err := credential.Encrypt(passphrase, keyPath, raw)
 				if err != nil {
 					return res, fmt.Errorf("encrypt %s: %w", name, err)
@@ -222,6 +274,10 @@ type EncryptResult struct {
 	// facts, and a user comparing config.json afterwards would otherwise find
 	// nothing where they expected ciphertext and conclude the run failed.
 	Redundant []string
+	// Pruned lists overlay keys removed because no config.json entry can reach
+	// them: they held tokens nothing loads. Reported so a credential that vanishes
+	// from the secret file is visible after the fact.
+	Pruned []string
 }
 
 // RefusedField names one credential left in plaintext and why.
@@ -266,6 +322,9 @@ func (r EncryptResult) Summary() string {
 	if n := len(r.Redundant); n > 0 {
 		parts = append(parts, fmt.Sprintf("%d duplicate(s) removed from config.json, picoclaw/%s holds the only copy", n, picoclaw.SecurityFileName))
 	}
+	if n := len(r.Pruned); n > 0 {
+		parts = append(parts, fmt.Sprintf("%d unreachable key(s) pruned from picoclaw/%s", n, picoclaw.SecurityFileName))
+	}
 	if n := len(r.Refused); n > 0 {
 		parts = append(parts, fmt.Sprintf("%d left in plaintext because picoclaw/%s governs them and its own copy is unsealed", n, picoclaw.SecurityFileName))
 	}
@@ -296,8 +355,8 @@ func docModelAliases(doc *configdoc.Doc) []string {
 	return out
 }
 
-// sealedTargets indexes the overlay paths the seal pass encrypted into the same
-// vocabulary the config.json refusals use, so "refused here" and "sealed there" can
+// sealedTargets translates dotted overlay paths into the locator vocabulary the
+// config.json branches use, so "refused here" and "sealed there" can
 // be told apart. Names come from SealSidecarFile's dotted paths, e.g.
 // "model_list.gpt-4o:0.api_keys[0]" -> "model:gpt-4o" and
 // "channel_list.discord.settings.token" -> "channel:discord.token".
@@ -320,4 +379,98 @@ func sealedTargets(paths []string) map[string]bool {
 		}
 	}
 	return out
+}
+
+// modelEntryView is one model_list entry reduced to what the move queue needs.
+type modelEntryView struct {
+	alias  string
+	values []string
+}
+
+func modelEntries(doc *configdoc.Doc) []modelEntryView {
+	v, ok := doc.Get("model_list")
+	if !ok {
+		return nil
+	}
+	arr, ok := v.([]configdoc.Value)
+	if !ok {
+		return nil
+	}
+	var out []modelEntryView
+	for _, el := range arr {
+		entry, ok := el.(*configdoc.Doc)
+		if !ok {
+			continue
+		}
+		mv := modelEntryView{}
+		mv.alias, _ = entry.GetString("model_name")
+		if keys, ok := entry.Get("api_keys"); ok {
+			if kv, ok := keys.([]configdoc.Value); ok {
+				for _, k := range kv {
+					if str, ok := k.(string); ok {
+						mv.values = append(mv.values, str)
+					}
+				}
+			}
+		}
+		out = append(out, mv)
+	}
+	return out
+}
+
+type channelEntryView struct {
+	name     string
+	settings *configdoc.Doc
+}
+
+func channelEntries(doc *configdoc.Doc) []channelEntryView {
+	cl, ok := doc.GetObject("channel_list")
+	if !ok {
+		return nil
+	}
+	var out []channelEntryView
+	for _, name := range cl.Keys() {
+		entry, ok := cl.GetObject(name)
+		if !ok {
+			continue
+		}
+		settings, ok := entry.GetObject("settings")
+		if !ok {
+			continue
+		}
+		out = append(out, channelEntryView{name: name, settings: settings})
+	}
+	return out
+}
+
+// liveOverlayFor computes what config.json can address in the overlay. Model keys
+// come from the same resolution the loader performs, so the prune cannot disagree
+// with the merge about which entry owns which key.
+func liveOverlayFor(doc *configdoc.Doc, secrets picoclaw.Secrets, movedAny bool) LiveOverlay {
+	live := LiveOverlay{ModelKeys: map[string]bool{}, Channels: map[string]bool{}}
+	aliases := docModelAliases(doc)
+	live.HaveModels = len(aliases) > 0
+	for i, sh := range secrets.ResolveModels(aliases) {
+		if aliases[i] == "" {
+			continue
+		}
+		live.ModelKeys[picoclaw.ModelOverlayKey(aliases[i], i)] = true
+		if sh.Matched {
+			live.ModelKeys[sh.Key] = true
+		}
+	}
+	if cl, ok := doc.GetObject("channel_list"); ok {
+		live.HaveChannels = len(cl.Keys()) > 0
+		for _, name := range cl.Keys() {
+			live.Channels[name] = true
+		}
+	}
+	return live
+}
+
+// defaultSidecarPath locates the overlay beside the config.json that shares its
+// directory, used only when a caller had no path to offer.
+func defaultSidecarPath(keyPath string) string {
+	home := filepath.Dir(filepath.Dir(keyPath))
+	return filepath.Join(home, picoclaw.SecurityFileName)
 }

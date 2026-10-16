@@ -1267,12 +1267,27 @@ func checkCredentialEncryption(workspaceDir, configPath string, configData []byt
 		results = append(results, Result{Status: s, Message: fmt.Sprintf(format, args...)})
 	}
 
-	n := countEncryptedValues(configData)
-	if n == 0 {
-		// Silent by design: a plaintext workspace is a valid one, and warning on
-		// every workspace that never opted in would train users to ignore the
-		// findings that matter.
+	// Counted across BOTH files. A credential that lives only in the overlay is
+	// still encrypted, and counting config.json alone made an overlay-only
+	// workspace look like it stores plaintext — which is worse than a missing
+	// warning, because it is a confidently wrong one.
+	configJSONCount := countEncryptedValues(configData)
+	overlayCount := len(secrets.EncryptedSecureValues())
+	n := configJSONCount + overlayCount
+	plaintext := secrets.PlaintextSecureValues()
+	keyPath := filepath.Join(workspaceDir, workspace.PicoclawDir, workspace.KeysDirName, workspace.KeyFileName)
+	_, keyErr := os.Stat(keyPath)
+
+	if n == 0 && m.Passphrase() == "" && len(plaintext) == 0 {
+		// Silent by design for a workspace that never opted in. It was NOT silent
+		// when a passphrase was recorded and no ciphertext existed — that state is
+		// "encryption configured, not happening", and it used to fall through here
+		// with nothing to say, which is how a plaintext Discord token survived in a
+		// workspace whose own piccolo.yaml promised better.
 		return results
+	}
+	if n == 0 && m.Passphrase() != "" {
+		add(WARN, "piccolo.yaml records secrets.passphrase but config.json holds no enc:// credential — the workspace is configured for encryption and is storing plaintext; run 'piccolo secrets encrypt' to seal it (a missing or deleted %s causes this)", filepath.Join(workspace.PicoclawDir, workspace.KeysDirName, workspace.KeyFileName))
 	}
 	if m.Passphrase() == "" {
 		add(WARN, "config.json holds %d enc:// credential(s) but piccolo.yaml has no secrets.passphrase — serve cannot deliver a passphrase and the gateway will not start", n)
@@ -1280,8 +1295,8 @@ func checkCredentialEncryption(workspaceDir, configPath string, configData []byt
 	// Checked whether or not the passphrase is present: a workspace missing both
 	// needs two fixes, and reporting only the first would send the user back to
 	// doctor after each one.
-	if _, err := os.Stat(filepath.Join(workspaceDir, workspace.PicoclawDir, workspace.KeysDirName, workspace.KeyFileName)); err != nil {
-		add(WARN, "config.json holds %d enc:// credential(s) but the key file %s is missing or unreadable — PicoClaw derives its AES key from that file's bytes, so no credential can be decrypted without it", n, workspace.KeysDirName+"/"+workspace.KeyFileName)
+	if keyErr != nil {
+		add(WARN, "%d enc:// credential(s) are held but the key file %s is missing or unreadable — PicoClaw derives its AES key from that file's bytes, so no credential can be decrypted without it", n, workspace.KeysDirName+"/"+workspace.KeyFileName)
 		return results
 	}
 	if m.Passphrase() == "" {
@@ -1291,22 +1306,20 @@ func checkCredentialEncryption(workspaceDir, configPath string, configData []byt
 	// a plaintext credential anywhere in it means the gateway is loading plaintext
 	// no matter what config.json says. Reporting "encrypted" without this would be
 	// the false green light in its purest form.
-	if plaintext := secrets.PlaintextSecureValues(); len(plaintext) > 0 {
+	if len(plaintext) > 0 {
 		sort.Strings(plaintext)
 		add(WARN, "picoclaw/%s still holds %d plaintext credential value(s) (%s) that override config.json on load — the gateway reads these, not the enc:// values; run 'piccolo secrets encrypt' to seal them",
 			picoclaw.SecurityFileName, len(plaintext), strings.Join(plaintext, ", "))
 	}
 
-	// The one finding this check must add: piccolo.yaml is committed on purpose, so
-	// recording the passphrase there means a copy of this workspace is a copy of the
-	// credentials. Reporting that beats letting "encrypted" imply protection the
-	// arrangement no longer provides.
-	// Both files are counted. Reporting only config.json understated a workspace
-	// whose overlay is sealed too, and the number is the one thing a user reads.
-	scEncrypted := len(secrets.EncryptedSecureValues())
+	// Credentials are counted across both files, and the split is named: with the
+	// overlay as the intended home, "in config.json" alone would read as though a
+	// model still had a key there.
 	switch {
-	case scEncrypted > 0:
-		add(OK, "credential encryption: %d enc:// value(s) in config.json, %d in picoclaw/%s, passphrase in piccolo.yaml, key present — note: piccolo.yaml is committed, so a copy of this workspace can still be decrypted", n, scEncrypted, picoclaw.SecurityFileName)
+	case overlayCount > 0 && configJSONCount > 0:
+		add(OK, "credential encryption: %d enc:// value(s), %d in config.json and %d in picoclaw/%s, passphrase in piccolo.yaml, key present — note: piccolo.yaml is committed, so a copy of this workspace can still be decrypted", n, configJSONCount, overlayCount, picoclaw.SecurityFileName)
+	case overlayCount > 0:
+		add(OK, "credential encryption: %d enc:// value(s), all in picoclaw/%s, passphrase in piccolo.yaml, key present — note: piccolo.yaml is committed, so a copy of this workspace can still be decrypted", n, picoclaw.SecurityFileName)
 	default:
 		add(OK, "credential encryption: %d enc:// value(s) in config.json, passphrase in piccolo.yaml, key present — note: piccolo.yaml is committed, so a copy of this workspace can still be decrypted", n)
 	}

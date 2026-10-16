@@ -128,78 +128,50 @@ func TestEncryptWorkspaceCoversModelsAndChannels(t *testing.T) {
 // Re-running must be a no-op: an enc:// value is already indirect, and wrapping a
 // ciphertext as if it were a secret would produce a credential that decrypts to
 // base64 noise.
-func TestEncryptWorkspaceIsIdempotent(t *testing.T) {
+// A field the overlay governs is no longer a refusal: its value moves into the
+// overlay, gets sealed there, and the config.json copy is dropped. The invariant
+// this pins is that nothing readable survives anywhere, and that the summary says
+// what actually happened rather than claiming an encryption that produced none.
+func TestShadowedFieldsEndUpSealedAndDuplicatedNowhere(t *testing.T) {
+	sidecar := secretsFromSidecar(t, "model_list:\n  gpt-5.4:0:\n    api_keys:\n      - sk-sidecar-wins\nchannel_list:\n  discord:\n    settings:\n      token: dt-sidecar-wins\n")
 	key := encryptFixtureKey(t)
-	doc, err := configdoc.Parse([]byte(encryptDoc))
+	dir := t.TempDir()
+	scPath := filepath.Join(dir, "sidecar.yml")
+	if err := os.WriteFile(scPath, []byte("model_list:\n  gpt-5.4:0:\n    api_keys:\n      - sk-sidecar-wins\nchannel_list:\n  discord:\n    settings:\n      token: dt-sidecar-wins\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	doc, err := configdoc.Parse([]byte(`{"version":3,"model_list":[{"model_name":"gpt-5.4","api_keys":["sk-CONFIG"]}],"channel_list":{"discord":{"settings":{"token":"dt-CONFIG"}},"slack":{"settings":{"bot_token":"xoxb-plain"}}}}`))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := EncryptWorkspace(doc, picoclaw.Secrets{}, key, "PASS", ""); err != nil {
-		t.Fatal(err)
-	}
-	first := string(doc.Marshal())
-
-	res, err := EncryptWorkspace(doc, picoclaw.Secrets{}, key, "PASS", "")
+	res, err := EncryptWorkspace(doc, sidecar, key, "PASS", scPath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !res.NothingChanged() {
-		t.Fatalf("second run changed things: %v", res.Changed)
-	}
-	if string(doc.Marshal()) != first {
-		t.Error("second run rewrote the file, so a workspace diff shows a change that did not happen")
-	}
-}
-
-// The core of task 3.4: a field the sidecar governs must be refused, not silently
-// rewritten into a value the gateway will never read.
-func TestEncryptWorkspaceRefusesShadowedFields(t *testing.T) {
-	sidecar := secretsFromSidecar(t, "model_list:\n  gpt:0:\n    api_keys:\n      - sk-from-sidecar\nchannel_list:\n  discord:\n    settings:\n      token: dt-from-sidecar\n")
-	key := encryptFixtureKey(t)
-	doc, err := configdoc.Parse([]byte(encryptDoc))
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	res, err := EncryptWorkspace(doc, sidecar, key, "PASS", "")
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// Both shadowed fields refused, with the sidecar named.
-	names := map[string]string{}
-	for _, r := range res.Refused {
-		names[r.Field] = r.Reason
-	}
-	for _, want := range []string{`model "gpt" api_keys`, `channel "discord" settings.token`} {
-		if _, ok := names[want]; !ok {
-			t.Errorf("shadowed field %q was not refused: %v", want, names)
+	cfgOut := string(doc.Marshal())
+	for _, gone := range []string{"sk-CONFIG", "dt-CONFIG"} {
+		if strings.Contains(cfgOut, gone) {
+			t.Errorf("%q survived in config.json:\n%s", gone, cfgOut)
 		}
 	}
-	for f, reason := range names {
-		if !strings.Contains(reason, ".security.yml") {
-			t.Errorf("refusal of %s does not name the sidecar: %q", f, reason)
-		}
+	// A field the overlay never mentions is still sealed, in place, in config.json.
+	if strings.Contains(cfgOut, "xoxb-plain") {
+		t.Error("unshadowed slack bot_token was not sealed")
 	}
-
-	// The unshadowed ones still encrypt, so a partial job is not a failed one.
-	if len(res.Changed) == 0 {
-		t.Fatal("nothing was encrypted despite unshadowed fields being present")
+	scOut := string(res.SidecarBytes)
+	if strings.Contains(scOut, "sk-sidecar-wins") || strings.Contains(scOut, "dt-sidecar-wins") {
+		t.Errorf("plaintext survived in the overlay:\n%s", scOut)
 	}
-	out := string(doc.Marshal())
-	if strings.Contains(out, "xoxb-plain") {
-		t.Error("slack bot_token was not encrypted")
+	if n := strings.Count(scOut, credential.Scheme); n < 2 {
+		t.Errorf("overlay should hold sealed copies of both shadowed values:\n%s", scOut)
 	}
-	// And the refused ones keep the value they had, untouched — the summary must
-	// not be able to claim a workspace that is fully encrypted.
-	if !strings.Contains(out, "sk-plain-one") {
-		t.Error("shadowed model key was rewritten even though it was refused")
+	if len(res.Refused) != 0 {
+		t.Errorf("nothing should be refused: %+v", res.Refused)
 	}
-	if !strings.Contains(out, "dt-plain") {
-		t.Error("shadowed channel token was rewritten even though it was refused")
-	}
-	if sum := res.Summary(); !strings.Contains(sum, "left in plaintext") {
-		t.Errorf("summary hides the refusals: %s", sum)
+	// The summary must not read as "N encrypted" when the work was duplication
+	// removal plus sealing in two different files.
+	if sum := res.Summary(); !strings.Contains(sum, "duplicate") {
+		t.Errorf("summary omits the removals: %s", sum)
 	}
 }
 
@@ -461,30 +433,35 @@ func TestSealedOverlayRemovesTheConfigJSONDuplicate(t *testing.T) {
 // The opposite case, and the dangerous one: if the overlay's own copy is still
 // plaintext, the config.json value is the only usable one. Deleting it would
 // destroy the credential outright.
-func TestUnsealedOverlayKeepsTheConfigJSONCopy(t *testing.T) {
+// A plaintext value already sitting in the overlay is sealed too, and the
+// config.json copy goes with it. Refusing here would be the old behavior and
+// would leave a readable secret in the very file meant to hold them.
+func TestUnsealedOverlayCopyIsSealedNotRefused(t *testing.T) {
 	key := encryptFixtureKey(t)
 	dir := t.TempDir()
 	scPath := filepath.Join(dir, "sidecar.yml")
-	// Overlay holds plaintext and sealing is impossible for it (no key match on
-	// the field name we look at) — assert the copy is retained and refused.
 	body := "model_list:\n  gpt:0:\n    api_keys:\n      - sk-OVERLAY\n"
 	if err := os.WriteFile(scPath, []byte(body), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	// Sealing succeeds here, so to reach the refusal path the overlay must not be
-	// sealable: use a config-only mismatch by pointing the pass at a missing file.
-	doc, err := configdoc.Parse([]byte(`{"version":3,"model_list":[{"model_name":"gpt","api_keys":["sk-JSON"]}],"channel_list":{}}`))
+	doc, err := configdoc.Parse([]byte(`{"version":3,"model_list":[{"model_name":"gpt","api_keys":["sk-JSON"]}]}`))
 	if err != nil {
 		t.Fatal(err)
 	}
-	res, err := EncryptWorkspace(doc, secretsFromSidecar(t, body), key, "PASS", filepath.Join(dir, "absent.yml"))
+	res, err := EncryptWorkspace(doc, secretsFromSidecar(t, body), key, "PASS", scPath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(res.Refused) == 0 {
-		t.Fatal("a shadowed field whose overlay copy is unreadable-as-sealed must be refused")
+	if len(res.Refused) != 0 {
+		t.Errorf("nothing should be refused when the overlay can be sealed: %+v", res.Refused)
 	}
-	if !strings.Contains(string(doc.Marshal()), "sk-JSON") {
-		t.Error("config.json copy was deleted although the overlay held no sealed value")
+	if !strings.Contains(string(res.SidecarBytes), credential.Scheme) {
+		t.Errorf("the overlay value was not sealed:\n%s", res.SidecarBytes)
+	}
+	if strings.Contains(string(res.SidecarBytes), "sk-OVERLAY") {
+		t.Errorf("plaintext left in the overlay:\n%s", res.SidecarBytes)
+	}
+	if strings.Contains(string(doc.Marshal()), "sk-JSON") || strings.Contains(string(doc.Marshal()), "sk-OVERLAY") {
+		t.Errorf("a plaintext copy survived in config.json:\n%s", doc.Marshal())
 	}
 }

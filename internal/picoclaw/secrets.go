@@ -69,6 +69,18 @@ var SecretFieldName = []string{
 	"password", "sasl_password", "nickserv_password", "secret",
 }
 
+// SidecarSentinelValue is what PicoClaw writes in place of a secure field it has
+// moved to the sidecar. Exported because setup must not treat it as a credential
+// to move.
+const SidecarSentinelValue = notHereSentinel
+
+// ModelOverlayKey is the overlay key PicoClaw's merge resolves for the model at a
+// given duplicate ordinal, counted in config.json order. Exposed so a writer and
+// the reader cannot disagree about where a model's keys live.
+func ModelOverlayKey(alias string, occurrence int) string {
+	return alias + ":" + strconv.Itoa(occurrence)
+}
+
 // IsSecretFieldName reports whether a mapping key names a field PicoClaw treats
 // as a secure string.
 func IsSecretFieldName(name string) bool {

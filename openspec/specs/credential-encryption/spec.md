@@ -231,3 +231,25 @@ When `picoclaw/.security.yml` carries a usable value for a field, Piccolo SHALL 
 #### Scenario: An overlay-only credential is not reported as missing
 - **WHEN** `config.json` carries no value for a field the overlay supplies
 - **THEN** doctor reports the credential as present and names the overlay, rather than warning about a missing or placeholder key
+
+### Requirement: The overlay SHALL be created when it has to hold a credential
+Piccolo SHALL create `picoclaw/.security.yml` when a credential must move there and no such file exists, and SHALL NOT create it when there is nothing to move.
+
+#### Scenario: First move creates the file
+- **WHEN** an encrypted workspace with no overlay seals its first credential
+- **THEN** the overlay is created with the sealed value at the key PicoClaw's merge resolves
+- **AND** `config.json` retains the model and channel entries, minus the credential fields
+
+#### Scenario: Nothing to move leaves no new file
+- **WHEN** a workspace has no overlay and no credential to move
+- **THEN** no `picoclaw/.security.yml` is created
+
+#### Scenario: An unreachable overlay key is dropped
+- **WHEN** the overlay holds a credential for a model no longer in `config.json`
+- **THEN** that key is removed during the seal pass
+- **AND** the removal is reported, because a credential vanishing from the secret file must be visible after the fact
+
+#### Scenario: A missing key file is not a silent downgrade
+- **WHEN** a workspace records a passphrase but its key file is absent
+- **THEN** a credential write is refused with that reason rather than storing plaintext
+- **AND** doctor and `secrets check` report the same state

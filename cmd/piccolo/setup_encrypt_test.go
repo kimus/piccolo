@@ -2,7 +2,6 @@ package main
 
 import (
 	"bytes"
-	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -159,20 +158,19 @@ func TestSetupModelFormSealsInEncryptedWorkspace(t *testing.T) {
 	if strings.Contains(out, "sk-TYPED-IN-SETUP") {
 		t.Error("setup wrote the plaintext credential into an encrypted workspace")
 	}
-	if !strings.Contains(out, credential.Scheme) {
-		t.Fatalf("no ciphertext written:\n%s", out)
+	// The one-place rule: the sealed value lives in the overlay, not config.json.
+	sc := string(readFile(t, workspace.NewLayout(dir).SidecarFile()))
+	if !strings.Contains(sc, credential.Scheme) {
+		t.Fatalf("no ciphertext in the overlay:\n%s", sc)
 	}
-	// And it decrypts with the same passphrase serve will read.
-	doc2, err := configdoc.Parse([]byte(out))
-	if err != nil {
-		t.Fatal(err)
+	// And what landed in the overlay decrypts with the same passphrase serve will
+	// read. config.json legitimately carries nothing now, so decrypting from the
+	// overlay is the only meaningful round trip.
+	sealed := firstEncryptedValue(sc)
+	if sealed == "" {
+		t.Fatal("no enc:// value in the overlay to verify")
 	}
-	var cfg picoclaw.Config
-	if err := json.Unmarshal([]byte(out), &cfg); err != nil {
-		t.Fatal(err)
-	}
-	_ = doc2
-	got, err := credential.Decrypt("horse", workspace.NewLayout(dir).KeyFile(), cfg.ModelList[0].APIKeys[0])
+	got, err := credential.Decrypt("horse", workspace.NewLayout(dir).KeyFile(), sealed)
 	if err != nil {
 		t.Fatalf("written credential not decryptable: %v", err)
 	}

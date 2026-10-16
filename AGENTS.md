@@ -127,6 +127,12 @@ Generated from wizard answers, PicoClaw schema v3. Minimum shape:
 
 `piccolo setup` → Container toggles encryption for an existing workspace. Enabling prompts for a passphrase (confirmed twice), generates the key if absent, and rewrites the plaintext already in `config.json` — a toggle that only affected future writes would leave the credentials exactly where they were while the menu claimed "on". Disabling refuses to rewrite existing ciphertext and says so: Piccolo has nowhere to put the plaintext it would produce, and silently decrypting into `config.json` behind a toggle is not the user's decision made for them.
 
+### Credential storage location
+
+In an encrypted workspace, a credential lives in `picoclaw/.security.yml` and NOWHERE else. PicoClaw's loader merges that file over `config.json` field by field and lets it win, so a value duplicated in `config.json` is never read while remaining readable on disk — the exact state `enc://` exists to remove. `setup.EncryptWorkspace` therefore moves each credential into the overlay (sealing it there, copying an existing `enc://` value verbatim rather than re-encrypting), and deletes the `config.json` value only once the overlay has accepted it. The overlay is created when there is something to move and never otherwise; PicoClaw's own empty stubs for absent models are pruned, since they hold tokens nothing loads.
+
+This reverses the earlier "Piccolo never writes `.security.yml`" rule, and the two operations that rule conflated are now separate: writing a NEW credential into a field the overlay governs is still refused (that value would be ignored), while healing the overlay's own plaintext is the point of `secrets encrypt`.
+
 ### `piccolo secrets`
 
 `encrypt` and `check`. `encrypt` generates the workspace key if absent, rewrites every plaintext credential in `config.json` as `enc://`, records `secrets.passphrase`, and appends any missing gitignore entry. It declines a field the sidecar governs — naming the sidecar key — because a ciphertext written where the gateway reads the sidecar is a secret stored for nothing. It resolves the passphrase BEFORE generating a key, so a refused prompt leaves no stray key file in a workspace whose credentials are still plaintext.

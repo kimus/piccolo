@@ -341,16 +341,23 @@ func runSecretsCheck(cmd *cobra.Command) error {
 	if err := json.Unmarshal(data, &cfg); err != nil {
 		return fmt.Errorf("config.json does not parse: %w", err)
 	}
+	secrets := picoclaw.LoadSecrets(layout.Config())
 
 	// Counted from the document, not the typed config: channel_list is user-owned
 	// and absent from picoclaw.Config, so a typed count would tell a workspace with
 	// every token encrypted that it has nothing to protect.
-	encountered := encryptedCredentialCount(doc)
+	encountered := encryptedCredentialCount(doc) + len(secrets.EncryptedSecureValues())
 	if encountered == 0 {
-		fmt.Fprintln(out, "config.json holds no enc:// credential — this workspace stores plaintext (piccolo secrets encrypt changes that)")
+		if m.Passphrase() != "" {
+			// Configured for encryption and storing plaintext: the key file is the
+			// usual cause, since a clone or rsync does not carry a git-ignored dir.
+			fmt.Fprintf(out, "FAIL: piccolo.yaml records a passphrase but nothing is encrypted — the key file %s is missing, so credentials are being written as plaintext\n", rel(dir, layout.KeyFile()))
+			return errors.New("workspace is configured for encryption but is not using it")
+		}
+		fmt.Fprintln(out, "no enc:// credential in config.json or picoclaw/.security.yml — this workspace stores plaintext (piccolo secrets encrypt changes that)")
 		return nil
 	}
-	fmt.Fprintf(out, "config.json holds %d enc:// credential value(s)\n", encountered)
+	fmt.Fprintf(out, "%d enc:// credential value(s) across config.json and picoclaw/%s\n", encountered, picoclaw.SecurityFileName)
 
 	ok := true
 	passphrase := m.Passphrase()
@@ -363,7 +370,7 @@ func runSecretsCheck(cmd *cobra.Command) error {
 		if _, err := os.Stat(keyPath); err != nil {
 			fmt.Fprintf(out, "FAIL: key file %s is missing; every enc:// value depends on its exact bytes\n", rel(dir, keyPath))
 			ok = false
-		} else if err := verifyOneDecrypts(v, keyPath, &cfg); err != nil {
+		} else if err := verifyOneDecrypts(v, keyPath, &cfg, layout.SidecarFile()); err != nil {
 			fmt.Fprintf(out, "FAIL: could not decrypt a credential with this passphrase and key: %v\n", err)
 			ok = false
 		} else {

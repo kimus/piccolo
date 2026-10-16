@@ -2121,6 +2121,15 @@ func updateAgentFrontmatterList(content string, lineRE *regexp.Regexp, key strin
 // piccolo.yaml — so there is no second passphrase to reconcile.
 func (st *setupState) sealBeforeWrite(what string) error {
 	if !st.encrypted {
+		// A recorded passphrase with no key file means the workspace IS configured
+		// for encryption, and the key is what vanished (it is git-ignored, so a
+		// clone or rsync drops it). Returning nil here wrote plaintext silently and
+		// is exactly how a user ended up with a "protected" workspace holding a
+		// readable Discord token while doctor said nothing.
+		if st.manifest.Passphrase() != "" {
+			return fmt.Errorf("this workspace records secrets.passphrase but %s is missing, so credentials cannot be sealed — "+
+				"run 'piccolo secrets encrypt' to generate a new key and re-enter the credentials", rel(st.dir, workspace.NewLayout(st.dir).KeyFile()))
+		}
 		return nil
 	}
 	pass := st.manifest.Passphrase()
@@ -2139,6 +2148,14 @@ func (st *setupState) sealBeforeWrite(what string) error {
 		// The field was already refused by the form-level guard in most cases; this
 		// catches anything that reached the document another way.
 		fmt.Fprintf(st.out, "left unencrypted: %s — %s\n", r.Field, r.Reason)
+	}
+	// The overlay is written BEFORE applyAndConfirm persists config.json, because a
+	// value moved out of config.json exists nowhere else until these bytes are on
+	// disk. Ordering the other way can lose the credential on a failed write.
+	if len(res.SidecarBytes) > 0 {
+		if err := setup.WriteSidecarBytes(res.SidecarPath, res.SidecarBytes); err != nil {
+			return fmt.Errorf("write picoclaw/%s: %w", picoclaw.SecurityFileName, err)
+		}
 	}
 	if len(res.Changed) > 0 {
 		fmt.Fprintf(st.out, "encrypted %d credential(s) for this workspace\n", len(res.Changed))

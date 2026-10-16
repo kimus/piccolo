@@ -363,7 +363,7 @@ Be clear about what that buys, because it is less than `enc://` alone would sugg
 
 | What this does | What this does not do |
 |---|---|
-| removes a readable API key from `config.json` — a grep, a screenshot, a pasted config no longer surfaces it | **protect a copy of the workspace.** The passphrase sits in `piccolo.yaml`, the one file here meant to be committed and shared, so a clone, tarball, or backup of the directory can be decrypted |
+| removes readable API keys from the workspace files — a grep, a screenshot, a pasted config no longer surfaces it | **protect a copy of the workspace.** The passphrase sits in `piccolo.yaml`, the one file here meant to be committed and shared, so a clone, tarball, or backup of the directory can be decrypted |
 | keeps credentials out of a repo that accidentally commits `config.json` | hide anything from someone with host or Docker access — the passphrase is passed to the container env, visible to `docker inspect` |
 | | protect `config.json.bak`, which holds the plaintext the change replaced — it is git-ignored, but a backup you did not mean to keep is still a copy of the old secret |
 

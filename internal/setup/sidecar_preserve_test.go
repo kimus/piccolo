@@ -42,7 +42,7 @@ skills:
 		t.Fatal(err)
 	}
 
-	res, err := EncryptSidecar(sc, key, "PASS")
+	res, err := EncryptSidecar(sc, key, "PASS", LiveOverlay{}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -72,7 +72,7 @@ skills:
 		t.Errorf("expected 3 sealed values, got %d:\n%s", n, s)
 	}
 	// Idempotent, and a second run must not rewrite.
-	res2, err := EncryptSidecar(sc, key, "PASS")
+	res2, err := EncryptSidecar(sc, key, "PASS", LiveOverlay{}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

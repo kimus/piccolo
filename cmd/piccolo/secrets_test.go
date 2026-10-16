@@ -75,12 +75,17 @@ func TestSecretsEncryptWithYesWritesCiphertext(t *testing.T) {
 	if len(cfg.ModelList) == 0 {
 		t.Fatal("model_list disappeared")
 	}
-	keys := cfg.ModelList[0].APIKeys
-	if len(keys) != 1 || !credential.IsEncrypted(keys[0]) {
-		t.Fatalf("api_keys = %v, want one enc:// value", keys)
+	// One-place rule: this credential is sealed into the overlay, and config.json
+	// keeps no copy of a value the loader would ignore anyway.
+	if len(cfg.ModelList[0].APIKeys) != 0 {
+		t.Fatalf("config.json still carries api_keys = %v", cfg.ModelList[0].APIKeys)
 	}
-	if strings.Contains(string(cfgData), "sk-CLICHET") {
-		t.Error("plaintext credential survived in config.json")
+	overlay := readFile(t, workspace.NewLayout(dir).SidecarFile())
+	if !strings.Contains(overlay, credential.Scheme) {
+		t.Fatalf("no sealed credential in the overlay:\n%s", overlay)
+	}
+	if strings.Contains(overlay, "sk-CLICHET") || strings.Contains(string(cfgData), "sk-CLICHET") {
+		t.Error("plaintext credential survived in config.json or the overlay")
 	}
 	// The warning must be shown, not merely exist somewhere in the code.
 	// "committed" is the claim that matters: the passphrase now sits in a file the
@@ -102,8 +107,13 @@ func TestSecretsEncryptWithYesWritesCiphertext(t *testing.T) {
 	if missing, _ := generate.MissingGitignoreEntries(dir); len(missing) != 0 {
 		t.Errorf("gitignore gaps after encrypt: %v", missing)
 	}
-	// And the ciphertext round-trips with the key it was written against.
-	if got, err := credential.Decrypt("horse", filepath.Join(dir, "picoclaw", "keys", "picoclaw_ed25519.key"), keys[0]); err != nil || got != "sk-CLICHET" {
+	// The ciphertext that landed in the overlay round-trips with the key written
+	// beside it.
+	sealed := firstEncryptedValue(overlay)
+	if sealed == "" {
+		t.Fatal("no enc:// value found in the overlay to verify")
+	}
+	if got, err := credential.Decrypt("horse", filepath.Join(dir, "picoclaw", "keys", "picoclaw_ed25519.key"), sealed); err != nil || got != "sk-CLICHET" {
 		t.Errorf("round trip = %q, %v", got, err)
 	}
 }
@@ -416,4 +426,18 @@ func TestSecretsEncryptDeclineWritesNothingAtAll(t *testing.T) {
 	if got := readFile(t, filepath.Join(dir, "picoclaw", "config.json")); got != cfgBefore {
 		t.Error("config.json was rewritten by a declined run")
 	}
+}
+
+// firstEncryptedValue pulls the first enc:// scalar out of the overlay text,
+// tolerant of quoting, so a test can decrypt what the tool wrote.
+func firstEncryptedValue(text string) string {
+	i := strings.Index(text, credential.Scheme)
+	if i < 0 {
+		return ""
+	}
+	rest := text[i:]
+	if j := strings.IndexAny(rest, "\" \n,]"); j >= 0 {
+		return rest[:j]
+	}
+	return strings.TrimSpace(rest)
 }
