@@ -61,12 +61,12 @@ setup:                                      # optional non-secret setup metadata
   channels:
     discord:
       application_id: ""                    # used to regenerate invite/setup links
-secrets:                                    # optional; holds NO secret
-  passphrase_env: ""                        # NAME of a host variable holding the enc:// passphrase
+secrets:                                    # optional; encryption opt-in
+  passphrase: ""                            # enc:// passphrase, stored here
 ```
 
 - Strict decoding: unknown keys SHALL cause a parse error.
-- `secrets.passphrase_env` is the **name** of a host environment variable, never its value, and validation rejects a value-shaped string (it requires the uppercase identifier form) so a pasted passphrase cannot land in this file. An absent `secrets:` block means the workspace is not encrypted.
+- `secrets.passphrase` holds the enc:// decryption passphrase. This is a deliberate trade: it buys a workspace that starts with no host setup, and it costs the at-rest protection `enc://` would otherwise provide, because `piccolo.yaml` is the one workspace file meant to be committed and shared. Only whitespace-only is rejected; any other string is a valid passphrase. An absent `secrets:` block means the workspace stores plaintext.
 - `env:HOST_VAR` refs resolve from host env at `serve`; missing refs → doctor warning + serve-time error.
 
 ### `config.json` generation
@@ -115,7 +115,7 @@ Generated from wizard answers, PicoClaw schema v3. Minimum shape:
 4. Write files. **Create-only**: if files exist, list them and require explicit per-file confirmation before any overwrite.
 5. Ensure `picoclaw/config.json`, `picoclaw/.security.yml`, `picoclaw/.picoclaw.pid`, `picoclaw/launcher-auth.db`, `picoclaw/keys/`, `picoclaw/logs/`, integration auth state, runtime caches, and OS directory metadata (`.DS_Store`) are git-ignored. The required entries live in ONE list, `generate.GitignoreEntries`, read by init, by doctor's check, and by the flat-layout migration: they previously had three copies and had drifted, so a workspace missing the credential sidecar was reported as clean. Add an entry there, never at a call site. Appending never rewrites existing lines, so a user's own rules survive; re-running `init` is therefore the documented heal for a workspace created before an entry was required, and `piccolo doctor` reports missing entries (warning only) because nothing else would.
 
-- `--encrypt-keys` opts the generated credential into PicoClaw `enc://` storage, with `--passphrase-env NAME` naming the host variable that will hold the passphrase (default `manifest.DefaultPassphraseEnv`). The flag must be carried in BOTH paths: `--yes` never enters `wizard.Run`, so the opt-in has to be copied in `inputsFromPrefill` as well as in the wizard. Key generation happens after "Proceed?" and the plan is rebuilt before writing, so an abort creates no key file and a completed run never writes a plaintext byte.
+- `--encrypt-keys` opts the generated credential into PicoClaw `enc://` storage; `--passphrase VALUE` supplies it non-interactively, else it is prompted and confirmed twice. The flag must be carried in BOTH paths: `--yes` never enters `wizard.Run`, so the opt-in has to be copied in `inputsFromPrefill` as well as in the wizard. Key generation happens after "Proceed?" and the plan is rebuilt before writing, so an abort creates no key file and a completed run never writes a plaintext byte.
 
 - Preferred prompt library: `github.com/charmbracelet/huh`. Keep wizard logic separated from file generation (upgrade path to full Bubble Tea).
 - Support non-interactive flags (`--name`, `--owner`, `--purpose`, `--yes`, ...) for scripting.
@@ -124,11 +124,11 @@ Generated from wizard answers, PicoClaw schema v3. Minimum shape:
 
 ### `piccolo secrets`
 
-`encrypt` and `check`. `encrypt` generates the workspace key if absent, rewrites every plaintext credential in `config.json` as `enc://`, records `secrets.passphrase_env`, and appends the gitignore entry. It never creates, edits, or deletes `picoclaw/.security.yml`, and it declines a field the sidecar governs — naming the sidecar key — because a ciphertext written where the gateway reads the sidecar is a secret stored for nothing.
+`encrypt` and `check`. `encrypt` generates the workspace key if absent, rewrites every plaintext credential in `config.json` as `enc://`, records `secrets.passphrase`, and appends any missing gitignore entry. It declines a field the sidecar governs — naming the sidecar key — because a ciphertext written where the gateway reads the sidecar is a secret stored for nothing. It resolves the passphrase BEFORE generating a key, so a refused prompt leaves no stray key file in a workspace whose credentials are still plaintext.
 
-`piccolo setup` seals at one choke point, `applyAndConfirm`, which both the model and channel forms pass through, so a path cannot be forgotten; its `encrypted` posture requires BOTH a key file and a recorded route, since either half alone describes a workspace that cannot boot. When the passphrase variable is unset it refuses the whole write rather than storing plaintext in a workspace the user believes is protected.
+`piccolo setup` seals at one choke point, `applyAndConfirm`, which both the model and channel forms pass through, so a path cannot be forgotten; its `encrypted` posture requires BOTH a key file and a recorded passphrase, since either half alone describes a workspace that cannot boot. When the passphrase is missing it refuses the whole write rather than storing plaintext in a workspace the user believes is protected.
 
-The passphrase is never accepted as a flag value: it comes from the named host variable or from `term.ReadPassword`. A command-line passphrase would be visible in shell history and process listings, which is the exposure the feature reduces.
+`--passphrase` is accepted as a flag, deliberately. Because the value goes into `piccolo.yaml` anyway — a committed file — refusing a flag would protect nothing while making non-interactive use impossible. What is enforced instead is that a prompted passphrase is confirmed twice, since a typo would otherwise be committed as the only way in.
 
 `secrets check` verifies decryptability from the workspace alone, because the alternative failure is a container that exits at boot with an error naming `config.json`.
 

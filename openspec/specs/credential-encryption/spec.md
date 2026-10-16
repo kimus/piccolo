@@ -5,7 +5,7 @@ Let a Piccolo workspace keep model API keys and channel tokens as PicoClaw `enc:
 ciphertext instead of plaintext, and make the consequences of that choice visible.
 
 Scope is deliberate and narrow: Piccolo generates and validates encrypted
-credentials and delivers the passphrase from the host environment at `serve`. It
+credentials and delivers the passphrase from `piccolo.yaml` at `serve`. It
 never writes PicoClaw's `picoclaw/.security.yml`, never stores the passphrase in a
 workspace file, and never prints a credential value. The threat model is at-rest
 exposure — a copied, backed-up, committed, or pasted workspace — not a host or
@@ -46,22 +46,32 @@ Because the container's `~/.ssh` is image content and Piccolo never sets `PICOCL
 - **WHEN** a workspace opts into encryption
 - **THEN** `.gitignore` covers the key directory alongside the existing credential entries
 
-### Requirement: The passphrase SHALL reach the container from the host environment only
-Piccolo SHALL keep the decryption passphrase out of every file it writes. It SHALL name a host environment variable in `piccolo.yaml` and resolve that variable when starting the container.
+### Requirement: The passphrase SHALL be recorded in piccolo.yaml
+Piccolo SHALL store the enc:// decryption passphrase in `piccolo.yaml` under `secrets.passphrase` and deliver it to the container from there, so an encrypted workspace needs no host setup to start. Because `piccolo.yaml` is the one workspace file intended to be committed and shared, Piccolo SHALL state plainly that this does not protect a copy of the workspace, and SHALL NOT describe the arrangement as at-rest protection.
 
-#### Scenario: Host variable is the source
+#### Scenario: Passphrase recorded and delivered
 - **WHEN** `piccolo serve` starts an encrypted workspace
-- **THEN** Piccolo resolves the configured host variable and passes its value to the container as `PICOCLAW_KEY_PASSPHRASE`
-- **AND** the value is not written to `piccolo.yaml`, `config.json`, or any other workspace file
+- **THEN** the container receives `PICOCLAW_KEY_PASSPHRASE` with the value from `secrets.passphrase`
+- **AND** no host environment setup is needed for the workspace to start
 
-#### Scenario: Host variable is unset
-- **WHEN** the configured host variable is not set
-- **THEN** `piccolo serve` fails before creating a container, naming the variable
-- **AND** an existing running gateway is not stopped to replace it with one that cannot decrypt its config
+#### Scenario: No setup ritual
+- **WHEN** a user runs `piccolo init --encrypt-keys` and supplies a passphrase
+- **THEN** `piccolo serve` starts the encrypted gateway with no further configuration
 
-#### Scenario: The exposure is stated honestly
-- **WHEN** a user opts into encryption
-- **THEN** Piccolo states that this protects credentials at rest against copies, backups, commits, and pasted configuration, and does not hide them from someone with host or Docker access
+#### Scenario: The limitation is stated where the choice is made
+- **WHEN** a user opts a workspace into encryption
+- **THEN** the command states that the passphrase is stored in `piccolo.yaml` and that a copy of the workspace can therefore be decrypted
+- **AND** help text, README and doctor use the same framing rather than implying at-rest protection
+
+#### Scenario: A typo cannot be committed silently
+- **WHEN** the passphrase is entered at a prompt
+- **THEN** it is confirmed by a second entry and a mismatch is refused
+- **AND** an empty or whitespace-only value is refused rather than stored
+
+#### Scenario: An existing passphrase is not overwritten by an opt-in
+- **WHEN** `piccolo.yaml` already records a passphrase and a later command supplies a different one
+- **THEN** Piccolo leaves the recorded value in place and says so
+- **AND** does not claim to have rotated anything, since re-encryption under a new passphrase is not performed
 
 ### Requirement: An encrypted workspace that cannot decrypt SHALL be reported before startup
 PicoClaw aborts its whole configuration load when an `enc://` value cannot be resolved, so the gateway exits and the health gate fails with an error naming `config.json`. Piccolo SHALL detect that state from the workspace alone and report the missing piece.
@@ -72,8 +82,8 @@ PicoClaw aborts its whole configuration load when an `enc://` value cannot be re
 - **AND** `piccolo serve` refuses to start for the same reason
 
 #### Scenario: Failure is not reported as a broken config file
-- **WHEN** the passphrase host variable is unset for an encrypted workspace
-- **THEN** the message names the host variable as the missing thing rather than reporting `config.json` as malformed
+- **WHEN** `secrets.passphrase` is empty for a workspace whose config.json holds `enc://` values
+- **THEN** the message names the missing field or key file rather than reporting `config.json` as malformed
 
 ### Requirement: Encryption SHALL compose with the sidecar's precedence
 Piccolo SHALL treat an `enc://` value written to a field governed by `picoclaw/.security.yml` as inert and SHALL refuse to report a field it could not genuinely protect as encrypted.
@@ -120,9 +130,9 @@ Losing the passphrase makes the credentials unrecoverable, and the pre-encryptio
 ### Requirement: Serve delivers both credential inputs and refuses without them
 PicoClaw needs the passphrase AND the exact key file whose bytes feed its derivation, and aborts the config load without either. Piccolo serve SHALL inject both for an encrypted workspace, and SHALL refuse in preflight — before any container is created or any running gateway is parked — when either is missing.
 
-#### Scenario: Both variables reach the container
+#### Scenario: Both inputs reach the container
 - **WHEN** `piccolo serve` starts an encrypted workspace
-- **THEN** the container environment includes `PICOCLAW_KEY_PASSPHRASE` with the resolved host value
+- **THEN** the container environment includes `PICOCLAW_KEY_PASSPHRASE` from `secrets.passphrase`
 - **AND** `PICOCLAW_SSH_KEY_PATH` naming the key's path inside the mounted PicoClaw home
 
 #### Scenario: A host-set value is not overwritten
@@ -130,9 +140,9 @@ PicoClaw needs the passphrase AND the exact key file whose bytes feed its deriva
 - **THEN** Piccolo leaves that entry alone
 
 #### Scenario: Preflight refuses an undeliverable credential
-- **WHEN** `config.json` holds an `enc://` value and the named host variable is unset, empty, or the key file is unreadable
-- **THEN** serve exits non-zero before creating a container
-- **AND** the error names the missing variable or file rather than reporting `config.json` as malformed
+- **WHEN** `config.json` holds an `enc://` value and `secrets.passphrase` is empty, or the key file is unreadable
+- **THEN** serve exits non-zero before creating a container, without contacting the Docker daemon first
+- **AND** the error names the missing field or file rather than reporting `config.json` as malformed
 - **AND** a running gateway keeps running and nothing is parked
 
 #### Scenario: A rejected promotion restores service
@@ -145,16 +155,16 @@ PicoClaw needs the passphrase AND the exact key file whose bytes feed its deriva
 - **THEN** the key path is given explicitly, because PicoClaw's default location is `~/.ssh`, which inside the container is image content that does not survive a recreate
 
 ### Requirement: Reporting states the missing input, not a broken config file
-Doctor and status SHALL report an encrypted workspace's delivery state, and every message SHALL name the missing host variable or key file rather than describing `config.json` as malformed. Neither SHALL print a credential value in either form.
+Doctor and status SHALL report an encrypted workspace's delivery state, and every message SHALL name the missing field or key file rather than describing `config.json` as malformed. Neither SHALL print a credential value in either form.
 
 #### Scenario: Healthy encrypted workspace
-- **WHEN** `config.json` holds `enc://` values, the named host variable resolves, and the key file is readable
-- **THEN** doctor reports an `[OK]` line naming the variable the passphrase comes from
+- **WHEN** `config.json` holds `enc://` values, `secrets.passphrase` is set, and the key file is readable
+- **THEN** doctor reports an `[OK]` line, and states that the passphrase sits in a file the workspace commits
 - **AND** does not report the ciphertext as a placeholder or empty key
 
 #### Scenario: Passphrase variable unset
-- **WHEN** the named host variable is unset or empty
-- **THEN** doctor warns and names the variable, as a warning and never a failure
+- **WHEN** `secrets.passphrase` is empty
+- **THEN** doctor warns and names the field, as a warning and never a failure
 - **AND** `piccolo status` shows the same gap, because the symptom a user notices is chat failing rather than an image or config error
 
 #### Scenario: Key file gone after encryption

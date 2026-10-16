@@ -403,7 +403,7 @@ Piccolo warns when a credential is still an unfilled template. The detection SHA
 - **WHEN** `piccolo init --yes --encrypt-keys` runs with the passphrase variable set
 - **THEN** `config.json` is written with the credential as `enc://`
 - **AND** the plaintext appears in no file in the workspace
-- **AND** `piccolo.yaml` records the variable name and `picoclaw/keys/` holds the key
+- **AND** `piccolo.yaml` records the passphrase and `picoclaw/keys/` holds the key
 
 #### Scenario: Declining keeps today's behaviour
 - **WHEN** `init` runs without the encryption choice
@@ -415,9 +415,9 @@ Piccolo warns when a credential is still an unfilled template. The detection SHA
 - **THEN** no key file exists and no `piccolo.yaml` secrets block was written
 
 #### Scenario: Opt-in without a reachable passphrase stops early
-- **WHEN** encryption is requested but the named host variable is unset and no terminal can supply it
-- **THEN** init fails before writing `config.json`
-- **AND** the error names the variable to export and offers `piccolo secrets encrypt` as the later route
+- **WHEN** encryption is requested with no `--passphrase` value and no terminal to ask for one
+- **THEN** init fails before writing `config.json` or generating a key
+- **AND** the error names the `--passphrase` flag and offers `piccolo secrets encrypt` as the later route
 
 ### Requirement: Setup seals credentials at one choke point
 `piccolo setup` SHALL encrypt a credential it is about to write whenever the workspace posture is encrypted, at the single write path every form shares, and SHALL treat that posture as requiring both a key file and a recorded passphrase route.
