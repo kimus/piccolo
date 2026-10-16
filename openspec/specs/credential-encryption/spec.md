@@ -91,14 +91,19 @@ Piccolo SHALL treat an `enc://` value written to a field governed by `picoclaw/.
 
 `picoclaw/.security.yml` overrides `config.json` per field, so an `enc://` value written to a governed field is dead in exactly the way a plaintext value is.
 
-#### Scenario: Encrypting a shadowed field is refused
-- **WHEN** `piccolo secrets encrypt` encounters a credential whose field is governed by `picoclaw/.security.yml`
-- **THEN** it declines that field, names the sidecar key that decides it, and continues with the fields it can genuinely protect
-- **AND** it does not report the workspace as encrypted when a governed field was skipped
+#### Scenario: Encrypting a shadowed field in config.json is refused
+- **WHEN** a credential write targets a field governed by `picoclaw/.security.yml`
+- **THEN** it is declined with the sidecar key named, rather than stored where it will never be read
+- **AND** the workspace-wide pass seals the overlay's own value instead, so the plaintext does not survive the run
+- **AND** a run that sealed some values but not others reports that, never a blanket success
 
-#### Scenario: No sidecar write
-- **WHEN** any encryption flow runs
-- **THEN** Piccolo does not create, edit, or delete `picoclaw/.security.yml`
+#### Scenario: The sidecar is sealed, never created
+- **WHEN** `piccolo secrets encrypt` runs on a workspace that has a `picoclaw/.security.yml`
+- **THEN** plaintext credential values inside it are rewritten as `enc://`, because the overlay overrides `config.json` per field and would otherwise leave the workspace loading plaintext
+- **AND** values already `enc://` or `file://`, empty values, and every field PicoClaw does not model as a secure string are left untouched
+- **AND** unrelated nodes and comments survive the rewrite, and the file is written with owner-only permissions
+- **WHEN** no `picoclaw/.security.yml` exists
+- **THEN** Piccolo does not create one, since absence is the good state
 
 ### Requirement: The credential format SHALL be verified against the pinned PicoClaw release
 Piccolo SHALL verify its credential format against the pinned PicoClaw release in both directions, and that verification SHALL fail the build on any mismatch.

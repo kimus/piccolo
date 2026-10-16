@@ -10,7 +10,8 @@ import (
 )
 
 // EncryptWorkspace rewrites every plaintext credential in config.json as an
-// enc:// value. It returns what it changed and, separately, what it refused —
+// enc:// value, and then does the same inside picoclaw/.security.yml. It returns
+// what it changed and, separately, what it refused —
 // because a workspace that "has been encrypted" while a shadowed field still
 // holds plaintext is the same false green light this repo just fixed in doctor,
 // and the caller must not be able to report a blanket success.
@@ -18,7 +19,11 @@ import (
 // Only config.json is touched. picoclaw/.security.yml is never written: it is
 // PicoClaw's file, it may already hold enc:// values, and Piccolo has no way to
 // re-encrypt those without the passphrase that produced them.
-func EncryptWorkspace(doc *configdoc.Doc, secrets picoclaw.Secrets, keyPath, passphrase string) (res EncryptResult, err error) {
+// sidecarPath is the workspace's picoclaw/.security.yml, or "" when the caller
+// has no overlay to heal. Required rather than variadic: an omitted argument would
+// silently leave the file that OVERRIDES config.json in plaintext, which is the
+// exact failure this pass exists to close.
+func EncryptWorkspace(doc *configdoc.Doc, secrets picoclaw.Secrets, keyPath, passphrase, sidecarPath string) (res EncryptResult, err error) {
 	if passphrase == "" {
 		return res, credential.ErrPassphraseRequired
 	}
@@ -119,6 +124,22 @@ func EncryptWorkspace(doc *configdoc.Doc, secrets picoclaw.Secrets, keyPath, pas
 		}
 	}
 
+	// The sidecar pass closes the hole the config.json pass cannot: that file is
+	// overridden by the sidecar per field, so leaving a plaintext credential there
+	// would mean reporting a workspace encrypted while the gateway still loads
+	// plaintext. Refusing the shadowed field is correct for a WRITE and wrong for a
+	// HEAL, which is why the two are separate operations.
+	var sc SidecarResult
+	if sidecarPath != "" {
+		sc, err = EncryptSidecar(sidecarPath, keyPath, passphrase)
+		if err != nil {
+			return res, err
+		}
+		for _, f := range sc.Encrypted {
+			res.addChanged(fmt.Sprintf("picoclaw/%s %s", picoclaw.SecurityFileName, f))
+		}
+	}
+	res.Sidecar = sc
 	return res, nil
 }
 
@@ -150,6 +171,10 @@ func encryptable(raw string) bool {
 type EncryptResult struct {
 	Changed []string
 	Refused []RefusedField
+	// Sidecar reports the picoclaw/.security.yml pass separately, because a user
+	// deciding whether their workspace is protected needs to know the overlay was
+	// handled at all — silence there would look like it was skipped.
+	Sidecar SidecarResult
 }
 
 // RefusedField names one credential left in plaintext and why.

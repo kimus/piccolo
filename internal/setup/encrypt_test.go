@@ -57,7 +57,7 @@ func TestEncryptWorkspaceCoversModelsAndChannels(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	res, err := EncryptWorkspace(doc, picoclaw.Secrets{}, key, "PASS")
+	res, err := EncryptWorkspace(doc, picoclaw.Secrets{}, key, "PASS", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -134,12 +134,12 @@ func TestEncryptWorkspaceIsIdempotent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := EncryptWorkspace(doc, picoclaw.Secrets{}, key, "PASS"); err != nil {
+	if _, err := EncryptWorkspace(doc, picoclaw.Secrets{}, key, "PASS", ""); err != nil {
 		t.Fatal(err)
 	}
 	first := string(doc.Marshal())
 
-	res, err := EncryptWorkspace(doc, picoclaw.Secrets{}, key, "PASS")
+	res, err := EncryptWorkspace(doc, picoclaw.Secrets{}, key, "PASS", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -161,7 +161,7 @@ func TestEncryptWorkspaceRefusesShadowedFields(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	res, err := EncryptWorkspace(doc, sidecar, key, "PASS")
+	res, err := EncryptWorkspace(doc, sidecar, key, "PASS", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -213,7 +213,7 @@ func TestEncryptWorkspaceEncryptsNullSidecarEntry(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	res, err := EncryptWorkspace(doc, sidecar, key, "PASS")
+	res, err := EncryptWorkspace(doc, sidecar, key, "PASS", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -236,7 +236,7 @@ func TestEncryptWorkspaceRequiresPassphrase(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := EncryptWorkspace(doc, picoclaw.Secrets{}, key, ""); err == nil {
+	if _, err := EncryptWorkspace(doc, picoclaw.Secrets{}, key, "", ""); err == nil {
 		t.Fatal("empty passphrase accepted")
 	}
 	// And the document was not half-modified.
@@ -271,7 +271,7 @@ func TestEncryptWorkspaceNoCredentialsIsByteIdentical(t *testing.T) {
 		t.Fatal(err)
 	}
 	before := string(doc.Marshal())
-	res, err := EncryptWorkspace(doc, picoclaw.Secrets{}, key, "PASS")
+	res, err := EncryptWorkspace(doc, picoclaw.Secrets{}, key, "PASS", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -293,7 +293,7 @@ func TestPlaceholderIsRefusedEvenThoughDoctorWarnsDifferently(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	res, err := EncryptWorkspace(doc, picoclaw.Secrets{}, key, "PASS")
+	res, err := EncryptWorkspace(doc, picoclaw.Secrets{}, key, "PASS", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -327,7 +327,7 @@ func TestEncryptWorkspaceTouchesOnlyCredentialFields(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	res, err := EncryptWorkspace(doc, picoclaw.Secrets{}, key, "pw")
+	res, err := EncryptWorkspace(doc, picoclaw.Secrets{}, key, "pw", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -356,7 +356,7 @@ func TestEncryptCoversEveryListedSecretField(t *testing.T) {
 		if err != nil {
 			t.Fatalf("%s: %v", field, err)
 		}
-		res, err := EncryptWorkspace(doc, picoclaw.Secrets{}, key, "PASS")
+		res, err := EncryptWorkspace(doc, picoclaw.Secrets{}, key, "PASS", "")
 		if err != nil {
 			t.Fatalf("%s: %v", field, err)
 		}

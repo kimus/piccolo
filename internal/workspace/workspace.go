@@ -7,6 +7,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/kimus/piccolo/internal/picoclaw"
 )
 
 // ManifestName is the Piccolo manifest file marking a workspace.
@@ -55,6 +57,14 @@ func (l Layout) PidFile() string      { return filepath.Join(l.PicoclawHome(), P
 // would encrypt against a different secret and the credential would fail to
 // decrypt only at gateway boot, far from the cause.
 func (l Layout) Keys() string { return filepath.Join(l.PicoclawHome(), KeysDirName) }
+
+// SidecarFile is the host path of PicoClaw's secret overlay, which overrides
+// config.json per field on load. It belongs on the layout for the same reason the
+// key path does: three packages need the identical path and a hand-joined variant
+// would silently skip the file that wins.
+func (l Layout) SidecarFile() string {
+	return filepath.Join(l.PicoclawHome(), picoclaw.SecurityFileName)
+}
 
 // KeyFile is the private key path inside Keys.
 func (l Layout) KeyFile() string { return filepath.Join(l.Keys(), KeyFileName) }

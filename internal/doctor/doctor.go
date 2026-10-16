@@ -269,7 +269,7 @@ func Run(ctx context.Context, opts Options) []Result {
 	// passphrase that reaches the container, and the exact key file whose bytes feed
 	// the derivation. Neither failure is visible from config.json, and both end the
 	// same way — the gateway exits on a config error that names config.json.
-	results = append(results, checkCredentialEncryption(opts.Workspace, configPath, data, m)...)
+	results = append(results, checkCredentialEncryption(opts.Workspace, configPath, data, m, secrets)...)
 
 	// 7. Agents.
 	results = append(results, checkAgents(opts.Workspace, cfg)...)
@@ -1261,7 +1261,7 @@ func checkRunningImage(ctx context.Context, engine Engine, m *manifest.Manifest)
 // variable is exported by whoever runs serve, not stored by Piccolo), and making it
 // a FAIL would turn every daemon-free `doctor` run in a fresh shell into a red
 // board. `serve` is where it becomes fatal, and that guard already exists.
-func checkCredentialEncryption(workspaceDir, configPath string, configData []byte, m *manifest.Manifest) []Result {
+func checkCredentialEncryption(workspaceDir, configPath string, configData []byte, m *manifest.Manifest, secrets picoclaw.Secrets) []Result {
 	var results []Result
 	add := func(s Status, format string, args ...any) {
 		results = append(results, Result{Status: s, Message: fmt.Sprintf(format, args...)})
@@ -1287,11 +1287,29 @@ func checkCredentialEncryption(workspaceDir, configPath string, configData []byt
 	if m.Passphrase() == "" {
 		return results
 	}
+	// The state the heal exists for: the overlay overrides config.json per field, so
+	// a plaintext credential anywhere in it means the gateway is loading plaintext
+	// no matter what config.json says. Reporting "encrypted" without this would be
+	// the false green light in its purest form.
+	if plaintext := secrets.PlaintextSecureValues(); len(plaintext) > 0 {
+		sort.Strings(plaintext)
+		add(WARN, "picoclaw/%s still holds %d plaintext credential value(s) (%s) that override config.json on load — the gateway reads these, not the enc:// values; run 'piccolo secrets encrypt' to seal them",
+			picoclaw.SecurityFileName, len(plaintext), strings.Join(plaintext, ", "))
+	}
+
 	// The one finding this check must add: piccolo.yaml is committed on purpose, so
 	// recording the passphrase there means a copy of this workspace is a copy of the
 	// credentials. Reporting that beats letting "encrypted" imply protection the
 	// arrangement no longer provides.
-	add(OK, "credential encryption: %d enc:// value(s), passphrase in piccolo.yaml, key present — note: piccolo.yaml is committed, so a copy of this workspace can still be decrypted", n)
+	// Both files are counted. Reporting only config.json understated a workspace
+	// whose overlay is sealed too, and the number is the one thing a user reads.
+	scEncrypted := len(secrets.EncryptedSecureValues())
+	switch {
+	case scEncrypted > 0:
+		add(OK, "credential encryption: %d enc:// value(s) in config.json, %d in picoclaw/%s, passphrase in piccolo.yaml, key present — note: piccolo.yaml is committed, so a copy of this workspace can still be decrypted", n, scEncrypted, picoclaw.SecurityFileName)
+	default:
+		add(OK, "credential encryption: %d enc:// value(s) in config.json, passphrase in piccolo.yaml, key present — note: piccolo.yaml is committed, so a copy of this workspace can still be decrypted", n)
+	}
 	return results
 }
 

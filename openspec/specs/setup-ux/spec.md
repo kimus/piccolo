@@ -345,9 +345,10 @@ When `picoclaw/.security.yml` governs a model's `api_keys` or a channel's token 
 - **WHEN** a model covered by a sidecar key is deleted
 - **THEN** setup reports the orphaned key and the consequence for a model re-added under that name
 
-#### Scenario: Piccolo never writes the sidecar
-- **WHEN** any setup or init flow touches credentials
-- **THEN** Piccolo does not create, edit, or delete `picoclaw/.security.yml`
+#### Scenario: The sidecar is sealed rather than left in plaintext
+- **WHEN** an explicit encryption flow runs on a workspace with a `picoclaw/.security.yml`
+- **THEN** plaintext credential values in it are rewritten as `enc://` and unrelated content is preserved
+- **AND** no `picoclaw/.security.yml` is created for a workspace that has none
 
 ### Requirement: Serve refuses to start over an unreadable sidecar
 Piccolo serve SHALL fail before starting a container when `picoclaw/.security.yml` exists and cannot be parsed, because PicoClaw aborts its whole config load on that error and the health gate would otherwise report a failure naming the wrong file.

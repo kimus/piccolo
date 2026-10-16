@@ -33,8 +33,11 @@ piccolo secrets encrypt [flags]
 PicoClaw accepts credentials as enc://<base64> and decrypts them at load, so a
 workspace can stop holding API keys and bot tokens as plaintext.
 
-WHAT THIS DOES: removes a readable API key from config.json. A casual grep, a
-screenshot, or a pasted config no longer surfaces the credential.
+WHAT THIS DOES: removes a readable API key from config.json AND from
+picoclaw/.security.yml — the overlay PicoClaw loads INSTEAD of config.json for
+any field it names, so sealing only config.json would leave the workspace
+reporting itself encrypted while the gateway still read plaintext. Absent
+overlay is left absent: it is never created here.
 
 WHAT THIS DOES NOT DO: protect a copy of this workspace. The passphrase is stored
 in piccolo.yaml, which is the one file here meant to be committed and shared, so
@@ -63,7 +66,7 @@ func newSecretsEncryptCmd() *cobra.Command {
 	var yes bool
 	cmd := &cobra.Command{
 		Use:   "encrypt",
-		Short: "Generate a key if needed and rewrite config.json credentials as enc://",
+		Short: "Generate a key if needed and rewrite config.json and .security.yml credentials as enc://",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runSecretsEncrypt(cmd, passphrase, yes)
@@ -140,7 +143,7 @@ func runSecretsEncrypt(cmd *cobra.Command, flagPassphrase string, yes bool) erro
 	}
 
 	secrets := picoclaw.LoadSecrets(layout.Config())
-	res, err := setup.EncryptWorkspace(doc, secrets, keyPath, passphrase)
+	res, err := setup.EncryptWorkspace(doc, secrets, keyPath, passphrase, layout.SidecarFile())
 	if err != nil {
 		return err
 	}

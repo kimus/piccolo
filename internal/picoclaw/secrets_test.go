@@ -219,3 +219,58 @@ func TestHasUsableKey(t *testing.T) {
 		t.Error("sentinel detection")
 	}
 }
+
+// The reader must classify sidecar values by state, since "the workspace is
+// encrypted" is only true if the file that overrides config.json is sealed too.
+func TestSecretsClassifyValuesByState(t *testing.T) {
+	s := LoadSecrets(sidecarFixture(t, `model_list:
+  gpt-4o:0:
+    api_keys:
+      - "enc://AAAA"
+      - sk-readable
+  other:0:
+    api_keys: []
+channel_list:
+  discord:
+    settings:
+      token: dt-readable
+      proxy: http://not-a-secret
+  slack:
+    settings:
+      bot_token: "file://keys/slack.token"
+`))
+	if s.Err != nil {
+		t.Fatal(s.Err)
+	}
+	gotPlain := map[string]bool{}
+	for _, p := range s.PlaintextSecureValues() {
+		gotPlain[p] = true
+	}
+	for _, want := range []string{"model_list.gpt-4o:0.api_keys[1]", "channel_list.discord.settings.token"} {
+		if !gotPlain[want] {
+			t.Errorf("%q not reported as plaintext: %v", want, gotPlain)
+		}
+	}
+	// Non-secret fields, empty lists, already-sealed and indirect values stay out.
+	for _, notWant := range []string{"model_list.gpt-4o:0.api_keys[0]", "channel_list.discord.settings.proxy", "channel_list.slack.settings.bot_token"} {
+		if gotPlain[notWant] {
+			t.Errorf("%q wrongly reported as plaintext", notWant)
+		}
+	}
+	if enc := s.EncryptedSecureValues(); len(enc) != 1 || enc[0] != "model_list.gpt-4o:0.api_keys[0]" {
+		t.Errorf("encrypted paths = %v", enc)
+	}
+}
+
+// The ambiguous name must stay out of the list, or the sidecar walk would rewrite
+// a real username into ciphertext and PicoClaw would send that as the username.
+func TestSecretFieldNameExcludesAmbiguousNames(t *testing.T) {
+	if IsSecretFieldName("username") {
+		t.Error("username is a SecureString in one struct and a plain string in another; rewriting by name would corrupt the plain one")
+	}
+	for _, n := range []string{"token", "api_keys", "nickserv_password", "webhook_url"} {
+		if !IsSecretFieldName(n) {
+			t.Errorf("%q must be treated as a credential", n)
+		}
+	}
+}

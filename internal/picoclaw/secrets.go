@@ -23,6 +23,7 @@ package picoclaw
 // print a secret by accident.
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
@@ -35,6 +36,11 @@ import (
 // SecurityFileName is PicoClaw's sidecar, always beside config.json.
 const SecurityFileName = ".security.yml"
 
+// EncSchemePrefix is PicoClaw's encrypted-value marker. Declared here rather than
+// imported from internal/credential so this package keeps no dependency on the
+// crypto it only reports about.
+const EncSchemePrefix = "enc://"
+
 // FileSchemePrefix marks a credential value that PicoClaw reads from a sibling
 // file instead of carrying inline. Like enc:// it is already indirect, so nothing
 // that writes credentials should treat it as plaintext to be wrapped.
@@ -45,23 +51,33 @@ const FileSchemePrefix = "file://"
 // JSON it arrives as the bare string, brackets included.
 const notHereSentinel = "[NOT_HERE]"
 
-// SecretFieldName lists the channel settings fields PicoClaw models as
-// SecureString (verified against pkg/config/config.go:594-723 of v0.3.1). Kept in
-// one place so doctor's channel check, the sidecar reader, and encryption cannot
-// drift apart on which field counts as a credential.
+// SecretFieldName lists every field PicoClaw models as SecureString/SecureStrings,
+// in the order a channel's settings should be probed (primary bot credential
+// first). Verified mechanically against pkg/config of the pinned release: each
+// name appears ONLY on a SecureString field, which is what makes "encrypt any
+// scalar under this key" safe rather than a guess.
 //
-// The order matters, not just the membership: the channel check takes the FIRST
-// listed field present in a channel's settings as "the" credential, so the
-// primary bot token comes before a channel's secondary secrets. Dropping a field
-// here would leave a real credential unencrypted and unwarned about, which is the
-// silent-under-protection failure this list exists to avoid.
-//
-// webhook_url is included because upstream treats it as a secret: a webhook URL
-// carries its own capability, so committing one is committing a credential.
+// `username` is deliberately absent. It is the one secure-looking name that is
+// ambiguous upstream — one SecureString use and one plain string use — so
+// rewriting it by name would turn a real username into ciphertext and PicoClaw
+// would send the ciphertext as the username. TestSecureFieldNamesAreUnambiguous
+// re-checks that claim against the module cache when it is present.
 var SecretFieldName = []string{
 	"token", "bot_token", "app_token", "client_secret", "app_secret",
-	"access_token", "channel_access_token", "channel_secret",
-	"webhook_url", "password",
+	"api_key", "api_keys", "access_token", "channel_access_token", "channel_secret",
+	"webhook_url", "auth_token", "verification_token", "encrypt_key",
+	"password", "sasl_password", "nickserv_password", "secret",
+}
+
+// IsSecretFieldName reports whether a mapping key names a field PicoClaw treats
+// as a secure string.
+func IsSecretFieldName(name string) bool {
+	for _, n := range SecretFieldName {
+		if n == name {
+			return true
+		}
+	}
+	return false
 }
 
 // Secrets is the parsed sidecar. The zero value means "no file", which is the
@@ -76,6 +92,12 @@ type Secrets struct {
 	// per field, so an empty `settings: {}` does NOT clear a token config.json
 	// still carries.
 	channels map[string]map[string]string
+	// plaintext and encrypted hold secure-field values by state, recorded during
+	// the load below so no later pass has to re-walk the document. Counting both
+	// lets a report say how many values each file protects rather than describing
+	// only config.json, which understates a workspace whose overlay is also sealed.
+	plaintext []string
+	encrypted []string
 	// Present reports whether the file existed.
 	Present bool
 	// Err is a parse failure. PicoClaw treats one as fatal — LoadConfig returns
@@ -102,7 +124,70 @@ func LoadSecrets(configPath string) Secrets {
 	s := Secrets{Present: true, models: map[string]bool{}, channels: map[string]map[string]string{}}
 	s.loadModels(root)
 	s.loadChannels(root)
+	s.collectPlaintext(root, "")
 	return s
+}
+
+// collectPlaintext records every secure-field value the file still holds as
+// readable text. Names are dotted paths so a report can point at the exact entry
+// without ever quoting the value itself.
+func (s *Secrets) collectPlaintext(node any, path string) {
+	switch v := node.(type) {
+	case map[string]any:
+		for key, child := range v {
+			next := key
+			if path != "" {
+				next = path + "." + key
+			}
+			if IsSecretFieldName(key) {
+				s.noteSecureValues(child, next)
+			}
+			s.collectPlaintext(child, next)
+		}
+	case []any:
+		for i, item := range v {
+			s.collectPlaintext(item, fmt.Sprintf("%s[%d]", path, i))
+		}
+	}
+}
+
+// noteSecureValues records one secure field's value(s) by state: readable text goes
+// to plaintext, ciphertext to encrypted. Empty values are neither — they are no
+// credential, not a protected one. A file:// reference counts as neither, since it
+// is indirect by design rather than sealed.
+func (s *Secrets) noteSecureValues(v any, path string) {
+	switch t := v.(type) {
+	case string:
+		s.noteSecureValue(t, path)
+	case []any:
+		for i, item := range t {
+			if str, ok := item.(string); ok {
+				s.noteSecureValue(str, fmt.Sprintf("%s[%d]", path, i))
+			}
+		}
+	}
+}
+
+func (s *Secrets) noteSecureValue(raw, path string) {
+	v := strings.TrimSpace(raw)
+	switch {
+	case v == "":
+		return
+	case strings.HasPrefix(v, EncSchemePrefix):
+		s.encrypted = append(s.encrypted, path)
+	case strings.HasPrefix(v, FileSchemePrefix):
+		// Indirect already, and not this package's business.
+	default:
+		s.plaintext = append(s.plaintext, path)
+	}
+}
+
+func isReadableSecret(raw string) bool {
+	v := strings.TrimSpace(raw)
+	if v == "" || strings.HasPrefix(v, EncSchemePrefix) || strings.HasPrefix(v, FileSchemePrefix) {
+		return false
+	}
+	return true
 }
 
 // ModelSecret is the sidecar's say over one model_list entry.
@@ -172,6 +257,22 @@ func (s Secrets) OrphanKeys(aliases []string) []string {
 }
 
 // ChannelSecret reports the sidecar's value for one channel setting field.
+// PlaintextSecureValues lists the secure-field values the sidecar still holds as
+// readable text, as dotted paths. It is the check that catches the state encryption
+// cannot be assumed to have fixed: because the overlay overrides config.json per
+// field, a workspace with an encrypted config.json and a plaintext overlay is not
+// encrypted — it only looks encrypted, which is the failure shape this whole area
+// keeps having to hunt down.
+func (s Secrets) PlaintextSecureValues() []string {
+	return append([]string(nil), s.plaintext...)
+}
+
+// EncryptedSecureValues lists the secure-field paths the sidecar holds as enc://
+// ciphertext, proving the overlay is sealed rather than merely present.
+func (s Secrets) EncryptedSecureValues() []string {
+	return append([]string(nil), s.encrypted...)
+}
+
 func (s Secrets) ChannelSecret(channel, field string) ChannelSecret {
 	v, ok := s.channels[channel][field]
 	if !ok {

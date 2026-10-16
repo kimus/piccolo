@@ -2097,7 +2097,7 @@ func (st *setupState) sealBeforeWrite(what string) error {
 			"set it and repeat the change, so the credential written here is one the gateway can decrypt")
 	}
 	key := workspace.NewLayout(st.dir).KeyFile()
-	res, err := setup.EncryptWorkspace(st.doc, st.secrets, key, pass)
+	res, err := setup.EncryptWorkspace(st.doc, st.secrets, key, pass, workspace.NewLayout(st.dir).SidecarFile())
 	if err != nil {
 		return fmt.Errorf("encrypt %s: %w", what, err)
 	}
@@ -2347,7 +2347,7 @@ func (st *setupState) encryptExistingCredentials(passphrase string) error {
 		keyPath = generated
 		fmt.Fprintf(st.out, "credential key: %s\n", rel(st.dir, keyPath))
 	}
-	res, err := setup.EncryptWorkspace(st.doc, st.secrets, keyPath, passphrase)
+	res, err := setup.EncryptWorkspace(st.doc, st.secrets, keyPath, passphrase, "")
 	if err != nil {
 		return err
 	}
