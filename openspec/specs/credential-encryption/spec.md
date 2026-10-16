@@ -13,21 +13,22 @@ Docker operator, who can read the container environment regardless.
 
 ## Requirements
 ### Requirement: Credentials SHALL be encryptable at rest
-Piccolo SHALL be able to store a model API key or channel token in `config.json` as a PicoClaw `enc://` credential instead of plaintext, and SHALL encrypt the value as it writes it so that plaintext never lands in the workspace file.
+Piccolo SHALL store a model API key or channel token in `config.json` as a PicoClaw `enc://` credential by default, and SHALL encrypt the value as it writes it so that plaintext never lands in the workspace file. `--no-encrypt` opts out.
 
 #### Scenario: Encrypted credential is written
 - **WHEN** a credential is stored for a workspace that has opted into encryption
 - **THEN** Piccolo writes the value as `enc://` followed by base64 of salt, nonce, and ciphertext
 - **AND** the plaintext value does not appear anywhere in `config.json`
 
-#### Scenario: Opt-in is explicit
-- **WHEN** a workspace has not opted into encryption
-- **THEN** Piccolo writes credentials exactly as it does today
-- **AND** no key file, manifest field, or container environment variable is created for it
+#### Scenario: Opting out is available and works
+- **WHEN** a workspace runs `piccolo init --no-encrypt`
+- **THEN** generated `config.json` contains plaintext credentials
+- **AND** no key file and no `secrets` block are created
 
-#### Scenario: The default does not change
-- **WHEN** `piccolo init` runs without the encryption choice and without `--encrypt-keys`
-- **THEN** generated `config.json` contains plaintext credentials as before
+#### Scenario: Encryption is the default
+- **WHEN** `piccolo init` runs with no encryption flag of any kind
+- **THEN** the credential is written as `enc://`
+- **AND** the key file and the `secrets.passphrase` entry exist
 
 ### Requirement: The encryption key SHALL live in the mounted PicoClaw home and be named by environment
 Because the container's `~/.ssh` is image content and Piccolo never sets `PICOCLAW_HOME`, Piccolo SHALL store the SSH private key under `picoclaw/keys/` in the workspace and SHALL inject `PICOCLAW_SSH_KEY_PATH` naming its container path, which is the key-location rule PicoClaw accepts for a path outside `~/.ssh`.
@@ -55,11 +56,11 @@ Piccolo SHALL store the enc:// decryption passphrase in `piccolo.yaml` under `se
 - **AND** no host environment setup is needed for the workspace to start
 
 #### Scenario: No setup ritual
-- **WHEN** a user runs `piccolo init --encrypt-keys` and supplies a passphrase
+- **WHEN** a user runs `piccolo init` and supplies a passphrase
 - **THEN** `piccolo serve` starts the encrypted gateway with no further configuration
 
 #### Scenario: The limitation is stated where the choice is made
-- **WHEN** a user opts a workspace into encryption
+- **WHEN** a user enables encryption for a workspace, or it is enabled by default
 - **THEN** the command states that the passphrase is stored in `piccolo.yaml` and that a copy of the workspace can therefore be decrypted
 - **AND** help text, README and doctor use the same framing rather than implying at-rest protection
 
@@ -123,9 +124,10 @@ Losing the passphrase makes the credentials unrecoverable, and the pre-encryptio
 - **THEN** Piccolo warns that a lost passphrase cannot be recovered and that the written backup holds the plaintext values
 - **AND** the rewrite happens only after that warning is shown
 
-#### Scenario: Nothing is encrypted without a request
-- **WHEN** no encryption command or flag is used
-- **THEN** Piccolo does not encrypt anything, does not generate a key, and does not change `piccolo.yaml`
+#### Scenario: Turning encryption off does not rewrite existing ciphertext
+- **WHEN** a user disables encryption on a workspace whose credentials are already `enc://`
+- **THEN** Piccolo leaves those values encrypted and working
+- **AND** states that later credentials would be stored as plaintext, rather than silently decrypting anything
 
 ### Requirement: Serve delivers both credential inputs and refuses without them
 PicoClaw needs the passphrase AND the exact key file whose bytes feed its derivation, and aborts the config load without either. Piccolo serve SHALL inject both for an encrypted workspace, and SHALL refuse in preflight — before any container is created or any running gateway is parked — when either is missing.

@@ -385,7 +385,7 @@ func initPassphrase(preset string, out io.Writer) (string, error) {
 	}
 	if !stdinIsTerminal() {
 		return "", errors.New("encryption was requested with no --passphrase value and there is no terminal to ask for one — " +
-			"pass --passphrase, or drop --encrypt-keys and run 'piccolo secrets encrypt' later")
+			"pass --passphrase, or run 'piccolo secrets encrypt' later")
 	}
 	fmt.Fprint(out, "Choose a passphrase (it will be stored in piccolo.yaml): ")
 	return confirmPassphrase(out)

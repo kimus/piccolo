@@ -31,7 +31,7 @@ const encryptedWorkspaceAlias = "gpt-4o"
 func encryptedWorkspace(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()
-	stdout, err := execInit(t, dir, "--yes", "--encrypt-keys", "--passphrase", "horse",
+	stdout, err := execInit(t, dir, "--yes", "--passphrase", "horse",
 		"--name", "P", "--owner", "K", "--purpose", "personal",
 		"--provider", "openai", "--model", "gpt-4o", "--api-key", "sk-original")
 	if err != nil {
@@ -236,7 +236,7 @@ func TestSetupSealRefusesWithoutPassphrase(t *testing.T) {
 // the user never opted in.
 func TestSetupSealIsNoOpWhenNotEncrypted(t *testing.T) {
 	dir := t.TempDir()
-	stdout, err := execInit(t, dir, "--yes", "--name", "P", "--owner", "K", "--purpose", "personal",
+	stdout, err := execInit(t, dir, "--yes", "--no-encrypt", "--name", "P", "--owner", "K", "--purpose", "personal",
 		"--provider", "openai", "--model", "gpt-4o", "--api-key", "sk-plain")
 	if err != nil {
 		t.Fatalf("init: %v\n%s", err, stdout)
@@ -267,4 +267,103 @@ func TestSetupSealIsNoOpWhenNotEncrypted(t *testing.T) {
 
 func patchModelKeyForTest(doc *configdoc.Doc, lookup, alias, key string) error {
 	return setup.PatchModel(doc, lookup, alias, "openai", "gpt-4o", key, "")
+}
+
+// The setup toggle has to encrypt what is already in the workspace. A toggle that
+// only changed future writes would leave the credentials sitting exactly where
+// they were while the menu said "on" — the same false state this feature keeps
+// having to chase down.
+func TestSetupEncryptionToggleOnEncryptsExistingPlaintext(t *testing.T) {
+	dir := plaintextWorkspaceForToggle(t)
+	st := newSetupStateForTest(t, dir)
+	if st.encrypted {
+		t.Fatal("fixture is already encrypted")
+	}
+	setPassphraseInManifest(t, dir, "")
+	st.manifest = reloadManifest(t, dir)
+
+	// The passphrase arrives through the same check the form performs.
+	if err := st.encryptExistingCredentials("horse"); err != nil {
+		t.Fatalf("enable: %v", err)
+	}
+	setPassphraseInManifest(t, dir, "horse")
+	st.manifest = reloadManifest(t, dir)
+	st.recomputeEncrypted()
+
+	if !st.encrypted {
+		t.Error("posture flag did not follow the change")
+	}
+	out := readFile(t, st.path)
+	if strings.Contains(out, "sk-plain") {
+		t.Error("plaintext credential survived enabling")
+	}
+	if !strings.Contains(out, credential.Scheme) {
+		t.Fatalf("no ciphertext written:\n%s", out)
+	}
+	// The key file is created on demand, not assumed to exist.
+	if _, err := os.Stat(workspace.NewLayout(dir).KeyFile()); err != nil {
+		t.Errorf("key file not generated: %v", err)
+	}
+}
+
+// Disabling must not decrypt anything behind the user's back — Piccolo has nowhere
+// to put the plaintext it would produce — and must not claim it did.
+func TestSetupEncryptionToggleOffLeavesCiphertext(t *testing.T) {
+	dir := encryptedWorkspace(t)
+	before := readFile(t, workspace.NewLayout(dir).Config())
+	if !strings.Contains(before, credential.Scheme) {
+		t.Fatal("fixture lost its ciphertext")
+	}
+	setPassphraseInManifest(t, dir, "")
+
+	after := readFile(t, workspace.NewLayout(dir).Config())
+	if after != before {
+		t.Error("clearing the passphrase rewrote config.json; disabling must not touch existing ciphertext")
+	}
+	st := newSetupStateForTest(t, dir)
+	if st.encrypted {
+		t.Error("posture still 'on' with no passphrase recorded")
+	}
+}
+
+// Enabling twice is a no-op rather than a re-encryption, which would wrap an
+// enc:// value as if it were a secret.
+func TestSetupEncryptExistingIsIdempotent(t *testing.T) {
+	dir := encryptedWorkspace(t)
+	st := newSetupStateForTest(t, dir)
+	before := string(st.doc.Marshal())
+	if err := st.encryptExistingCredentials(""); err != nil {
+		t.Fatalf("second enable: %v", err)
+	}
+	if got := string(st.doc.Marshal()); got != before {
+		t.Error("re-enabling rewrote already-encrypted credentials")
+	}
+}
+
+func TestSetupToggleRejectsBlankOrMismatchedPassphrase(t *testing.T) {
+	dir := encryptedWorkspace(t)
+	setPassphraseInManifest(t, dir, "")
+	st := newSetupStateForTest(t, dir)
+	// No terminal in tests, so the prompt path cannot run; the validation that
+	// guards it is exercised directly.
+	if err := st.encryptExistingCredentials("   "); err == nil {
+		t.Error("blank passphrase accepted")
+	}
+	if err := st.encryptExistingCredentials(""); err == nil {
+		t.Error("empty passphrase accepted on a workspace with nothing recorded")
+	}
+}
+
+// plaintextWorkspaceForToggle is the state a user would toggle from: init default
+// produces ciphertext, so this builds the opted-out workspace.
+func plaintextWorkspaceForToggle(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	stdout, err := execInit(t, dir, "--yes", "--no-encrypt",
+		"--name", "P", "--owner", "K", "--purpose", "personal",
+		"--provider", "openai", "--model", "gpt-4o", "--api-key", "sk-plain")
+	if err != nil {
+		t.Fatalf("init: %v\n%s", err, stdout)
+	}
+	return dir
 }

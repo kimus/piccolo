@@ -365,10 +365,10 @@ Piccolo SHALL let a user choose encrypted storage when supplying a model API key
 - **THEN** it offers encrypted storage of the workspace credentials
 - **AND** declining leaves the generated `config.json` exactly as it is generated today
 
-#### Scenario: Non-interactive init does not opt in
-- **WHEN** `piccolo init` runs non-interactively without `--encrypt-keys`
-- **THEN** credentials are written as plaintext
-- **AND** no key file or manifest field is created
+#### Scenario: Non-interactive init needs the passphrase
+- **WHEN** `piccolo init --yes` runs with no `--passphrase`
+- **THEN** init refuses before writing anything
+- **AND** the error names `--passphrase` and offers `--no-encrypt` as the way out
 
 #### Scenario: Setup stores a key encrypted for an opted-in workspace
 - **WHEN** a user enters a credential in a workspace that has opted into encryption
@@ -400,7 +400,7 @@ Piccolo warns when a credential is still an unfilled template. The detection SHA
 `piccolo init` SHALL offer the credential-storage choice in the interactive wizard and SHALL accept it non-interactively, and a choice made on either path SHALL reach the generated workspace. The key SHALL be generated only after the plan is confirmed, and the plan SHALL be rebuilt from the encrypted value before anything is written.
 
 #### Scenario: Non-interactive opt-in is not dropped
-- **WHEN** `piccolo init --yes --encrypt-keys` runs with the passphrase variable set
+- **WHEN** `piccolo init --yes --passphrase VALUE` runs
 - **THEN** `config.json` is written with the credential as `enc://`
 - **AND** the plaintext appears in no file in the workspace
 - **AND** `piccolo.yaml` records the passphrase and `picoclaw/keys/` holds the key
@@ -435,3 +435,30 @@ Piccolo warns when a credential is still an unfilled template. The detection SHA
 #### Scenario: Half-configured posture is not treated as encrypted
 - **WHEN** a key file exists but no passphrase route is recorded, or the reverse
 - **THEN** setup does not behave as though credentials can be sealed
+
+### Requirement: Setup toggles credential encryption
+`piccolo setup` SHALL let a user turn enc:// credential storage on or off for an existing workspace, alongside the other container-level choices. Enabling asks for a passphrase and encrypts the plaintext credentials already in `config.json`; disabling leaves existing ciphertext alone and says so.
+
+#### Scenario: Enabling encrypts what is already there
+- **WHEN** a user enables credential encryption on a workspace holding plaintext
+- **THEN** the passphrase is requested and confirmed before anything is written
+- **THEN** the existing plaintext credentials are rewritten as `enc://`
+- **AND** `secrets.passphrase` is recorded in `piccolo.yaml`
+
+#### Scenario: A mismatched confirmation is refused
+- **WHEN** the two passphrase entries differ
+- **THEN** setup writes nothing and reports the mismatch
+
+#### Scenario: Disabling does not silently decrypt
+- **WHEN** a user disables encryption on a workspace whose credentials are already `enc://`
+- **THEN** setup leaves those values encrypted and functional
+- **AND** states that credentials entered afterwards would be plaintext
+
+#### Scenario: The posture is reflected everywhere at once
+- **WHEN** the toggle changes the workspace's encryption state
+- **THEN** the model list's key state, each credential field's help text, and the sealing behaviour on later writes all follow it
+- **AND** `piccolo doctor` on the same workspace agrees
+
+#### Scenario: Turning it on with credentials already encrypted
+- **WHEN** a user enables encryption on a workspace that is already encrypted
+- **THEN** setup reports that there is nothing left to encrypt rather than rewriting or failing

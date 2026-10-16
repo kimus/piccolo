@@ -29,11 +29,13 @@ type initFlags struct {
 	apiBase   string
 	web       bool
 	shell     bool
-	// encryptKeys opts the generated credential into PicoClaw's enc:// storage.
-	// The default is plaintext, so nothing changes for an existing caller.
-	encryptKeys bool
-	passphrase  string
-	yes         bool
+	// noEncrypt turns off the default. Credentials are encrypted with PicoClaw's
+	// enc:// format unless this is set, so the escape hatch has to exist and be
+	// discoverable: a default-on behaviour with no way out is a trap for anyone
+	// whose threat model does not need it or who cannot manage a passphrase.
+	noEncrypt  bool
+	passphrase string
+	yes        bool
 }
 
 func newInitCmd() *cobra.Command {
@@ -60,8 +62,10 @@ func newInitCmd() *cobra.Command {
 	cmd.Flags().StringVar(&f.apiBase, "api-base", "", "optional API base URL")
 	cmd.Flags().BoolVar(&f.web, "web-search", true, "enable web search tools")
 	cmd.Flags().BoolVar(&f.shell, "shell", false, "enable shell execution")
-	cmd.Flags().BoolVar(&f.encryptKeys, "encrypt-keys", false, "store the API credential as PicoClaw enc:// ciphertext instead of plaintext")
-	cmd.Flags().StringVar(&f.passphrase, "passphrase", "", "passphrase for --encrypt-keys; omit to be prompted (stored in piccolo.yaml either way)")
+	// Credentials are encrypted by default; the flag exists to turn that off, not
+	// to opt in. A default-on choice has to be exit-able or it is a trap.
+	cmd.Flags().BoolVar(&f.noEncrypt, "no-encrypt", false, "store the API credential as plaintext in config.json instead of enc:// ciphertext")
+	cmd.Flags().StringVar(&f.passphrase, "passphrase", "", "passphrase for the encrypted credential; required with --yes, otherwise prompted")
 	cmd.Flags().BoolVar(&f.yes, "yes", false, "non-interactive: use flags/defaults, skip prompts, never overwrite")
 	return cmd
 }
@@ -81,7 +85,7 @@ func runInit(cmd *cobra.Command, f initFlags) error {
 		APIBase:       f.apiBase,
 		WebSearch:     boolPtr(f.web),
 		ShellExec:     boolPtr(f.shell),
-		EncryptKeys:   boolPtr(f.encryptKeys),
+		EncryptKeys:   boolPtr(!f.noEncrypt),
 		// Passphrase is not carried through Prefill: init prompts for it after the plan
 		// is confirmed, because encryption cannot happen before the key exists.
 		Workspace: dirFlag,
@@ -111,6 +115,13 @@ func runInit(cmd *cobra.Command, f initFlags) error {
 		}
 		if pre.Model == "" {
 			return fmt.Errorf("--model is required with --yes")
+		}
+		// Encryption is on by default, so --yes needs the passphrase from the one
+		// place a non-interactive run can get it. Generated silently instead would
+		// hand the user a secret they never chose and cannot distinguish from a
+		// mistake; refused here means the remedy is in the error text.
+		if pre.EncryptKeys != nil && *pre.EncryptKeys && strings.TrimSpace(f.passphrase) == "" {
+			return fmt.Errorf("--yes stores the credential as enc:// by default and needs --passphrase VALUE to do it with — pass one, or use --no-encrypt for plaintext in config.json")
 		}
 		if pre.ModelAlias == "" {
 			pre.ModelAlias = pre.Model
@@ -287,6 +298,7 @@ func inputsFromPrefill(pre wizard.Prefill, passphrase string) (generate.Inputs, 
 		// the user with a plaintext workspace they believed was encrypted. Mirrors of
 		// the same field on two paths are exactly the drift this repo keeps hitting.
 		EncryptKeys: pre.EncryptKeys != nil && *pre.EncryptKeys,
+		Passphrase:  strings.TrimSpace(passphrase),
 		Model: generate.ModelInput{
 			Alias:    pre.ModelAlias,
 			Provider: pre.Provider,

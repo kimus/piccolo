@@ -15,8 +15,8 @@ import (
 	"github.com/kimus/piccolo/internal/workspace"
 )
 
-// initEncryptedWorkspace produces the same state `piccolo init --encrypt-keys`
-// leaves behind — key file, ciphertext in config.json, recorded route — built
+// initEncryptedWorkspace produces the same state `piccolo init` leaves behind
+// now that encryption is the default — key file, ciphertext in config.json, recorded route — built
 // through the generators rather than by hand, so a fixture cannot drift from what
 // init actually writes.
 func initEncryptedWorkspace(t *testing.T) string {

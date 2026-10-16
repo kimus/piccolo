@@ -26,14 +26,14 @@ func execInit(t *testing.T, dir string, args ...string) (string, error) {
 	return out.String(), err
 }
 
-// --encrypt-keys and the wizard answer are two separate code paths into the same
-// field, and the flag path was silently dropped the first time it was wired: an
-// --yes run reported success while writing plaintext. Asserted on the artifact,
-// not the flag plumbing, so a future path that loses the opt-in fails here.
-func TestInitEncryptKeysCarriesThroughYesPath(t *testing.T) {
+// The wizard answer and the --yes defaults are two paths into the same choice,
+// and the --yes path dropped it silently the first time it was wired, reporting an
+// encrypted workspace while writing plaintext. Asserted on the artifact, so a path
+// that loses the default fails here rather than in someone's workspace.
+func TestInitEncryptsByDefault(t *testing.T) {
 	dir := t.TempDir()
 
-	stdout, err := execInit(t, dir, "--yes", "--encrypt-keys", "--passphrase", "horse",
+	stdout, err := execInit(t, dir, "--yes", "--passphrase", "horse",
 		"--name", "P", "--owner", "K", "--purpose", "personal",
 		"--provider", "openai", "--model", "gpt-4o", "--api-key", "sk-INIT-PLAINTEXT")
 	if err != nil {
@@ -50,10 +50,10 @@ func TestInitEncryptKeysCarriesThroughYesPath(t *testing.T) {
 	}
 	keys := cfg.ModelList[0].APIKeys
 	if len(keys) != 1 || !credential.IsEncrypted(keys[0]) {
-		t.Fatalf("api_keys = %v, want one enc:// value (--encrypt-keys was accepted and ignored)", keys)
+		t.Fatalf("api_keys = %v, want one enc:// value (encryption is the default and was silently skipped)", keys)
 	}
 	if strings.Contains(string(cfgData), "sk-INIT-PLAINTEXT") {
-		t.Error("plaintext credential written despite --encrypt-keys")
+		t.Error("plaintext credential written although encryption is the default")
 	}
 	// The plaintext must not exist anywhere in the workspace: no temp file, no
 	// backup, no provenance echo.
@@ -90,9 +90,9 @@ func TestInitEncryptKeysCarriesThroughYesPath(t *testing.T) {
 // A workspace that does not ask for encryption is untouched by any of this:
 // plaintext as before, no key directory, no secrets block. This is the
 // no-opt-in-is-unchanged guarantee.
-func TestInitWithoutEncryptKeysIsUnchanged(t *testing.T) {
+func TestInitNoEncryptWritesPlaintext(t *testing.T) {
 	dir := t.TempDir()
-	stdout, err := execInit(t, dir, "--yes",
+	stdout, err := execInit(t, dir, "--yes", "--no-encrypt",
 		"--name", "P", "--owner", "K", "--purpose", "personal",
 		"--provider", "openai", "--model", "gpt-4o", "--api-key", "sk-plain")
 	if err != nil {
@@ -117,11 +117,13 @@ func TestInitWithoutEncryptKeysIsUnchanged(t *testing.T) {
 // Encryption needs a passphrase before any file exists. With neither a host
 // variable nor a terminal, init must stop BEFORE writing — a workspace with an
 // encrypted config.json and no way to decrypt it is worse than no workspace.
-func TestInitEncryptionWithoutPassphraseWritesNothing(t *testing.T) {
+func TestInitYesWithoutPassphraseRefuses(t *testing.T) {
 	dir := t.TempDir()
 
-	// No --passphrase and no terminal: there is nowhere to get one from.
-	stdout, err := execInit(t, dir, "--yes", "--encrypt-keys",
+	// Encryption is on by default, so --yes needs the passphrase from the flag:
+	// there is no terminal to ask, and generating one silently would hand the user
+	// a secret they never chose and cannot tell apart from a mistake.
+	stdout, err := execInit(t, dir, "--yes",
 		"--name", "P", "--owner", "K", "--purpose", "personal",
 		"--provider", "openai", "--model", "gpt-4o", "--api-key", "sk-x")
 	if err == nil {
@@ -130,8 +132,9 @@ func TestInitEncryptionWithoutPassphraseWritesNothing(t *testing.T) {
 	if !strings.Contains(err.Error(), "--passphrase") {
 		t.Errorf("error should name the flag that supplies it: %v", err)
 	}
-	if !strings.Contains(err.Error(), "piccolo secrets encrypt") {
-		t.Errorf("error should offer the later route: %v", err)
+	// The error must carry both ways out: supply the passphrase, or opt out.
+	if !strings.Contains(err.Error(), "--no-encrypt") {
+		t.Errorf("error should name the opt-out: %v", err)
 	}
 	// Nothing may have been written.
 	if _, err := os.Stat(filepath.Join(dir, "picoclaw", "config.json")); err == nil {
@@ -141,10 +144,10 @@ func TestInitEncryptionWithoutPassphraseWritesNothing(t *testing.T) {
 
 // A --passphrase-env that looks like a secret is refused before any key is
 // generated, mirroring the manifest validator.
-func TestInitRejectsPassphraseShapedVariableName(t *testing.T) {
+func TestInitRejectsBlankPassphrase(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("SOMETHING", "x")
-	stdout, err := execInit(t, dir, "--yes", "--encrypt-keys", "--passphrase", "horse", "--passphrase-env", "hunter2",
+	stdout, err := execInit(t, dir, "--yes", "--passphrase", "horse", "--passphrase-env", "hunter2",
 		"--name", "P", "--owner", "K", "--purpose", "personal",
 		"--provider", "openai", "--model", "gpt-4o", "--api-key", "sk-x")
 	if err == nil {
@@ -215,7 +218,7 @@ func TestInitAbortedLeavesNoKeyOrRoute(t *testing.T) {
 	var out bytes.Buffer
 	root.SetOut(&out)
 	root.SetErr(&out)
-	root.SetArgs([]string{"init", "-D", dir, "--encrypt-keys",
+	root.SetArgs([]string{"init", "-D", dir, "--passphrase", "horse",
 		"--name", "P", "--owner", "K", "--purpose", "personal",
 		"--provider", "openai", "--model", "gpt-4o", "--api-key", "sk-x"})
 	if err := root.Execute(); err == nil {
@@ -235,7 +238,7 @@ func TestInitAbortedLeavesNoKeyOrRoute(t *testing.T) {
 // describe a protected workspace that is not.
 func TestInitRecordsRouteOnlyWhenItCanSeal(t *testing.T) {
 	dir := t.TempDir()
-	stdout, err := execInit(t, dir, "--yes",
+	stdout, err := execInit(t, dir, "--yes", "--no-encrypt",
 		"--name", "P", "--owner", "K", "--purpose", "personal",
 		"--provider", "openai", "--model", "gpt-4o", "--api-key", "sk-x")
 	if err != nil {

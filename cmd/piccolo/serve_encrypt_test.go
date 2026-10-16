@@ -63,7 +63,7 @@ func TestServePreflightRefusesUndeliverableCredentials(t *testing.T) {
 // failure mode, nothing to deliver.
 func TestServePreflightUnchangedForPlaintextWorkspace(t *testing.T) {
 	dir := t.TempDir()
-	stdout, err := execInit(t, dir, "--yes", "--name", "P", "--owner", "K", "--purpose", "personal",
+	stdout, err := execInit(t, dir, "--yes", "--no-encrypt", "--name", "P", "--owner", "K", "--purpose", "personal",
 		"--provider", "openai", "--model", "gpt-4o", "--api-key", "sk-plain")
 	if err != nil {
 		t.Fatalf("init: %v\n%s", err, stdout)

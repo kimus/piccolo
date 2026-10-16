@@ -4,6 +4,7 @@
 package wizard
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 
@@ -55,9 +56,8 @@ type Prefill struct {
 	APIBase    string
 	WebSearch  *bool
 	ShellExec  *bool
-	// EncryptKeys is the credential-storage choice; nil means "ask". The passphrase
-	// itself is not collected here — init prompts for it after the plan is
-	// confirmed, since encryption cannot happen before a key exists.
+	// EncryptKeys is the credential-storage choice; nil means "ask" (and the
+	// wizard defaults to enabled).
 	EncryptKeys *bool
 	Workspace   string
 }
@@ -177,10 +177,10 @@ func Run(pre Prefill) (generate.Inputs, string, error) {
 	// Nothing is encrypted at this point: this records the intent, and init
 	// generates the key after the plan is confirmed.
 	if pre.EncryptKeys == nil && in.Model.APIKey != "" {
-		enc := false
-		if pre.EncryptKeys != nil {
-			enc = *pre.EncryptKeys
-		}
+		// Default ON: encryption is the normal state of a Piccolo workspace, and a
+		// prompt that pre-selects the weaker option quietly makes the weak path the
+		// common one.
+		enc := true
 		groups = append(groups, huh.NewGroup(
 			huh.NewConfirm().
 				Title("Encrypt credentials stored in this workspace?").
@@ -195,11 +195,30 @@ func Run(pre Prefill) (generate.Inputs, string, error) {
 				Negative("No, plaintext").
 				Value(&enc),
 		))
-		if enc {
-			in.EncryptKeys = true
-		}
+		in.EncryptKeys = enc
 	} else if pre.EncryptKeys != nil {
 		in.EncryptKeys = *pre.EncryptKeys
+	}
+	// The passphrase belongs here rather than only at the post-confirmation step:
+	// the wizard is where the user is thinking about credentials, and asking after
+	// "Proceed?" separates the decision from its consequence.
+	if in.EncryptKeys && in.Passphrase == "" {
+		var pass, conf string
+		groups = append(groups, huh.NewGroup(
+			huh.NewInput().
+				Title("Passphrase for the encrypted credential").
+				Description("Stored in piccolo.yaml so the workspace starts without any host setup.\n"+
+					"Losing it is permanent: the credentials must then be re-entered.").
+				EchoMode(huh.EchoModePassword).
+				Value(&pass),
+		))
+		groups = append(groups, huh.NewGroup(
+			huh.NewInput().
+				Title("Confirm the passphrase").
+				Description("A typo here would be committed as the only way in.").
+				EchoMode(huh.EchoModePassword).
+				Value(&conf),
+		))
 	}
 
 	if pre.WebSearch == nil {
@@ -244,4 +263,23 @@ func Run(pre Prefill) (generate.Inputs, string, error) {
 		return generate.Inputs{}, "", err
 	}
 	return in, workspace, nil
+}
+
+// validatePassphrase checks the wizard's two-entry pair. It runs AFTER the form
+// because huh reads every group into its bound variable before Run returns, so a
+// mismatch is only knowable then. A passphrase that is silently dropped or
+// mistyped becomes unrecoverable once it is the only way into the workspace.
+func validatePassphrase(existing, entered, confirm string) error {
+	chosen := entered
+	if chosen == "" {
+		// A prefilled value (flag-supplied) still has to be usable.
+		chosen = existing
+	}
+	if strings.TrimSpace(chosen) == "" {
+		return errors.New("encryption needs a passphrase — a blank one seals credentials nothing can later decrypt")
+	}
+	if chosen != confirm {
+		return errors.New("the passphrase and its confirmation did not match")
+	}
+	return nil
 }
