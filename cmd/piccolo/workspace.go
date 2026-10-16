@@ -10,6 +10,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/kimus/piccolo/internal/generate"
 	"github.com/kimus/piccolo/internal/workspace"
 )
 
@@ -132,7 +133,9 @@ func updateGitignoreForMigration(dir string) (bool, error) {
 	if err != nil && !os.IsNotExist(err) {
 		return false, err
 	}
-	entries := []string{"picoclaw/config.json", "picoclaw/.security.yml", "picoclaw/.picoclaw.pid", "picoclaw/launcher-auth.db", "picoclaw/logs/", "integrations/*/auth/", "runtime/"}
+	// One shared list with init and doctor: this third copy is how entries ended up
+	// differing between the three places that write .gitignore.
+	entries := generate.GitignoreEntries
 	seen := map[string]bool{}
 	for _, line := range strings.Split(string(data), "\n") {
 		seen[strings.TrimSpace(line)] = true

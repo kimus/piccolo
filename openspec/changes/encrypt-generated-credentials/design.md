@@ -56,6 +56,8 @@ This reuses the existing `picoclaw/` mount, so no new bind mount is added and th
 - Store the passphrase in `piccolo.yaml`. Rejected — that is plaintext in the workspace, the exact thing this change is fixing, only moved between two files.
 - macOS Keychain. Rejected for v1 — it makes the workspace non-portable and unusable under Linux CI; revisit as its own change.
 
+**Name, not value, enforced at parse time.** `secrets.passphrase_env` accepts only the uppercase identifier form and `Validate` rejects anything else, so pasting a passphrase into the field fails loudly instead of silently storing a plaintext secret in the file that was meant to stop that. This is deliberately narrower than POSIX, which permits lowercase variable names: the input being guarded against is a pasted secret, and the shape of a secret is a lowercase word like `hunter2` — which any syntactically permissive rule would accept. A user who genuinely owns a lowercase variable can still reference it through `container.env` with the `env:` prefix, which does not pass through this validator.
+
 **Trade-off stated plainly:** the passphrase is visible in `docker inspect`. Anyone with docker access to the host can already read the container's filesystem and env, so this is not a regression, but it means `enc://` defends against copies, backups, commits, and a pasted config — not against a host operator. `doctor` and README must say this in those words rather than implying secrets are unconditionally safe.
 
 ### D4: One explicit opt-in command; `init` offers but never requires

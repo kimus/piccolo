@@ -353,6 +353,28 @@ func (p *Plan) Write(dir string, overwrite map[string]bool) (written, skipped []
 	return written, skipped, nil
 }
 
+// GitignoreEntries is the single source of truth for what a Piccolo workspace
+// must never commit. It exists as one list because three places need it (init,
+// doctor's read-only check, and the flat-layout migration), and they had already
+// drifted: the check carried five entries while init wrote eight, so a workspace
+// missing picoclaw/.security.yml — the file that holds every credential PicoClaw
+// relocates out of config.json — was reported as clean. Adding an entry here is
+// the only way to add it everywhere at once.
+var GitignoreEntries = []string{
+	"picoclaw/config.json",
+	"picoclaw/.security.yml",
+	"picoclaw/.picoclaw.pid",
+	"picoclaw/launcher-auth.db",
+	// The credential encryption key. Its absence is not merely untidy: the key
+	// file plus a committed config.json is the complete recipe for decrypting
+	// every enc:// value in the workspace.
+	"picoclaw/keys/",
+	"picoclaw/logs/",
+	"integrations/*/auth/",
+	"runtime/",
+	GitignoreOSMetadata,
+}
+
 // EnsureGitignore creates or appends to dir/.gitignore so sensitive and
 // runtime files (config.json holds API keys; .picoclaw.pid holds the gateway
 // reload token) and OS directory metadata are never committed. It reports
@@ -363,7 +385,7 @@ func (p *Plan) Write(dir string, overwrite map[string]bool) (written, skipped []
 // append-only for missing entries, so a curated .gitignore is never rewritten.
 func EnsureGitignore(dir string) (bool, error) {
 	path := filepath.Join(dir, ".gitignore")
-	entries := []string{"picoclaw/config.json", "picoclaw/.security.yml", "picoclaw/.picoclaw.pid", "picoclaw/launcher-auth.db", "picoclaw/logs/", "integrations/*/auth/", "runtime/", GitignoreOSMetadata}
+	entries := GitignoreEntries
 	data, err := os.ReadFile(path)
 	if err != nil && !os.IsNotExist(err) {
 		return false, err
@@ -418,7 +440,7 @@ func MissingGitignoreEntries(dir string) ([]string, error) {
 		present[line] = true
 	}
 	var missing []string
-	for _, entry := range []string{"picoclaw/config.json", "picoclaw/logs/", "integrations/*/auth/", "runtime/", GitignoreOSMetadata} {
+	for _, entry := range GitignoreEntries {
 		if !present[entry] {
 			missing = append(missing, entry)
 		}

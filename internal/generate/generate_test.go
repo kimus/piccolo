@@ -406,7 +406,7 @@ func TestEnsureGitignore(t *testing.T) {
 		t.Fatalf("create: changed=%v err=%v", changed, err)
 	}
 	data, _ := os.ReadFile(filepath.Join(dir, ".gitignore"))
-	if strings.TrimSpace(string(data)) != "picoclaw/config.json\npicoclaw/.security.yml\npicoclaw/.picoclaw.pid\npicoclaw/launcher-auth.db\npicoclaw/logs/\nintegrations/*/auth/\nruntime/\n.DS_Store" {
+	if strings.TrimSpace(string(data)) != "picoclaw/config.json\npicoclaw/.security.yml\npicoclaw/.picoclaw.pid\npicoclaw/launcher-auth.db\npicoclaw/keys/\npicoclaw/logs/\nintegrations/*/auth/\nruntime/\n.DS_Store" {
 		t.Fatalf("gitignore = %q", data)
 	}
 
@@ -423,7 +423,7 @@ func TestEnsureGitignore(t *testing.T) {
 		t.Fatalf("append: changed=%v err=%v", changed, err)
 	}
 	data, _ = os.ReadFile(filepath.Join(dir2, ".gitignore"))
-	if string(data) != "*.log\npicoclaw/config.json\npicoclaw/.security.yml\npicoclaw/.picoclaw.pid\npicoclaw/launcher-auth.db\npicoclaw/logs/\nintegrations/*/auth/\nruntime/\n.DS_Store\n" {
+	if string(data) != "*.log\npicoclaw/config.json\npicoclaw/.security.yml\npicoclaw/.picoclaw.pid\npicoclaw/launcher-auth.db\npicoclaw/keys/\npicoclaw/logs/\nintegrations/*/auth/\nruntime/\n.DS_Store\n" {
 		t.Fatalf("appended gitignore = %q", data)
 	}
 
@@ -434,7 +434,7 @@ func TestEnsureGitignore(t *testing.T) {
 		t.Fatalf("partial append: changed=%v err=%v", changed, err)
 	}
 	data, _ = os.ReadFile(filepath.Join(dir2, ".gitignore"))
-	if string(data) != "picoclaw/config.json\npicoclaw/.security.yml\npicoclaw/.picoclaw.pid\npicoclaw/launcher-auth.db\npicoclaw/logs/\nintegrations/*/auth/\nruntime/\n.DS_Store\n" {
+	if string(data) != "picoclaw/config.json\npicoclaw/.security.yml\npicoclaw/.picoclaw.pid\npicoclaw/launcher-auth.db\npicoclaw/keys/\npicoclaw/logs/\nintegrations/*/auth/\nruntime/\n.DS_Store\n" {
 		t.Fatalf("partial appended gitignore = %q", data)
 	}
 }
@@ -540,4 +540,67 @@ func containsString(values []string, want string) bool {
 		}
 	}
 	return false
+}
+
+// The three writers of .gitignore used to carry their own lists and had drifted:
+// the read-only check looked at five entries while init wrote eight, so a workspace
+// missing picoclaw/.security.yml — the file holding every credential PicoClaw
+// relocates out of config.json — was reported as clean. All three now read one
+// list, and this pins that they cannot drift again.
+func TestGitignoreEntryListsAgree(t *testing.T) {
+	dir := t.TempDir()
+	if _, err := EnsureGitignore(dir); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(filepath.Join(dir, ".gitignore"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	wrote := map[string]bool{}
+	for _, line := range strings.Split(string(data), "\n") {
+		if l := strings.TrimSpace(line); l != "" {
+			wrote[l] = true
+		}
+	}
+	if len(wrote) != len(GitignoreEntries) {
+		t.Fatalf("EnsureGitignore wrote %d entries, list has %d", len(wrote), len(GitignoreEntries))
+	}
+	for _, e := range GitignoreEntries {
+		if !wrote[e] {
+			t.Errorf("required entry %q was not written", e)
+		}
+	}
+	// And the check reports nothing missing against what init just wrote.
+	if missing, err := MissingGitignoreEntries(dir); err != nil || len(missing) != 0 {
+		t.Fatalf("check disagrees with writer: %v (%v)", missing, err)
+	}
+}
+
+// Deleting picoclaw/.security.yml or picoclaw/keys/ from a workspace's .gitignore
+// must be visible: those two are the credential sidecar and the encryption key,
+// and either one committed next to the other is the whole recipe for plaintext.
+func TestMissingGitignoreNamesCredentialEntries(t *testing.T) {
+	for _, entry := range []string{"picoclaw/.security.yml", "picoclaw/keys/"} {
+		dir := t.TempDir()
+		if _, err := EnsureGitignore(dir); err != nil {
+			t.Fatal(err)
+		}
+		data, _ := os.ReadFile(filepath.Join(dir, ".gitignore"))
+		kept := make([]string, 0, len(data))
+		for _, line := range strings.Split(string(data), "\n") {
+			if strings.TrimSpace(line) != entry {
+				kept = append(kept, line)
+			}
+		}
+		if err := os.WriteFile(filepath.Join(dir, ".gitignore"), []byte(strings.Join(kept, "\n")), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		missing, err := MissingGitignoreEntries(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(missing) != 1 || missing[0] != entry {
+			t.Errorf("dropping %q reported %v", entry, missing)
+		}
+	}
 }

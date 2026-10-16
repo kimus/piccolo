@@ -57,9 +57,12 @@ setup:                                      # optional non-secret setup metadata
   channels:
     discord:
       application_id: ""                    # used to regenerate invite/setup links
+secrets:                                    # optional; holds NO secret
+  passphrase_env: ""                        # NAME of a host variable holding the enc:// passphrase
 ```
 
 - Strict decoding: unknown keys SHALL cause a parse error.
+- `secrets.passphrase_env` is the **name** of a host environment variable, never its value, and validation rejects a value-shaped string (it requires the uppercase identifier form) so a pasted passphrase cannot land in this file. An absent `secrets:` block means the workspace is not encrypted.
 - `env:HOST_VAR` refs resolve from host env at `serve`; missing refs → doctor warning + serve-time error.
 
 ### `config.json` generation
@@ -106,7 +109,7 @@ Generated from wizard answers, PicoClaw schema v3. Minimum shape:
 2. Ask wizard questions: assistant name; owner name; purpose template (personal/research/coding/operations/blank); specialist agents (research, planner, coder, ops); expose the optional **web console** (`--dashboard`; gateway always runs, this only adds the launcher image + `127.0.0.1:18800` + `PICOCLAW_GATEWAY_HOST=0.0.0.0` env); model provider + model + API key (placeholder allowed with warning); web search (`--web-search`, default yes); shell exec (default no); workspace path (default cwd).
 3. Preview the generation plan (files, image, ports), then final confirmation.
 4. Write files. **Create-only**: if files exist, list them and require explicit per-file confirmation before any overwrite.
-5. Ensure `picoclaw/config.json`, `picoclaw/.security.yml`, `picoclaw/.picoclaw.pid`, `picoclaw/launcher-auth.db`, `picoclaw/logs/`, integration auth state, runtime caches, and OS directory metadata (`.DS_Store`) are git-ignored: create `.gitignore` or append if entries are missing. Appending never rewrites existing lines, so a user's own rules survive; re-running `init` is therefore the documented heal for a workspace created before an entry was required, and `piccolo doctor` reports missing entries (warning only) because nothing else would.
+5. Ensure `picoclaw/config.json`, `picoclaw/.security.yml`, `picoclaw/.picoclaw.pid`, `picoclaw/launcher-auth.db`, `picoclaw/keys/`, `picoclaw/logs/`, integration auth state, runtime caches, and OS directory metadata (`.DS_Store`) are git-ignored. The required entries live in ONE list, `generate.GitignoreEntries`, read by init, by doctor's check, and by the flat-layout migration: they previously had three copies and had drifted, so a workspace missing the credential sidecar was reported as clean. Add an entry there, never at a call site. Appending never rewrites existing lines, so a user's own rules survive; re-running `init` is therefore the documented heal for a workspace created before an entry was required, and `piccolo doctor` reports missing entries (warning only) because nothing else would.
 
 - Preferred prompt library: `github.com/charmbracelet/huh`. Keep wizard logic separated from file generation (upgrade path to full Bubble Tea).
 - Support non-interactive flags (`--name`, `--owner`, `--purpose`, `--yes`, ...) for scripting.

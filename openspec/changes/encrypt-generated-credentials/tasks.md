@@ -9,11 +9,11 @@
 
 ## 2. Workspace layout and manifest
 
-- [ ] 2.1 Add `secrets.passphrase_env` to `internal/manifest` as a non-secret variable *name*; confirm strict decoding accepts it and rejects unknown siblings, and that no passphrase value can be expressed in `piccolo.yaml`
-- [ ] 2.2 Document in the manifest type comment that a variable name is Piccolo-owned metadata while a passphrase value is never stored
-- [ ] 2.3 Add `picoclaw/keys/` to the required entry list in `EnsureGitignore` and to `MissingGitignoreEntries`, verifying an existing user's lines survive the append unchanged
-- [ ] 2.4 Add the key path to `internal/workspace` layout (`Layout.Keys()` host path plus the `/root/.picoclaw/keys/...` container path) so no caller hand-assembles it
-- [ ] 2.5 Update `cmd/piccolo/workspace.go`'s gitignore entry list so a migrated workspace gains the same entry
+- [x] 2.1 Add `secrets.passphrase_env` to `internal/manifest` as a non-secret variable *name*; confirm strict decoding accepts it and rejects unknown siblings, and that no passphrase value can be expressed in `piccolo.yaml`
+- [x] 2.2 Document in the manifest type comment that a variable name is Piccolo-owned metadata while a passphrase value is never stored
+- [x] 2.3 Add `picoclaw/keys/` to the required entries — done by collapsing three drifted copies of the list into one `generate.GitignoreEntries` read by init, doctor's check, and the migration. The copies had already diverged: the check looked at 5 entries while init wrote 8, so a workspace missing `picoclaw/.security.yml` (the relocated credentials) was reported `[OK]`. `TestGitignoreEntryListsAgree` pins writer against checker so they cannot drift again
+- [x] 2.4 Add the key path to `internal/workspace` layout (`Layout.Keys()` host path plus the `/root/.picoclaw/keys/...` container path) so no caller hand-assembles it
+- [x] 2.5 Update `cmd/piccolo/workspace.go`'s gitignore entry list so a migrated workspace gains the same entry
 
 ## 3. Write paths: opt in and store encrypted
 

@@ -19,8 +19,21 @@ const (
 	RuntimeMedia    = "media"
 	ConfigName      = "config.json"
 	PidFileName     = ".picoclaw.pid"
+	// KeysDirName is the directory under the PicoClaw home holding the encryption
+	// key for enc:// credentials. It lives inside picoclaw/ on purpose: that whole
+	// directory is already bind-mounted to /root/.picoclaw, so an encrypted
+	// workspace needs no new mount to reach its key.
+	KeysDirName = "keys"
+	// KeyFileName is the credential encryption key's file name, matching the name
+	// PicoClaw auto-detects under ~/.ssh so the file is recognisable in a workspace.
+	KeyFileName = "picoclaw_ed25519.key"
 
 	ContainerPicoclawHome = "/root/.picoclaw"
+	// ContainerKeysDir is where a workspace's keys directory appears inside the
+	// gateway. PicoClaw looks for its key under ~/.ssh, which is image content here
+	// and dies with the container, so serve names this path through
+	// PICOCLAW_SSH_KEY_PATH instead of relying on that search.
+	ContainerKeysDir      = ContainerPicoclawHome + "/" + KeysDirName
 	ContainerPiccoloHome  = "/root/.piccolo"
 	ContainerIntegrations = ContainerPiccoloHome + "/integrations"
 	ContainerMedia        = "/tmp/picoclaw_media"
@@ -34,7 +47,22 @@ func (l Layout) Manifest() string     { return filepath.Join(l.Root, ManifestNam
 func (l Layout) PicoclawHome() string { return filepath.Join(l.Root, PicoclawDir) }
 func (l Layout) Config() string       { return filepath.Join(l.PicoclawHome(), ConfigName) }
 func (l Layout) PidFile() string      { return filepath.Join(l.PicoclawHome(), PidFileName) }
-func (l Layout) Agents() string       { return filepath.Join(l.PicoclawHome(), "agents") }
+
+// Keys is the host directory holding the workspace's credential encryption key.
+// It is a method rather than an inline join because three packages need the same
+// path (generate, doctor, serve) and because PicoClaw derives its AES key from
+// this file's raw bytes: a caller that hand-assembled a slightly different path
+// would encrypt against a different secret and the credential would fail to
+// decrypt only at gateway boot, far from the cause.
+func (l Layout) Keys() string { return filepath.Join(l.PicoclawHome(), KeysDirName) }
+
+// KeyFile is the private key path inside Keys.
+func (l Layout) KeyFile() string { return filepath.Join(l.Keys(), KeyFileName) }
+
+// ContainerKeyFile is the in-container path for the same private key, the value
+// serve injects as PICOCLAW_SSH_KEY_PATH.
+func (l Layout) ContainerKeyFile() string { return ContainerKeysDir + "/" + KeyFileName }
+func (l Layout) Agents() string           { return filepath.Join(l.PicoclawHome(), "agents") }
 
 // Skills is the generated PicoClaw skill root inside PicoClaw's home. It is a
 // method rather than an inline join because the layout restructure moved skills

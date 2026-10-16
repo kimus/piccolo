@@ -23,6 +23,24 @@ type Manifest struct {
 	Container Container `yaml:"container"`
 	Runtime   Runtime   `yaml:"runtime,omitempty"`
 	Setup     Setup     `yaml:"setup,omitempty"`
+	Secrets   Secrets   `yaml:"secrets,omitempty"`
+}
+
+// Secrets describes how a workspace's encrypted credentials are unlocked. It is
+// Piccolo-owned delivery configuration, and it holds NO secret: PassphraseEnv is
+// the NAME of a host environment variable, never its value. The value is read at
+// serve time through the same env: reference mechanism container.env already uses,
+// so the passphrase never exists in a file Piccolo writes.
+//
+// The distinction is the whole point of the block, so it is enforced rather than
+// trusted: a value that looks like a passphrase instead of a variable name is
+// rejected at parse time, because a user who pasted their passphrase here would
+// otherwise get a plaintext secret in the workspace they were trying to protect,
+// with the encryption silently doing nothing.
+type Secrets struct {
+	// PassphraseEnv names the host variable holding the enc:// decryption
+	// passphrase. Empty means the workspace is not encrypted.
+	PassphraseEnv string `yaml:"passphrase_env,omitempty"`
 }
 
 // Runtime holds Piccolo-owned container runtime configuration. This is distinct
@@ -197,6 +215,9 @@ func (m *Manifest) Validate() error {
 	if err := validateStringList("runtime.toolchain.commands", m.Runtime.Toolchain.Commands); err != nil {
 		return err
 	}
+	if err := m.Secrets.Validate(); err != nil {
+		return err
+	}
 	seenIntegrations := map[string]bool{}
 	for i, in := range m.Runtime.Integrations {
 		prefix := fmt.Sprintf("runtime.integrations[%d]", i)
@@ -350,4 +371,58 @@ func sortStrings(s []string) {
 			s[j], s[j-1] = s[j-1], s[j]
 		}
 	}
+}
+
+// Validate rejects a passphrase_env that is not a plausible environment variable
+// name. Only characters that cannot appear in a real passphrase-bearing shell
+// reference are allowed, and the empty value is always valid because it simply
+// means the workspace is not encrypted.
+func (s Secrets) Validate() error {
+	v := strings.TrimSpace(s.PassphraseEnv)
+	if v == "" {
+		return nil
+	}
+	if !IsEnvVarName(v) {
+		return fmt.Errorf("secrets.passphrase_env %q must be the NAME of an uppercase host environment variable (letters, digits and underscores), not a passphrase value", v)
+	}
+	return nil
+}
+
+// IsEnvVarName reports whether s is shaped like a host environment variable name,
+// restricted to the conventional uppercase form.
+//
+// Deliberately narrower than POSIX, which permits lowercase names: the input being
+// guarded against is a user pasting their passphrase into this field, and the
+// shape of a passphrase is exactly a lowercase word like "hunter2". Accepting any
+// syntactically legal identifier would accept the single most likely secret, so the
+// rule rejects the shape of secrets rather than the shape of non-conforming names.
+// A lowercase variable name that the user genuinely owns can still be used by
+// setting it in container.env with the env: reference, which does not parse here.
+func IsEnvVarName(s string) bool {
+	if s == "" {
+		return false
+	}
+	// An env: prefix here would be a user copying the container.env style; the
+	// field takes a bare name, so say so rather than resolving "env:env:X".
+	if strings.HasPrefix(s, EnvPrefix) {
+		return false
+	}
+	for i, r := range s {
+		switch {
+		case r >= 'A' && r <= 'Z', r == '_':
+		case r >= '0' && r <= '9':
+			if i == 0 {
+				return false
+			}
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// PassphraseVar returns the host variable name holding this workspace's
+// passphrase, or "" when the workspace is not encrypted.
+func (m *Manifest) PassphraseVar() string {
+	return strings.TrimSpace(m.Secrets.PassphraseEnv)
 }
