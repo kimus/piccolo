@@ -415,7 +415,7 @@ func TestEnsureGitignore(t *testing.T) {
 		t.Fatalf("create: changed=%v err=%v", changed, err)
 	}
 	data, _ := os.ReadFile(filepath.Join(dir, ".gitignore"))
-	if strings.TrimSpace(string(data)) != "picoclaw/config.json\npicoclaw/.security.yml\npicoclaw/.picoclaw.pid\npicoclaw/launcher-auth.db\npicoclaw/keys/\npicoclaw/logs/\nintegrations/*/auth/\nruntime/\n.DS_Store" {
+	if strings.TrimSpace(string(data)) != strings.Join(GitignoreEntries, "\n") {
 		t.Fatalf("gitignore = %q", data)
 	}
 
@@ -432,8 +432,8 @@ func TestEnsureGitignore(t *testing.T) {
 		t.Fatalf("append: changed=%v err=%v", changed, err)
 	}
 	data, _ = os.ReadFile(filepath.Join(dir2, ".gitignore"))
-	if string(data) != "*.log\npicoclaw/config.json\npicoclaw/.security.yml\npicoclaw/.picoclaw.pid\npicoclaw/launcher-auth.db\npicoclaw/keys/\npicoclaw/logs/\nintegrations/*/auth/\nruntime/\n.DS_Store\n" {
-		t.Fatalf("appended gitignore = %q", data)
+	if want := "*.log\n" + strings.Join(GitignoreEntries, "\n") + "\n"; string(data) != want {
+		t.Fatalf("appended gitignore = %q, want %q", data, want)
 	}
 
 	// Partially covered file: only the missing entry is appended.
@@ -443,8 +443,8 @@ func TestEnsureGitignore(t *testing.T) {
 		t.Fatalf("partial append: changed=%v err=%v", changed, err)
 	}
 	data, _ = os.ReadFile(filepath.Join(dir2, ".gitignore"))
-	if string(data) != "picoclaw/config.json\npicoclaw/.security.yml\npicoclaw/.picoclaw.pid\npicoclaw/launcher-auth.db\npicoclaw/keys/\npicoclaw/logs/\nintegrations/*/auth/\nruntime/\n.DS_Store\n" {
-		t.Fatalf("partial appended gitignore = %q", data)
+	if want := "picoclaw/config.json\n" + strings.Join(GitignoreEntries[1:], "\n") + "\n"; string(data) != want {
+		t.Fatalf("partial appended gitignore = %q, want %q", data, want)
 	}
 }
 
@@ -589,21 +589,14 @@ func TestGitignoreEntryListsAgree(t *testing.T) {
 // must be visible: those two are the credential sidecar and the encryption key,
 // and either one committed next to the other is the whole recipe for plaintext.
 func TestMissingGitignoreNamesCredentialEntries(t *testing.T) {
-	for _, entry := range []string{"picoclaw/.security.yml", "picoclaw/keys/"} {
+	// picoclaw/.security.yml is unconditional: PicoClaw creates it without asking,
+	// so a workspace can acquire relocated credentials at any time.
+	for _, entry := range []string{"picoclaw/.security.yml"} {
 		dir := t.TempDir()
 		if _, err := EnsureGitignore(dir); err != nil {
 			t.Fatal(err)
 		}
-		data, _ := os.ReadFile(filepath.Join(dir, ".gitignore"))
-		kept := make([]string, 0, len(data))
-		for _, line := range strings.Split(string(data), "\n") {
-			if strings.TrimSpace(line) != entry {
-				kept = append(kept, line)
-			}
-		}
-		if err := os.WriteFile(filepath.Join(dir, ".gitignore"), []byte(strings.Join(kept, "\n")), 0o644); err != nil {
-			t.Fatal(err)
-		}
+		dropIgnore(t, dir, entry)
 		missing, err := MissingGitignoreEntries(dir)
 		if err != nil {
 			t.Fatal(err)
@@ -611,5 +604,54 @@ func TestMissingGitignoreNamesCredentialEntries(t *testing.T) {
 		if len(missing) != 1 || missing[0] != entry {
 			t.Errorf("dropping %q reported %v", entry, missing)
 		}
+	}
+}
+
+// A plaintext workspace must NOT be told to ignore picoclaw/keys/: demanding an
+// entry for a directory it will never have is a permanent false warning, and a
+// warning on a healthy workspace is worse than no warning. Once the key exists,
+// the same check must name it.
+func TestKeysIgnoreOnlyRequiredWhenKeyExists(t *testing.T) {
+	dir := t.TempDir()
+	if _, err := EnsureGitignore(dir); err != nil {
+		t.Fatal(err)
+	}
+	dropIgnore(t, dir, "picoclaw/keys/")
+	if missing, _ := MissingGitignoreEntries(dir); len(missing) != 0 {
+		t.Errorf("plaintext workspace warned about %v", missing)
+	}
+
+	// Give it a key directory; now the gap is real.
+	if err := os.MkdirAll(filepath.Join(dir, "picoclaw", "keys"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	missing, err := MissingGitignoreEntries(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(missing) != 1 || missing[0] != "picoclaw/keys/" {
+		t.Errorf("workspace with a key dir reported %v", missing)
+	}
+	// And EnsureGitignore heals it, so 'piccolo init' on the workspace closes the gap.
+	if _, err := EnsureGitignore(dir); err != nil {
+		t.Fatal(err)
+	}
+	if missing, _ := MissingGitignoreEntries(dir); len(missing) != 0 {
+		t.Errorf("heal left %v", missing)
+	}
+}
+
+func dropIgnore(t *testing.T, dir, entry string) {
+	t.Helper()
+	path := filepath.Join(dir, ".gitignore")
+	data, _ := os.ReadFile(path)
+	kept := []string{}
+	for _, line := range strings.Split(string(data), "\n") {
+		if strings.TrimSpace(line) != entry {
+			kept = append(kept, line)
+		}
+	}
+	if err := os.WriteFile(path, []byte(strings.Join(kept, "\n")), 0o644); err != nil {
+		t.Fatal(err)
 	}
 }

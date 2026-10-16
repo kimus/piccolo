@@ -120,7 +120,7 @@ func runSetup(cmd *cobra.Command, args []string) error {
 	st := &setupState{cmd: cmd, out: os.Stdout, dir: dir, path: path, doc: doc, orig: orig, manifestPath: manifestPath, manifest: mf, secrets: picoclaw.LoadSecrets(path)}
 	// Checked once: nothing inside a setup session generates a key or changes the
 	// manifest's passphrase route.
-	if _, err := os.Stat(workspace.NewLayout(dir).KeyFile()); err == nil && mf.PassphraseVar() != "" {
+	if _, err := os.Stat(workspace.NewLayout(dir).KeyFile()); err == nil && mf.Passphrase() != "" {
 		st.encrypted = true
 	}
 
@@ -1992,20 +1992,18 @@ func updateAgentFrontmatterList(content string, lineRE *regexp.Regexp, key strin
 // into an issue) than one who believes it is sealed.
 // sealBeforeWrite converts any plaintext credential the forms just stored into the
 // enc:// form, for a workspace that opted in. It is a no-op when the workspace is
-// not encrypted, and it needs the passphrase from the same host variable serve will
-// read: the credential a user typed must be readable by the gateway that starts
-// later, so there is no second passphrase to reconcile.
+// not encrypted, and it uses the same passphrase serve will deliver — the one in
+// piccolo.yaml — so there is no second passphrase to reconcile.
 func (st *setupState) sealBeforeWrite(what string) error {
 	if !st.encrypted {
 		return nil
 	}
-	envVar := st.manifest.PassphraseVar()
-	pass, ok := os.LookupEnv(envVar)
-	if !ok || pass == "" {
+	pass := st.manifest.Passphrase()
+	if pass == "" {
 		// Loud, because silently writing plaintext in an encrypted workspace is the
 		// one outcome the user cannot detect later.
-		return fmt.Errorf("this workspace stores credentials as enc:// but host variable %s is unset — "+
-			"export it and repeat the change, so the credential written here is one the gateway can decrypt", envVar)
+		return errors.New("this workspace stores credentials as enc:// but piccolo.yaml has no secrets.passphrase — " +
+			"set it and repeat the change, so the credential written here is one the gateway can decrypt")
 	}
 	key := workspace.NewLayout(st.dir).KeyFile()
 	res, err := setup.EncryptWorkspace(st.doc, st.secrets, key, pass)
@@ -2025,7 +2023,7 @@ func (st *setupState) sealBeforeWrite(what string) error {
 
 func (st *setupState) credentialStorageNote(fallback string) string {
 	if st.encrypted {
-		return "encrypted as PicoClaw enc:// before it is written (git-ignored); needs the passphrase from " + st.manifest.PassphraseVar()
+		return "encrypted as PicoClaw enc:// before it is written; the passphrase lives in piccolo.yaml"
 	}
 	if fallback != "" {
 		return fallback

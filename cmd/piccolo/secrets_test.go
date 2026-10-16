@@ -59,9 +59,8 @@ func runSecrets(t *testing.T, dir string, args ...string) (string, error) {
 
 func TestSecretsEncryptWithYesWritesCiphertext(t *testing.T) {
 	dir := encryptWorkspaceShell(t)
-	t.Setenv("PICCOLO_KEY_PASSPHRASE", "horse")
 
-	stdout, err := runSecrets(t, dir, "encrypt", "--yes")
+	stdout, err := runSecrets(t, dir, "encrypt", "--yes", "--passphrase", "horse")
 	if err != nil {
 		t.Fatalf("encrypt: %v\n%s", err, stdout)
 	}
@@ -84,7 +83,10 @@ func TestSecretsEncryptWithYesWritesCiphertext(t *testing.T) {
 		t.Error("plaintext credential survived in config.json")
 	}
 	// The warning must be shown, not merely exist somewhere in the code.
-	for _, want := range []string{"not reversible", "config.json.bak", "docker inspect"} {
+	// "committed" is the claim that matters: the passphrase now sits in a file the
+	// workspace is meant to commit, and the warning must say so rather than let
+	// "encrypted" imply protection this arrangement no longer provides.
+	for _, want := range []string{"not reversible", "config.json.bak", "piccolo.yaml", "committed"} {
 		if !strings.Contains(stdout, want) {
 			t.Errorf("warning omitted %q:\n%s", want, stdout)
 		}
@@ -94,8 +96,8 @@ func TestSecretsEncryptWithYesWritesCiphertext(t *testing.T) {
 		t.Errorf("key file missing: %v", err)
 	}
 	m, err := manifest.Load(filepath.Join(dir, "piccolo.yaml"))
-	if err != nil || m.PassphraseVar() != "PICCOLO_KEY_PASSPHRASE" {
-		t.Errorf("manifest did not record the variable: %v %q", err, m.PassphraseVar())
+	if err != nil || m.Passphrase() != "horse" {
+		t.Errorf("manifest did not record the passphrase: %v %q", err, m.Passphrase())
 	}
 	if missing, _ := generate.MissingGitignoreEntries(dir); len(missing) != 0 {
 		t.Errorf("gitignore gaps after encrypt: %v", missing)
@@ -110,7 +112,6 @@ func TestSecretsEncryptWithYesWritesCiphertext(t *testing.T) {
 // command must refuse rather than write, and must not have modified the file.
 func TestSecretsEncryptRefusesWithoutTerminal(t *testing.T) {
 	dir := encryptWorkspaceShell(t)
-	t.Setenv("PICCOLO_KEY_PASSPHRASE", "horse")
 
 	before, _ := os.ReadFile(filepath.Join(dir, "picoclaw", "config.json"))
 	// Tests have no tty, so the confirmation path is exactly what runs here.
@@ -122,8 +123,8 @@ func TestSecretsEncryptRefusesWithoutTerminal(t *testing.T) {
 	if !bytes.Equal(before, after) {
 		t.Error("config.json was modified although the confirmation could not happen")
 	}
-	if !strings.Contains(err.Error(), "--yes") {
-		t.Errorf("refusal should name the non-interactive route: %v", err)
+	if !strings.Contains(err.Error(), "--passphrase") {
+		t.Errorf("refusal should name the flag that supplies the passphrase: %v", err)
 	}
 }
 
@@ -132,7 +133,6 @@ func TestSecretsEncryptRefusesWithoutTerminal(t *testing.T) {
 // secrets block with a plaintext config would make 'secrets check' look encrypted.
 func TestSecretsRefusalLeavesWorkspaceConsistent(t *testing.T) {
 	dir := encryptWorkspaceShell(t)
-	t.Setenv("PICCOLO_KEY_PASSPHRASE", "horse")
 
 	if _, err := runSecrets(t, dir, "encrypt"); err == nil {
 		t.Fatal("expected refusal")
@@ -141,7 +141,7 @@ func TestSecretsRefusalLeavesWorkspaceConsistent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if m.PassphraseVar() != "" {
+	if m.Passphrase() != "" {
 		t.Error("refused run recorded secrets.passphrase_env, so the workspace claims to be encrypted")
 	}
 	cfgData, _ := os.ReadFile(filepath.Join(dir, "picoclaw", "config.json"))
@@ -150,32 +150,37 @@ func TestSecretsRefusalLeavesWorkspaceConsistent(t *testing.T) {
 	}
 }
 
-func TestSecretsEncryptNeedsAPassphrase(t *testing.T) {
+// No --passphrase and no terminal means no passphrase. The command must refuse,
+// and crucially must not have generated a key first: a key file in a workspace
+// whose credentials are still plaintext is a half-configured state that later
+// reports and mislead.
+func TestSecretsEncryptWithoutPassphraseLeavesNoKey(t *testing.T) {
 	dir := encryptWorkspaceShell(t)
-	// Neither the host variable nor a terminal: no way to obtain a passphrase.
-	os.Unsetenv("PICCOLO_KEY_PASSPHRASE")
 	stdout, err := runSecrets(t, dir, "encrypt", "--yes")
 	if err == nil {
-		t.Fatalf("accepted an empty passphrase: %s", stdout)
+		t.Fatalf("accepted a run with no way to obtain a passphrase: %s", stdout)
 	}
-	if !strings.Contains(err.Error(), "PICCOLO_KEY_PASSPHRASE") {
-		t.Errorf("error should name the variable to export: %v", err)
+	if !strings.Contains(err.Error(), "--passphrase") {
+		t.Errorf("error should name the flag that supplies it: %v", err)
+	}
+	if _, statErr := os.Stat(filepath.Join(dir, "picoclaw", "keys")); statErr == nil {
+		t.Error("a key directory was created before the missing passphrase was noticed")
 	}
 }
 
-// A --passphrase-env that looks like a secret must be refused before anything is
-// generated, exactly as the manifest validator refuses it in piccolo.yaml.
-func TestSecretsEncryptRejectsPassphraseShapedEnvName(t *testing.T) {
+// A blank passphrase is refused for the same reason: it would seal credentials that
+// nothing can later decrypt.
+func TestSecretsEncryptRejectsBlankPassphrase(t *testing.T) {
 	dir := encryptWorkspaceShell(t)
-	stdout, err := runSecrets(t, dir, "encrypt", "--yes", "--passphrase-env", "hunter2")
+	stdout, err := runSecrets(t, dir, "encrypt", "--yes", "--passphrase", "   ")
 	if err == nil {
-		t.Fatalf("accepted a passphrase-shaped variable name: %s", stdout)
+		t.Fatalf("accepted a blank passphrase: %s", stdout)
 	}
-	if !strings.Contains(err.Error(), "NAME") {
-		t.Errorf("error should explain name-vs-value: %v", err)
+	if !strings.Contains(err.Error(), "decrypt") {
+		t.Errorf("error should state the consequence: %v", err)
 	}
-	if _, err := os.Stat(filepath.Join(dir, "picoclaw", "keys")); err == nil {
-		t.Error("a key directory was generated before the bad name was noticed")
+	if _, statErr := os.Stat(filepath.Join(dir, "picoclaw", "keys")); statErr == nil {
+		t.Error("a key directory was created for a refused passphrase")
 	}
 }
 
@@ -191,8 +196,7 @@ func TestSecretsCheckStatesTheThreeStates(t *testing.T) {
 		t.Errorf("unexpected check output: %s", stdout)
 	}
 
-	t.Setenv("PICCOLO_KEY_PASSPHRASE", "horse")
-	if _, err := runSecrets(t, dir, "encrypt", "--yes"); err != nil {
+	if _, err := runSecrets(t, dir, "encrypt", "--yes", "--passphrase", "horse"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -202,9 +206,10 @@ func TestSecretsCheckStatesTheThreeStates(t *testing.T) {
 		t.Fatalf("check on a healthy encrypted workspace: %v\n%s", err, stdout)
 	}
 
-	// 3. Encrypted but the passphrase is wrong: the state that otherwise shows up
-	// as a container exit and a health-gate timeout two steps later.
-	t.Setenv("PICCOLO_KEY_PASSPHRASE", "wrong")
+	// 3. Encrypted but the recorded passphrase is wrong — the state a user reaches
+	// by editing piccolo.yaml or restoring a stale copy. It otherwise surfaces as a
+	// container exit and a health-gate timeout two steps later.
+	setPassphraseInManifest(t, dir, "wrong")
 	stdout, err = runSecrets(t, dir, "check")
 	if err == nil {
 		t.Fatal("check passed a workspace that cannot decrypt")
@@ -218,8 +223,8 @@ func TestSecretsCheckStatesTheThreeStates(t *testing.T) {
 // check must call it out while the user can still act on it.
 func TestSecretsCheckNamesAMissingKeyFile(t *testing.T) {
 	dir := encryptWorkspaceShell(t)
-	t.Setenv("PICCOLO_KEY_PASSPHRASE", "horse")
-	if _, err := runSecrets(t, dir, "encrypt", "--yes"); err != nil {
+
+	if _, err := runSecrets(t, dir, "encrypt", "--yes", "--passphrase", "horse"); err != nil {
 		t.Fatal(err)
 	}
 	keyDir := filepath.Join(dir, "picoclaw", "keys")
@@ -240,8 +245,13 @@ func TestSecretsGroupWithoutArgsShowsHelp(t *testing.T) {
 	if err != nil {
 		t.Fatalf("bare group should print help and succeed: %v\n%s", err, stdout)
 	}
-	if !strings.Contains(stdout, "WHAT THIS DOES NOT HIDE") {
-		t.Errorf("help omitted the honest scope statement:\n%s", stdout)
+	// Asserted on substance, not headings: the help must not be allowed to imply
+	// that storing the passphrase in piccolo.yaml still protects a copied
+	// workspace, however the sections get reworded later.
+	for _, want := range []string{"DOES NOT", "passphrase is stored\n", "piccolo.yaml"} {
+		if !strings.Contains(stdout, want) {
+			t.Errorf("help omitted %q — the honest scope statement is required:\n%s", want, stdout)
+		}
 	}
 }
 

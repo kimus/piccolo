@@ -9,77 +9,60 @@ import (
 
 func TestParseAcceptsSecretsMetadata(t *testing.T) {
 	m, err := Parse(strings.NewReader(validYAML + `secrets:
-  passphrase_env: PICCOLO_PASSPHRASE
+  passphrase: "horse battery"
 `))
 	if err != nil {
 		t.Fatalf("Parse secrets metadata: %v", err)
 	}
-	if m.PassphraseVar() != "PICCOLO_PASSPHRASE" {
-		t.Fatalf("passphrase var = %q", m.Secrets.PassphraseEnv)
+	if m.Passphrase() != "horse battery" {
+		t.Fatalf("passphrase = %q", m.Secrets.Passphrase)
 	}
 	// An absent block means an unencrypted workspace, not an error.
 	plain, err := Parse(strings.NewReader(validYAML))
-	if err != nil || plain.PassphraseVar() != "" {
-		t.Fatalf("no secrets block: %q %v", plain.PassphraseVar(), err)
+	if err != nil || plain.Passphrase() != "" {
+		t.Fatalf("no secrets block: %q %v", plain.Passphrase(), err)
 	}
 }
 
-// The block holds a variable NAME. A value pasted here would put the passphrase in
-// plaintext in the very file the feature exists to protect, and encryption would
-// look configured while doing nothing — so the shape is rejected at parse time
-// rather than discovered at boot.
-func TestParseRejectsPassphraseValueNotName(t *testing.T) {
-	for _, bad := range []string{
-		"hunter2",                // lowercase, looks like a secret
-		"correct horse battery",  // spaces cannot be an env name
-		"piccolo=secret",         // assignment shape
-		"env:PICCOLO_PASSPHRASE", // copied container.env style; the field takes a bare name
-		"9LIVES",                 // cannot start with a digit
-		"PICCOLO-PASSPHRASE",     // hyphen is not valid in an exported name
-		"$(cat /tmp/pass)",       // shell interpolation is never a name
-	} {
-		_, err := Parse(strings.NewReader(validYAML + "secrets:\n  passphrase_env: " + quoteIf(bad) + "\n"))
-		if err == nil {
-			t.Errorf("passphrase_env %q was accepted; it is not an env var name", bad)
-		} else if !strings.Contains(err.Error(), "passphrase_env") || !strings.Contains(err.Error(), "uppercase") {
-			t.Errorf("error for %q does not name the field: %v", bad, err)
+// The passphrase may be any string, including one that looks like a variable name
+// or contains spaces — it is a secret, not an identifier. Only whitespace-only is
+// refused, because that reads as "encrypted" while making decryption impossible.
+func TestParseAcceptsAnyPassphraseShape(t *testing.T) {
+	for _, v := range []string{"hunter2", "correct horse battery staple", "PICCOLO_KEY_PASSPHRASE", "p\tc\n", "ünïcødé"} {
+		_, err := Parse(strings.NewReader(validYAML + "secrets:\n  passphrase: " + quoteIf(v) + "\n"))
+		if err != nil {
+			t.Errorf("passphrase %q rejected: %v", v, err)
 		}
 	}
+}
 
-	for _, good := range []string{"PICCOLO_PASSPHRASE", "P", "_HIDDEN", "A1", "A_B_C"} {
-		if !IsEnvVarName(good) {
-			t.Errorf("IsEnvVarName(%q) = false, want true", good)
+func TestValidateRejectsWhitespaceOnlyPassphrase(t *testing.T) {
+	for _, v := range []string{" ", "\t", "   \n"} {
+		_, err := Parse(strings.NewReader(validYAML + "secrets:\n  passphrase: " + quoteIf(v) + "\n"))
+		if err == nil {
+			t.Errorf("whitespace-only passphrase %q accepted", v)
+			continue
 		}
-	}
-	// Lowercase is legal in POSIX but rejected here on purpose: "hunter2" is the
-	// single most likely pasted passphrase, and it matches the permissive rule.
-	for _, lower := range []string{"hunter2", "my_passphrase", "piccolo_passphrase"} {
-		if IsEnvVarName(lower) {
-			t.Errorf("IsEnvVarName(%q) = true; a lowercase word is the shape of a secret, not of this field", lower)
+		if !strings.Contains(err.Error(), "secrets.passphrase") {
+			t.Errorf("error must name the field: %v", err)
 		}
 	}
 }
 
 func quoteIf(s string) string {
-	// YAML needs quoting for values with spaces or leading special characters; the
-	// point of the test is the parsed value, not the YAML escape rules.
-	if strings.ContainsAny(s, " $(") || strings.Contains(s, "=") {
-		return `"` + s + `"`
-	}
-	return s
+	return `"` + strings.NewReplacer(`\`, `\\`, `"`, `\"`, "\n", `\n`, "\t", `\t`).Replace(s) + `"`
 }
 
 // An unknown sibling under secrets: must still be refused. Strict decoding is what
-// makes a typo in this field loud instead of silently disabling encryption.
+// makes a typo here loud.
 func TestParseRejectsUnknownSecretsKey(t *testing.T) {
-	_, err := Parse(strings.NewReader(validYAML + "secrets:\n  passphrase_env: PICCOLO_PASSPHRASE\n  passphrase: hunter2\n"))
+	_, err := Parse(strings.NewReader(validYAML + "secrets:\n  passphrase: hunter2\n  passphrase_env: PICCOLO_KEY_PASSPHRASE\n"))
 	if err == nil {
-		t.Fatal("a `passphrase:` key (a value, not a name) must be rejected, not ignored")
+		t.Fatal("the retired passphrase_env key must be rejected, not silently ignored: a workspace that still uses it would look encrypted and not be")
 	}
 }
 
-// Round-tripping must not invent an empty secrets block in every workspace's
-// piccolo.yaml.
+// Write must not invent an empty secrets block in every workspace's piccolo.yaml.
 func TestWriteOmitsEmptySecrets(t *testing.T) {
 	m, err := Parse(strings.NewReader(validYAML))
 	if err != nil {
@@ -97,13 +80,50 @@ func TestWriteOmitsEmptySecrets(t *testing.T) {
 	if strings.Contains(string(data), "secrets:") {
 		t.Errorf("unencrypted workspace rendered a secrets block:\n%s", data)
 	}
-	// And the encrypted form survives a write/load cycle unchanged.
-	m.Secrets.PassphraseEnv = "PICCOLO_PASSPHRASE"
+	// And the passphrase survives a write/load cycle unchanged.
+	m.Secrets.Passphrase = "horse battery"
 	if err := m.Write(path); err != nil {
 		t.Fatal(err)
 	}
 	back, err := Load(path)
-	if err != nil || back.PassphraseVar() != "PICCOLO_PASSPHRASE" {
-		t.Fatalf("round trip = %q, %v", back.PassphraseVar(), err)
+	if err != nil || back.Passphrase() != "horse battery" {
+		t.Fatalf("round trip = %q, %v", back.Passphrase(), err)
+	}
+}
+
+// The passphrase is now YAML content, and the awkward shapes are exactly the ones
+// a passphrase can legitimately contain: spaces, a `#` that YAML would read as a
+// comment, a `: ` that would parse as a mapping, quotes, leading whitespace. A
+// silent mangling here would encrypt with one value and decrypt with another,
+// failing only at gateway boot with no hint that the file altered the secret.
+func TestPassphraseSurvivesYamlRoundTrip(t *testing.T) {
+	for _, want := range []string{
+		"correct horse battery staple",
+		"p@ss: #word",
+		"trailing ",
+		" leading",
+		`it's "quoted"`,
+		"# starts as a comment",
+		"- looks like a list",
+		"tab\there",
+		"ünïcødé ✓",
+	} {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "piccolo.yaml")
+		m, err := Parse(strings.NewReader(validYAML))
+		if err != nil {
+			t.Fatal(err)
+		}
+		m.Secrets.Passphrase = want
+		if err := m.Write(path); err != nil {
+			t.Fatalf("%q: write: %v", want, err)
+		}
+		back, err := Load(path)
+		if err != nil {
+			t.Fatalf("%q: load: %v", want, err)
+		}
+		if back.Passphrase() != want {
+			t.Errorf("passphrase mangled by the round trip: got %q want %q", back.Passphrase(), want)
+		}
 	}
 }

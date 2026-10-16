@@ -38,9 +38,17 @@ type Manifest struct {
 // otherwise get a plaintext secret in the workspace they were trying to protect,
 // with the encryption silently doing nothing.
 type Secrets struct {
-	// PassphraseEnv names the host variable holding the enc:// decryption
-	// passphrase. Empty means the workspace is not encrypted.
-	PassphraseEnv string `yaml:"passphrase_env,omitempty"`
+	// Passphrase is the enc:// decryption passphrase, stored here in piccolo.yaml.
+	// Empty means the workspace is not encrypted.
+	//
+	// This is a deliberate trade: it buys a workspace that starts with no setup
+	// ritual — no host variable to export in every shell, no prompt on each run —
+	// and it costs the at-rest protection that `enc://` was otherwise buying, because
+	// piccolo.yaml is the one file in this workspace that is meant to be committed
+	// and shared. Anyone who can read the workspace directory can therefore decrypt
+	// it. The wording in help text, README and doctor states that plainly rather
+	// than letting `enc://` imply more than it now delivers.
+	Passphrase string `yaml:"passphrase,omitempty"`
 }
 
 // Runtime holds Piccolo-owned container runtime configuration. This is distinct
@@ -327,12 +335,6 @@ func parsePortNum(s string) (int, error) {
 // EnvPrefix marks a manifest env value as a reference to a host variable.
 const EnvPrefix = "env:"
 
-// DefaultPassphraseEnv is the host variable Piccolo suggests for the enc://
-// passphrase. One constant in the package that validates the name, so the wizard,
-// the init flag default, and the secrets command cannot suggest three different
-// things and leave a user exporting a variable nothing reads.
-const DefaultPassphraseEnv = "PICCOLO_KEY_PASSPHRASE"
-
 // ResolveEnv turns the manifest env map into KEY=value pairs for the
 // container, resolving env:HOST_VAR references through lookup. The result is
 // sorted by key for deterministic container specs. Missing references return
@@ -379,56 +381,22 @@ func sortStrings(s []string) {
 	}
 }
 
-// Validate rejects a passphrase_env that is not a plausible environment variable
-// name. Only characters that cannot appear in a real passphrase-bearing shell
-// reference are allowed, and the empty value is always valid because it simply
-// means the workspace is not encrypted.
+// Validate checks the secrets block. A whitespace-only passphrase is refused
+// rather than rounded to empty, because a workspace that looks encrypted and
+// cannot be decrypted is the state this whole feature must not produce. An absent
+// value is valid: it simply means the workspace stores plaintext.
 func (s Secrets) Validate() error {
-	v := strings.TrimSpace(s.PassphraseEnv)
-	if v == "" {
+	if s.Passphrase == "" {
 		return nil
 	}
-	if !IsEnvVarName(v) {
-		return fmt.Errorf("secrets.passphrase_env %q must be the NAME of an uppercase host environment variable (letters, digits and underscores), not a passphrase value", v)
+	if strings.TrimSpace(s.Passphrase) == "" {
+		return errors.New("secrets.passphrase is whitespace only — set a real passphrase or remove the field so the workspace stores plaintext")
 	}
 	return nil
 }
 
-// IsEnvVarName reports whether s is shaped like a host environment variable name,
-// restricted to the conventional uppercase form.
-//
-// Deliberately narrower than POSIX, which permits lowercase names: the input being
-// guarded against is a user pasting their passphrase into this field, and the
-// shape of a passphrase is exactly a lowercase word like "hunter2". Accepting any
-// syntactically legal identifier would accept the single most likely secret, so the
-// rule rejects the shape of secrets rather than the shape of non-conforming names.
-// A lowercase variable name that the user genuinely owns can still be used by
-// setting it in container.env with the env: reference, which does not parse here.
-func IsEnvVarName(s string) bool {
-	if s == "" {
-		return false
-	}
-	// An env: prefix here would be a user copying the container.env style; the
-	// field takes a bare name, so say so rather than resolving "env:env:X".
-	if strings.HasPrefix(s, EnvPrefix) {
-		return false
-	}
-	for i, r := range s {
-		switch {
-		case r >= 'A' && r <= 'Z', r == '_':
-		case r >= '0' && r <= '9':
-			if i == 0 {
-				return false
-			}
-		default:
-			return false
-		}
-	}
-	return true
-}
-
-// PassphraseVar returns the host variable name holding this workspace's
-// passphrase, or "" when the workspace is not encrypted.
-func (m *Manifest) PassphraseVar() string {
-	return strings.TrimSpace(m.Secrets.PassphraseEnv)
+// Passphrase returns the workspace's enc:// decryption passphrase, or "" when the
+// workspace is not encrypted. Callers treat "" as the encrypted-posture test.
+func (m *Manifest) Passphrase() string {
+	return m.Secrets.Passphrase
 }

@@ -32,9 +32,8 @@ func execInit(t *testing.T, dir string, args ...string) (string, error) {
 // not the flag plumbing, so a future path that loses the opt-in fails here.
 func TestInitEncryptKeysCarriesThroughYesPath(t *testing.T) {
 	dir := t.TempDir()
-	t.Setenv("PICCOLO_KEY_PASSPHRASE", "horse")
 
-	stdout, err := execInit(t, dir, "--yes", "--encrypt-keys",
+	stdout, err := execInit(t, dir, "--yes", "--encrypt-keys", "--passphrase", "horse",
 		"--name", "P", "--owner", "K", "--purpose", "personal",
 		"--provider", "openai", "--model", "gpt-4o", "--api-key", "sk-INIT-PLAINTEXT")
 	if err != nil {
@@ -75,15 +74,15 @@ func TestInitEncryptKeysCarriesThroughYesPath(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if m.PassphraseVar() != "PICCOLO_KEY_PASSPHRASE" {
-		t.Errorf("piccolo.yaml did not record the variable: %q", m.PassphraseVar())
+	if m.Passphrase() != "horse" {
+		t.Errorf("piccolo.yaml did not record the passphrase: %q", m.Passphrase())
 	}
 	if _, err := os.Stat(filepath.Join(dir, "picoclaw", "keys", "picoclaw_ed25519.key")); err != nil {
 		t.Errorf("key file missing: %v", err)
 	}
 	// The two files must agree: an encrypted config.json with no recorded route is
 	// a workspace that cannot boot, and vice versa.
-	if !strings.Contains(string(cfgData), credential.Scheme) || m.PassphraseVar() == "" {
+	if !strings.Contains(string(cfgData), credential.Scheme) || m.Passphrase() == "" {
 		t.Error("config.json and piccolo.yaml disagree about encryption")
 	}
 }
@@ -110,8 +109,8 @@ func TestInitWithoutEncryptKeysIsUnchanged(t *testing.T) {
 		t.Error("keys directory created for a workspace that never opted in")
 	}
 	m, err := manifest.Load(filepath.Join(dir, "piccolo.yaml"))
-	if err != nil || m.PassphraseVar() != "" {
-		t.Errorf("secrets block recorded without opt-in: %q %v", m.PassphraseVar(), err)
+	if err != nil || m.Passphrase() != "" {
+		t.Errorf("secrets block recorded without opt-in: %q %v", m.Passphrase(), err)
 	}
 }
 
@@ -120,19 +119,19 @@ func TestInitWithoutEncryptKeysIsUnchanged(t *testing.T) {
 // encrypted config.json and no way to decrypt it is worse than no workspace.
 func TestInitEncryptionWithoutPassphraseWritesNothing(t *testing.T) {
 	dir := t.TempDir()
-	os.Unsetenv("PICCOLO_KEY_PASSPHRASE")
 
+	// No --passphrase and no terminal: there is nowhere to get one from.
 	stdout, err := execInit(t, dir, "--yes", "--encrypt-keys",
 		"--name", "P", "--owner", "K", "--purpose", "personal",
 		"--provider", "openai", "--model", "gpt-4o", "--api-key", "sk-x")
 	if err == nil {
 		t.Fatalf("init succeeded with no way to obtain a passphrase:\n%s", stdout)
 	}
-	if !strings.Contains(err.Error(), "PICCOLO_KEY_PASSPHRASE") {
-		t.Errorf("error should name the variable to export: %v", err)
+	if !strings.Contains(err.Error(), "--passphrase") {
+		t.Errorf("error should name the flag that supplies it: %v", err)
 	}
-	if !strings.Contains(err.Error(), "secrets encrypt") {
-		t.Errorf("error should offer the after-the-fact route: %v", err)
+	if !strings.Contains(err.Error(), "piccolo secrets encrypt") {
+		t.Errorf("error should offer the later route: %v", err)
 	}
 	// Nothing may have been written.
 	if _, err := os.Stat(filepath.Join(dir, "picoclaw", "config.json")); err == nil {
@@ -145,7 +144,7 @@ func TestInitEncryptionWithoutPassphraseWritesNothing(t *testing.T) {
 func TestInitRejectsPassphraseShapedVariableName(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("SOMETHING", "x")
-	stdout, err := execInit(t, dir, "--yes", "--encrypt-keys", "--passphrase-env", "hunter2",
+	stdout, err := execInit(t, dir, "--yes", "--encrypt-keys", "--passphrase", "horse", "--passphrase-env", "hunter2",
 		"--name", "P", "--owner", "K", "--purpose", "personal",
 		"--provider", "openai", "--model", "gpt-4o", "--api-key", "sk-x")
 	if err == nil {
@@ -156,13 +155,12 @@ func TestInitRejectsPassphraseShapedVariableName(t *testing.T) {
 	}
 }
 
-// encryptionCandidateInputs is the Inputs shape init holds at the moment
-// prepareEncryption runs: opted in, with the variable name chosen and no callback
-// installed yet.
+// encryptionCandidateInputs is the Inputs shape init holds when prepareEncryption
+// runs: opted in, passphrase chosen, no callback installed yet.
 func encryptionCandidateInputs() *generate.Inputs {
 	return &generate.Inputs{
-		EncryptKeys:   true,
-		PassphraseEnv: "PICCOLO_KEY_PASSPHRASE",
+		EncryptKeys: true,
+		Passphrase:  "horse",
 	}
 }
 
@@ -170,7 +168,6 @@ func encryptionCandidateInputs() *generate.Inputs {
 // Encrypt callback would mean the plan renders plaintext.
 func TestPrepareEncryptionInstallsTheCallback(t *testing.T) {
 	dir := t.TempDir()
-	t.Setenv("PICCOLO_KEY_PASSPHRASE", "horse")
 	layout := workspace.NewLayout(dir)
 	if err := layout.EnsureDirs(); err != nil {
 		t.Fatal(err)
@@ -212,7 +209,6 @@ func TestInitAbortedLeavesNoKeyOrRoute(t *testing.T) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv("PICCOLO_KEY_PASSPHRASE", "horse")
 
 	// Flags supplied but no --yes and no terminal: init must refuse before writing.
 	root := newRootCmd()
@@ -249,8 +245,8 @@ func TestInitRecordsRouteOnlyWhenItCanSeal(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if m.PassphraseVar() != "" {
-		t.Error("a plaintext workspace recorded a passphrase route it does not use")
+	if m.Passphrase() != "" {
+		t.Error("a plaintext workspace recorded a passphrase")
 	}
 	if _, err := os.Stat(filepath.Join(dir, "picoclaw", "keys")); err == nil {
 		t.Error("a plaintext workspace has a key directory")

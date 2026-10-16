@@ -10,6 +10,7 @@ import (
 
 	"github.com/kimus/piccolo/internal/credential"
 	"github.com/kimus/piccolo/internal/generate"
+	"github.com/kimus/piccolo/internal/manifest"
 	"github.com/kimus/piccolo/internal/picoclaw"
 	"github.com/kimus/piccolo/internal/workspace"
 )
@@ -23,10 +24,10 @@ func initEncryptedWorkspace(t *testing.T) string {
 	dir := t.TempDir()
 	in := generate.Inputs{
 		AssistantName: "Piccolo", OwnerName: "Kimus", Purpose: "personal",
-		Model:         generate.ModelInput{Alias: "gpt-5.4", Provider: "openai", Model: "gpt-4o", APIKey: "sk-real-key"},
-		WebSearch:     true,
-		EncryptKeys:   true,
-		PassphraseEnv: "PICCOLO_KEY_PASSPHRASE",
+		Model:       generate.ModelInput{Alias: "gpt-5.4", Provider: "openai", Model: "gpt-4o", APIKey: "sk-real-key"},
+		WebSearch:   true,
+		EncryptKeys: true,
+		Passphrase:  "fixture-passphrase",
 	}
 	// Encryption at render time needs a key, which init generates after the plan is
 	// confirmed; do the same here so config.json carries a real ciphertext.
@@ -52,6 +53,21 @@ func initEncryptedWorkspace(t *testing.T) string {
 		t.Fatal(err)
 	}
 	return dir
+}
+
+// dropPassphrase removes secrets.passphrase from piccolo.yaml, leaving the
+// ciphertext behind — the drift a workspace clone or a hand edit produces.
+func dropPassphrase(t *testing.T, dir string) {
+	t.Helper()
+	path := filepath.Join(dir, "piccolo.yaml")
+	m, err := manifest.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.Secrets.Passphrase = ""
+	if err := m.Write(path); err != nil {
+		t.Fatal(err)
+	}
 }
 
 // sidecar writes picoclaw/.security.yml next into a workspace.
@@ -514,27 +530,27 @@ func TestDoctorChecksSecondaryChannelSecrets(t *testing.T) {
 // one from config.json, and fails at boot with an error saying "cannot read SSH
 // key". doctor and status are where a user looks when the gateway misbehaves.
 func TestDoctorReportsCredentialDeliveryState(t *testing.T) {
-	lookupSet := func(string) (string, bool) { return "something", true }
-	lookupUnset := func(string) (string, bool) { return "", false }
 
 	// Healthy encrypted workspace.
 	dir := initEncryptedWorkspace(t)
-	results := Run(context.Background(), Options{Workspace: dir, Engine: fakeEngine{imageExists: true}, LookupEnv: lookupSet})
+	results := Run(context.Background(), Options{Workspace: dir, Engine: fakeEngine{imageExists: true}})
 	if r := find(results, "credential encryption"); r == nil || r.Status != OK {
 		t.Fatalf("healthy encrypted workspace not reported OK: %v", results)
+	}
+	// The honest half: it must say the passphrase sits in a committed file.
+	if r := find(results, "credential encryption"); !strings.Contains(r.Message, "committed") {
+		t.Errorf("encryption line omits the piccolo.yaml exposure: %s", r.Message)
 	}
 	if r := find(results, "placeholder or empty API key"); r != nil {
 		t.Errorf("the enc:// value was judged an empty key: %s", r.Message)
 	}
 
-	// Variable unset.
-	results = Run(context.Background(), Options{Workspace: dir, Engine: fakeEngine{imageExists: true}, LookupEnv: lookupUnset})
-	r := find(results, "is unset")
+	// Passphrase removed from piccolo.yaml.
+	dropPassphrase(t, dir)
+	results = Run(context.Background(), Options{Workspace: dir, Engine: fakeEngine{imageExists: true}})
+	r := find(results, "no secrets.passphrase")
 	if r == nil || r.Status != WARN {
-		t.Fatalf("unset passphrase not warned: %v", results)
-	}
-	if !strings.Contains(r.Message, "PICCOLO_KEY_PASSPHRASE") {
-		t.Errorf("warning must name the variable: %s", r.Message)
+		t.Fatalf("missing passphrase not warned: %v", results)
 	}
 	// Never phrase it as a broken config file: that sends the user to the wrong
 	// file, which is the misdirection this check exists to remove.
@@ -542,14 +558,14 @@ func TestDoctorReportsCredentialDeliveryState(t *testing.T) {
 		t.Errorf("misattributed to config.json: %s", r.Message)
 	}
 	if Failed(results) {
-		t.Error("an unset passphrase must warn, not fail: it is supplied by whoever runs serve")
+		t.Error("a missing passphrase must warn, not fail: doctor stays a report, serve is the gate")
 	}
 
 	// Key file removed.
 	if err := os.RemoveAll(filepath.Join(dir, "picoclaw", "keys")); err != nil {
 		t.Fatal(err)
 	}
-	results = Run(context.Background(), Options{Workspace: dir, Engine: fakeEngine{imageExists: true}, LookupEnv: lookupSet})
+	results = Run(context.Background(), Options{Workspace: dir, Engine: fakeEngine{imageExists: true}})
 	r = find(results, "key file")
 	if r == nil || r.Status != WARN {
 		t.Fatalf("missing key file not warned: %v", results)

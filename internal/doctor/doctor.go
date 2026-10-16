@@ -269,7 +269,7 @@ func Run(ctx context.Context, opts Options) []Result {
 	// passphrase that reaches the container, and the exact key file whose bytes feed
 	// the derivation. Neither failure is visible from config.json, and both end the
 	// same way — the gateway exits on a config error that names config.json.
-	results = append(results, checkCredentialEncryption(opts.Workspace, configPath, data, m, lookup)...)
+	results = append(results, checkCredentialEncryption(opts.Workspace, configPath, data, m)...)
 
 	// 7. Agents.
 	results = append(results, checkAgents(opts.Workspace, cfg)...)
@@ -1252,7 +1252,7 @@ func checkRunningImage(ctx context.Context, engine Engine, m *manifest.Manifest)
 // variable is exported by whoever runs serve, not stored by Piccolo), and making it
 // a FAIL would turn every daemon-free `doctor` run in a fresh shell into a red
 // board. `serve` is where it becomes fatal, and that guard already exists.
-func checkCredentialEncryption(workspaceDir, configPath string, configData []byte, m *manifest.Manifest, lookup func(string) (string, bool)) []Result {
+func checkCredentialEncryption(workspaceDir, configPath string, configData []byte, m *manifest.Manifest) []Result {
 	var results []Result
 	add := func(s Status, format string, args ...any) {
 		results = append(results, Result{Status: s, Message: fmt.Sprintf(format, args...)})
@@ -1265,25 +1265,24 @@ func checkCredentialEncryption(workspaceDir, configPath string, configData []byt
 		// findings that matter.
 		return results
 	}
-	envVar := strings.TrimSpace(m.PassphraseVar())
-	if envVar == "" {
-		add(WARN, "config.json holds %d enc:// credential(s) but piccolo.yaml names no secrets.passphrase_env — serve cannot deliver the passphrase and the gateway will not start", n)
-		return results
+	if m.Passphrase() == "" {
+		add(WARN, "config.json holds %d enc:// credential(s) but piccolo.yaml has no secrets.passphrase — serve cannot deliver a passphrase and the gateway will not start", n)
 	}
-	v, found := lookup(envVar)
-	if !found || strings.TrimSpace(v) == "" {
-		add(WARN, "config.json holds %d enc:// credential(s) and host variable %s is unset — export it before 'piccolo serve', which will otherwise refuse to start", n, envVar)
-		// The key file is still worth reporting on this branch: two missing things
-		// is a different remedy list than one.
-	}
+	// Checked whether or not the passphrase is present: a workspace missing both
+	// needs two fixes, and reporting only the first would send the user back to
+	// doctor after each one.
 	if _, err := os.Stat(filepath.Join(workspaceDir, workspace.PicoclawDir, workspace.KeysDirName, workspace.KeyFileName)); err != nil {
 		add(WARN, "config.json holds %d enc:// credential(s) but the key file %s is missing or unreadable — PicoClaw derives its AES key from that file's bytes, so no credential can be decrypted without it", n, workspace.KeysDirName+"/"+workspace.KeyFileName)
 		return results
 	}
-	if found && strings.TrimSpace(v) != "" {
-		add(OK, "credential encryption: %d enc:// value(s), passphrase from %s, key present", n, envVar)
+	if m.Passphrase() == "" {
 		return results
 	}
+	// The one finding this check must add: piccolo.yaml is committed on purpose, so
+	// recording the passphrase there means a copy of this workspace is a copy of the
+	// credentials. Reporting that beats letting "encrypted" imply protection the
+	// arrangement no longer provides.
+	add(OK, "credential encryption: %d enc:// value(s), passphrase in piccolo.yaml, key present — note: piccolo.yaml is committed, so a copy of this workspace can still be decrypted", n)
 	return results
 }
 

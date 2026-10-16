@@ -25,11 +25,13 @@ const encryptedWorkspaceAlias = "gpt-4o"
 // encryptedWorkspace builds a workspace already opted into enc:// storage, the
 // state setup has to respect. Done through the real init path so the key, the
 // manifest field, and the ignore rule are the ones init itself would produce.
+// encryptedWorkspace builds a workspace already opted into enc:// storage. Done
+// through the real init path so the key, the manifest entry and the ignore rule are
+// the ones init itself produces.
 func encryptedWorkspace(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()
-	t.Setenv("PICCOLO_KEY_PASSPHRASE", "horse")
-	stdout, err := execInit(t, dir, "--yes", "--encrypt-keys",
+	stdout, err := execInit(t, dir, "--yes", "--encrypt-keys", "--passphrase", "horse",
 		"--name", "P", "--owner", "K", "--purpose", "personal",
 		"--provider", "openai", "--model", "gpt-4o", "--api-key", "sk-original")
 	if err != nil {
@@ -58,6 +60,31 @@ func TestSetupEncryptedFlagNeedsBothHalves(t *testing.T) {
 
 // newSetupStateForTest mirrors runSetup's derivation of the encrypted flag, so the
 // test exercises the same conjunction the command does rather than a copy of it.
+// setPassphrase writes secrets.passphrase into piccolo.yaml, standing in for the
+// state a user creates by editing the file by hand.
+func setPassphrase(t *testing.T, dir, passphrase string) {
+	t.Helper()
+	layout := workspace.NewLayout(dir)
+	m, err := manifest.Load(layout.Manifest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.Secrets.Passphrase = passphrase
+	if err := m.Write(layout.Manifest()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// reloadManifest mirrors what a fresh process would see after setPassphrase.
+func reloadManifest(t *testing.T, dir string) *manifest.Manifest {
+	t.Helper()
+	m, err := manifest.Load(workspace.NewLayout(dir).Manifest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return m
+}
+
 func newSetupStateForTest(t *testing.T, dir string) *setupState {
 	t.Helper()
 	layout := workspace.NewLayout(dir)
@@ -75,7 +102,7 @@ func newSetupStateForTest(t *testing.T, dir string) *setupState {
 		manifestPath: layout.Manifest(), manifest: m,
 		secrets: picoclaw.LoadSecrets(layout.Config()),
 	}
-	if _, err := os.Stat(layout.KeyFile()); err == nil && m.PassphraseVar() != "" {
+	if _, err := os.Stat(layout.KeyFile()); err == nil && m.Passphrase() != "" {
 		st.encrypted = true
 	}
 	return st
@@ -177,13 +204,16 @@ func TestSetupSealRefusesWithoutPassphrase(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	os.Unsetenv("PICCOLO_KEY_PASSPHRASE")
+	setPassphrase(t, dir, "")
+	// Reload the state the way a fresh setup session would, or the test would be
+	// asserting against a manifest copy that still holds the old value.
+	st.manifest = reloadManifest(t, dir)
 	err = st.sealBeforeWrite("model m1")
 	if err == nil {
 		t.Fatal("sealed nothing and reported success in a workspace that must not hold plaintext")
 	}
-	if !strings.Contains(err.Error(), "PICCOLO_KEY_PASSPHRASE") {
-		t.Errorf("error should name the variable: %v", err)
+	if !strings.Contains(err.Error(), "secrets.passphrase") {
+		t.Errorf("error should name the manifest field: %v", err)
 	}
 	// The guarantee is about DISK, not the in-memory document: the plaintext the
 	// user typed is legitimately in memory until the write happens, and
@@ -197,7 +227,7 @@ func TestSetupSealRefusesWithoutPassphrase(t *testing.T) {
 		t.Error("the refusal also destroyed the previously encrypted credential")
 	}
 	// And the error is the actionable kind: it names the variable, not a stack.
-	if !strings.Contains(err.Error(), "export") && !strings.Contains(err.Error(), "unset") {
+	if !strings.Contains(err.Error(), "set it") {
 		t.Errorf("error should tell the user what to do: %v", err)
 	}
 }

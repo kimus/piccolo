@@ -5,10 +5,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/spf13/cobra"
 
+	"github.com/kimus/piccolo/internal/configdoc"
 	"github.com/kimus/piccolo/internal/docker"
 	"github.com/kimus/piccolo/internal/manifest"
 	"github.com/kimus/piccolo/internal/picoclaw"
@@ -110,10 +112,14 @@ func newStatusCmd() *cobra.Command {
 				// could not decrypt its own config, and the symptom is chat failing, not
 				// an image error — same reasoning as the stale line above. Only reported
 				// when the workspace is encrypted at all.
-				if m.PassphraseVar() != "" {
-					if v, found := os.LookupEnv(m.PassphraseVar()); !found || v == "" {
-						fmt.Fprintf(out, "encrypt:   host variable %s is unset — a gateway started now would refuse to boot on this workspace's enc:// credentials\n", m.PassphraseVar())
-					}
+				// The enc:// half of the posture lives in the workspace, so it can be
+				// checked from the workspace alone: a config.json with ciphertext and
+				// no passphrase (or no key file) is a gateway that will not boot.
+				if credentialDeliveryGap(dir, m) {
+					fmt.Fprintln(out, "encrypt:   config.json holds enc:// credentials but piccolo.yaml has no secrets.passphrase — the gateway will refuse to start")
+				}
+				if keyGap := credentialKeyGap(dir, m); keyGap != "" {
+					fmt.Fprintf(out, "encrypt:   %s\n", keyGap)
 				}
 			}
 			return nil
@@ -188,4 +194,32 @@ func healthURLFor(cmd *cobra.Command) (string, error) {
 		return "", fmt.Errorf("config.json does not parse: %w", err)
 	}
 	return fmt.Sprintf("http://127.0.0.1:%d/health", cfg.HealthPort()), nil
+}
+
+// credentialDeliveryGap reports an encrypted workspace that cannot decrypt its own
+// config: ciphertext present and no passphrase recorded. Checked from the
+// workspace alone, because both halves now live in it.
+func credentialDeliveryGap(dir string, m *manifest.Manifest) bool {
+	if m.Passphrase() != "" {
+		return false
+	}
+	doc, err := configdoc.Load(workspace.NewLayout(dir).Config())
+	if err != nil {
+		return false // status already surfaces an unreadable config through healthURLFor
+	}
+	return encryptedCredentialCount(doc) > 0
+}
+
+// credentialKeyGap returns a sentence when an encrypted workspace cannot reach its
+// key file. Empty string means nothing to report.
+func credentialKeyGap(dir string, m *manifest.Manifest) string {
+	layout := workspace.NewLayout(dir)
+	doc, err := configdoc.Load(layout.Config())
+	if err != nil || encryptedCredentialCount(doc) == 0 {
+		return ""
+	}
+	if _, err := os.Stat(layout.KeyFile()); err != nil {
+		return fmt.Sprintf("%s holds enc:// credentials but the key file %s is missing — PicoClaw derives its AES key from that file's bytes, so nothing can decrypt", filepath.Join("picoclaw", "config.json"), rel(dir, layout.KeyFile()))
+	}
+	return ""
 }

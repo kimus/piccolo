@@ -23,11 +23,11 @@ func TestServePreflightRefusesUndeliverableCredentials(t *testing.T) {
 		want   string
 	}{
 		{
-			name: "host variable unset",
+			name: "passphrase stripped from piccolo.yaml",
 			mutate: func(t *testing.T, dir string) {
-				os.Unsetenv("PICCOLO_KEY_PASSPHRASE")
+				setPassphraseInManifest(t, dir, "")
 			},
-			want: "PICCOLO_KEY_PASSPHRASE",
+			want: "secrets.passphrase",
 		},
 		{
 			name: "key file deleted",
@@ -41,7 +41,6 @@ func TestServePreflightRefusesUndeliverableCredentials(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			// Fresh workspace per case: the mutations are destructive.
 			w := encryptedWorkspace(t)
-			t.Setenv("PICCOLO_KEY_PASSPHRASE", "horse")
 			tc.mutate(t, w)
 
 			err := preflightFails(w)
@@ -69,10 +68,11 @@ func TestServePreflightUnchangedForPlaintextWorkspace(t *testing.T) {
 	if err != nil {
 		t.Fatalf("init: %v\n%s", err, stdout)
 	}
-	// Preflight must reach the end of its checks for a plaintext workspace: the
-	// credential guard staying silent is the whole no-opt-in-is-unchanged claim, and
-	// asserting only "not an enc:// message" would pass on any unrelated failure.
-	if err := preflightFails(dir); err != nil {
+	// The credential guard, not all of preflight: the guard must stay silent here,
+	// and it must not need a Docker daemon to say so. Full preflight requires a
+	// live daemon, which is a property of the machine running the tests and would
+	// turn this positive control into a flaky one.
+	if err := checkCredentialDelivery(dir); err != nil {
 		t.Errorf("plaintext workspace was refused by the credential guard: %v", err)
 	}
 }
@@ -86,8 +86,12 @@ func TestWithCredentialEnvRespectsExplicitValues(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// The fixture really is encrypted, or this test proves nothing.
+	if m.Passphrase() == "" {
+		t.Fatal("fixture has no secrets.passphrase")
+	}
 
-	env := withCredentialEnv([]string{"A=1"}, m, layout, "horse")
+	env := withCredentialEnv([]string{"A=1"}, layout, m.Passphrase())
 	if !contains(env, "PICOCLAW_KEY_PASSPHRASE=horse") {
 		t.Errorf("passphrase not injected: %v", env)
 	}
@@ -96,7 +100,7 @@ func TestWithCredentialEnvRespectsExplicitValues(t *testing.T) {
 	}
 
 	// Explicit values survive.
-	kept := withCredentialEnv([]string{"PICOCLAW_SSH_KEY_PATH=/custom/path"}, m, layout, "horse")
+	kept := withCredentialEnv([]string{"PICOCLAW_SSH_KEY_PATH=/custom/path"}, layout, m.Passphrase())
 	if contains(kept, "PICOCLAW_SSH_KEY_PATH="+layout.ContainerKeyFile()) {
 		t.Error("Piccolo overwrote an explicit PICOCLAW_SSH_KEY_PATH")
 	}
@@ -107,7 +111,7 @@ func TestWithCredentialEnvRespectsExplicitValues(t *testing.T) {
 	// An empty passphrase is not injected as an empty assignment: that would set
 	// the variable to "" and PicoClaw reports "passphrase required" rather than
 	// "you never told me where it came from".
-	blank := withCredentialEnv(nil, m, layout, "")
+	blank := withCredentialEnv(nil, layout, "")
 	if contains(blank, "PICOCLAW_KEY_PASSPHRASE=") {
 		t.Error("empty passphrase injected as an assignment")
 	}
@@ -123,7 +127,7 @@ func TestWithCredentialEnvUsesContainerPath(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	env := withCredentialEnv(nil, m, layout, "horse")
+	env := withCredentialEnv(nil, layout, m.Passphrase())
 	var keyArg string
 	for _, kv := range env {
 		if strings.HasPrefix(kv, "PICOCLAW_SSH_KEY_PATH=") {
@@ -139,6 +143,21 @@ func TestWithCredentialEnvUsesContainerPath(t *testing.T) {
 	// And it lives under the directory that is actually mounted.
 	if filepath.Dir(keyArg) != workspace.ContainerKeysDir {
 		t.Errorf("key dir %q != %q", filepath.Dir(keyArg), workspace.ContainerKeysDir)
+	}
+}
+
+// setPassphraseInManifest rewrites secrets.passphrase, standing in for a user who
+// edits piccolo.yaml or clones a workspace whose copy lost it.
+func setPassphraseInManifest(t *testing.T, dir, passphrase string) {
+	t.Helper()
+	path := workspace.NewLayout(dir).Manifest()
+	m, err := manifest.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.Secrets.Passphrase = passphrase
+	if err := m.Write(path); err != nil {
+		t.Fatal(err)
 	}
 }
 

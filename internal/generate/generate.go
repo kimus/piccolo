@@ -17,6 +17,7 @@ import (
 	"github.com/kimus/piccolo/internal/manifest"
 	"github.com/kimus/piccolo/internal/picoclaw"
 	"github.com/kimus/piccolo/internal/runtimeimage"
+	"github.com/kimus/piccolo/internal/workspace"
 )
 
 // DefaultImage is the pinned PicoClaw gateway image used when the optional
@@ -56,14 +57,14 @@ type Inputs struct {
 	Model     ModelInput
 	WebSearch bool
 	ShellExec bool
-	// EncryptKeys records the opt-in so piccolo.yaml can name the host variable
-	// the passphrase will come from. It does not itself encrypt anything: the
+	// EncryptKeys records the opt-in. It does not itself encrypt anything: the
 	// workspace has no key until the caller generates one, which happens after the
 	// user confirms the plan. Carried on Inputs because piccolo.yaml is rendered
 	// here, and the two files must agree about whether this workspace is encrypted.
 	EncryptKeys bool
-	// PassphraseEnv is the host variable NAME recorded when EncryptKeys is set.
-	PassphraseEnv string
+	// Passphrase is the enc:// decryption passphrase recorded into piccolo.yaml
+	// when EncryptKeys is set.
+	Passphrase string
 	// Encrypt turns a plaintext credential into the value that gets written. nil
 	// writes plaintext, which is the default and the only behaviour before a
 	// workspace opts in.
@@ -96,14 +97,8 @@ func (in Inputs) Validate() error {
 	if strings.TrimSpace(in.Model.Alias) == "" || strings.TrimSpace(in.Model.Model) == "" {
 		return fmt.Errorf("model alias and model id are required")
 	}
-	if in.EncryptKeys {
-		// Validated against manifest's own rule rather than a second copy, so
-		// init cannot write a piccolo.yaml that the manifest loader would then
-		// refuse to read.
-		if !manifest.IsEnvVarName(strings.TrimSpace(in.PassphraseEnv)) {
-			return fmt.Errorf("passphrase variable name %q must be uppercase letters, digits and underscores — the NAME of a host variable, not a passphrase", in.PassphraseEnv)
-		}
-	}
+	// The passphrase itself is validated by the manifest it is about to be written
+	// into, so init cannot produce a piccolo.yaml that the loader then refuses.
 	return nil
 }
 
@@ -130,10 +125,11 @@ func (in Inputs) Manifest() *manifest.Manifest {
 		m.Container.Env = map[string]string{"PICOCLAW_GATEWAY_HOST": "0.0.0.0"}
 	}
 	if in.EncryptKeys {
-		// Recorded so serve can resolve the passphrase at launch. Only the NAME of
-		// a host variable is written here; the passphrase itself is never stored by
-		// Piccolo, which is why this field cannot express a value.
-		m.Secrets.PassphraseEnv = in.PassphraseEnv
+		// The passphrase is written into piccolo.yaml, which is what lets an
+		// encrypted workspace start with no setup ritual. piccolo.yaml is committed
+		// by design, so this does NOT protect a copied workspace — see the field
+		// comment in manifest.Secrets and the README wording.
+		m.Secrets.Passphrase = in.Passphrase
 	}
 	return m
 }
@@ -427,13 +423,14 @@ func (p *Plan) Write(dir string, overwrite map[string]bool) (written, skipped []
 // the only way to add it everywhere at once.
 var GitignoreEntries = []string{
 	"picoclaw/config.json",
+	// Every confirmed write leaves the previous file behind, and before encryption
+	// that previous file is the plaintext the user just removed. Ignoring it is not
+	// tidiness: `git add -A` would commit the credentials that
+	// `piccolo secrets encrypt` exists to take out of the tree.
+	"picoclaw/config.json.bak",
 	"picoclaw/.security.yml",
 	"picoclaw/.picoclaw.pid",
 	"picoclaw/launcher-auth.db",
-	// The credential encryption key. Its absence is not merely untidy: the key
-	// file plus a committed config.json is the complete recipe for decrypting
-	// every enc:// value in the workspace.
-	"picoclaw/keys/",
 	"picoclaw/logs/",
 	"integrations/*/auth/",
 	"runtime/",
@@ -461,7 +458,7 @@ func EnsureGitignore(dir string) (bool, error) {
 	}
 	changed := false
 	out := string(data)
-	for _, entry := range entries {
+	for _, entry := range append(append([]string{}, entries...), conditionalEntries(dir)...) {
 		if existing[entry] {
 			continue
 		}
@@ -491,6 +488,21 @@ const GitignoreOSMetadata = ".DS_Store"
 // not carry. It exists because EnsureGitignore runs only during init: a workspace
 // created before an entry was required never gains it, and without a read-only
 // check that gap is invisible rather than merely unfixed.
+// ConditionalGitignoreEntries are required only once the workspace actually holds
+// the thing they cover. Demanding them always made `piccolo doctor` warn on
+// untouched plaintext workspaces about a picoclaw/keys/ directory they will never
+// have, which is a permanent false warning on a healthy workspace — the exact
+// thing this repo keeps having to un-learn, and a sure way to train users to
+// ignore the findings that are real.
+var ConditionalGitignoreEntries = []struct {
+	Path  string
+	Entry string
+}{
+	// The credential encryption key: key file plus committed config.json is the
+	// complete recipe for every enc:// value in the workspace.
+	{Path: filepath.Join("picoclaw", workspace.KeysDirName), Entry: "picoclaw/" + workspace.KeysDirName + "/"},
+}
+
 func MissingGitignoreEntries(dir string) ([]string, error) {
 	data, err := os.ReadFile(filepath.Join(dir, ".gitignore"))
 	if err != nil && !os.IsNotExist(err) {
@@ -510,5 +522,25 @@ func MissingGitignoreEntries(dir string) ([]string, error) {
 			missing = append(missing, entry)
 		}
 	}
+	for _, c := range ConditionalGitignoreEntries {
+		if present[c.Entry] {
+			continue
+		}
+		if fi, err := os.Stat(filepath.Join(dir, c.Path)); err == nil && fi.IsDir() {
+			missing = append(missing, c.Entry)
+		}
+	}
 	return missing, nil
+}
+
+// conditionalEntries lists the conditional ignore rules that apply to this
+// workspace right now.
+func conditionalEntries(dir string) []string {
+	var out []string
+	for _, c := range ConditionalGitignoreEntries {
+		if fi, err := os.Stat(filepath.Join(dir, c.Path)); err == nil && fi.IsDir() {
+			out = append(out, c.Entry)
+		}
+	}
+	return out
 }

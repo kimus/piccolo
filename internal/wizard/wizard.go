@@ -11,7 +11,6 @@ import (
 	"github.com/charmbracelet/huh"
 
 	"github.com/kimus/piccolo/internal/generate"
-	"github.com/kimus/piccolo/internal/manifest"
 )
 
 // KeyMap is the one keybinding definition for every interactive Piccolo screen:
@@ -56,24 +55,15 @@ type Prefill struct {
 	APIBase    string
 	WebSearch  *bool
 	ShellExec  *bool
-	// EncryptKeys is the credential-storage choice; nil means "ask".
-	EncryptKeys   *bool
-	PassphraseEnv string
-	Workspace     string
+	// EncryptKeys is the credential-storage choice; nil means "ask". The passphrase
+	// itself is not collected here — init prompts for it after the plan is
+	// confirmed, since encryption cannot happen before a key exists.
+	EncryptKeys *bool
+	Workspace   string
 }
 
 // Run presents the wizard and returns validated generation inputs plus the
 // chosen workspace path (relative or absolute, as entered).
-// passphraseVar is the host variable name a workspace will read the passphrase
-// from. Flag-provided when given, else the default. It is a NAME: the passphrase
-// itself is never a value Piccolo stores or passes on a command line.
-func passphraseVar(pre Prefill) string {
-	if v := strings.TrimSpace(pre.PassphraseEnv); v != "" {
-		return v
-	}
-	return manifest.DefaultPassphraseEnv
-}
-
 func Run(pre Prefill) (generate.Inputs, string, error) {
 	in := generate.Inputs{
 		AssistantName: pre.AssistantName,
@@ -81,7 +71,6 @@ func Run(pre Prefill) (generate.Inputs, string, error) {
 		Purpose:       pre.Purpose,
 		Specialists:   pre.Specialists,
 		EncryptKeys:   pre.EncryptKeys != nil && *pre.EncryptKeys,
-		PassphraseEnv: passphraseVar(pre),
 		Model: generate.ModelInput{
 			Alias:    pre.ModelAlias,
 			Provider: pre.Provider,
@@ -196,25 +185,21 @@ func Run(pre Prefill) (generate.Inputs, string, error) {
 			huh.NewConfirm().
 				Title("Encrypt credentials stored in this workspace?").
 				Description("Stores the API key as PicoClaw enc:// ciphertext instead of plaintext.\n\n"+
-					"Protects: a copied, backed-up, or accidentally committed workspace.\n"+
-					"Does not hide: anything from someone with host or Docker access — the passphrase\n"+
-					"  reaches the gateway through the container environment, visible to 'docker inspect'.\n\n"+
-					"Losing the passphrase is permanent: the credentials must be re-entered. It is never\n"+
-					"stored by piccolo; the workspace records only the NAME of the host variable that\n"+
-					"holds it ("+passphraseVar(pre)+").").
+					"Protects: config.json no longer holds a readable key, so a file listing or a\n"+
+					"  casual grep of the workspace does not surface it.\n"+
+					"Does NOT protect: a copy of this workspace. The passphrase is written to\n"+
+					"  piccolo.yaml, which is the file meant to be committed and shared, so anyone\n"+
+					"  holding this directory can decrypt it.\n\n"+
+					"Losing the passphrase is permanent: the credentials must be re-entered.").
 				Affirmative("Yes, encrypt").
 				Negative("No, plaintext").
 				Value(&enc),
 		))
 		if enc {
 			in.EncryptKeys = true
-			in.PassphraseEnv = passphraseVar(pre)
 		}
 	} else if pre.EncryptKeys != nil {
 		in.EncryptKeys = *pre.EncryptKeys
-		if in.EncryptKeys {
-			in.PassphraseEnv = passphraseVar(pre)
-		}
 	}
 
 	if pre.WebSearch == nil {

@@ -73,6 +73,14 @@ func preflight(cmd *cobra.Command) (*serveContext, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Credential delivery is checked from the workspace alone, before the daemon
+	// ping. It needs nothing from Docker, and running it after the ping meant a
+	// user with an undecryptable workspace and a stopped daemon was told about the
+	// daemon — the one thing that is not their problem here.
+	if err := checkCredentialDelivery(dir); err != nil {
+		return nil, err
+	}
+
 	runner := docker.New()
 	ctx := cmd.Context()
 	pingCtx, cancelPing := context.WithTimeout(ctx, runner.ProbeTimeout)
@@ -118,19 +126,6 @@ func preflight(cmd *cobra.Command) (*serveContext, error) {
 	// variable or a file on the host. Checked here, before any container is created,
 	// because serve parks the running gateway later in this routine and a candidate
 	// that cannot decrypt should never have been allowed to displace it.
-	if n := countEncryptedCredentials(cfgData); n > 0 {
-		envVar := m.PassphraseVar()
-		if envVar == "" {
-			return nil, fmt.Errorf("config.json holds %d enc:// credential(s) but piccolo.yaml names no secrets.passphrase_env, so nothing can deliver the passphrase — set the field, or rewrite the credentials with 'piccolo secrets encrypt'", n)
-		}
-		if v, ok := os.LookupEnv(envVar); !ok || v == "" {
-			return nil, fmt.Errorf("config.json holds %d enc:// credential(s) and host variable %s is unset or empty — export it and retry; PicoClaw will not start the gateway without the passphrase", n, envVar)
-		}
-		if _, err := os.Stat(layout.KeyFile()); err != nil {
-			return nil, fmt.Errorf("config.json holds %d enc:// credential(s) but the key file %s is unreadable — PicoClaw derives its AES key from this file's bytes, so every credential is undecryptable without it (%v)", n, rel(dir, layout.KeyFile()), err)
-		}
-	}
-
 	env, err := m.ResolveEnv(os.LookupEnv)
 	if err != nil {
 		var ref *manifest.ErrPlaceholderEnv
@@ -155,10 +150,10 @@ func preflight(cmd *cobra.Command) (*serveContext, error) {
 	// passphrase and the key location: the derivation hashes the key file's bytes,
 	// so having one without the other is a gateway that exits at startup. Nothing
 	// is injected for a workspace that never opted in. The passphrase is injected
-	// here only because preflight already proved the host variable resolves; the
-	// value comes from the same lookup so there is one resolution, not two.
-	if m.PassphraseVar() != "" {
-		env = withCredentialEnv(env, m, layout, os.Getenv(m.PassphraseVar()))
+	// here because preflight already proved it is set; passing the manifest value
+	// keeps one source of truth rather than a second lookup.
+	if m.Passphrase() != "" {
+		env = withCredentialEnv(env, layout, m.Passphrase())
 	}
 
 	volumes := []string{layout.IntegrationBind()}
@@ -246,7 +241,7 @@ func countEncryptedCredentials(configData []byte) int {
 //
 // Like withGatewayHost, a value the user set in piccolo.yaml wins: an explicit
 // container.env entry is respected rather than overwritten.
-func withCredentialEnv(env []string, m *manifest.Manifest, layout workspace.Layout, passphrase string) []string {
+func withCredentialEnv(env []string, layout workspace.Layout, passphrase string) []string {
 	env = appendEnvUnlessSet(env, passphraseEnvVar, passphrase)
 	return appendEnvUnlessSet(env, keyPathEnvVar, layout.ContainerKeyFile())
 }
@@ -770,6 +765,32 @@ func runServeForeground(cmd *cobra.Command) error {
 	if exitCode != 0 {
 		cmd.SilenceErrors = true
 		os.Exit(exitCode)
+	}
+	return nil
+}
+
+// checkCredentialDelivery refuses a workspace whose enc:// credentials cannot be
+// unlocked: no passphrase recorded, or no key file to derive with. Purely
+// workspace-local, so it can run before Docker is even asked about it.
+func checkCredentialDelivery(dir string) error {
+	layout := workspace.NewLayout(dir)
+	m, err := manifest.Load(layout.Manifest())
+	if err != nil {
+		return err
+	}
+	cfgData, err := os.ReadFile(layout.Config())
+	if err != nil {
+		return nil // the existing preflight read reports this with the right message
+	}
+	n := countEncryptedCredentials(cfgData)
+	if n == 0 {
+		return nil
+	}
+	if m.Passphrase() == "" {
+		return fmt.Errorf("config.json holds %d enc:// credential(s) but piccolo.yaml has no secrets.passphrase, so nothing can decrypt them — set the field, or rewrite the credentials with 'piccolo secrets encrypt'", n)
+	}
+	if _, err := os.Stat(layout.KeyFile()); err != nil {
+		return fmt.Errorf("config.json holds %d enc:// credential(s) but the key file %s is missing or unreadable — PicoClaw derives its AES key from that file's bytes, so nothing can decrypt", n, rel(dir, layout.KeyFile()))
 	}
 	return nil
 }

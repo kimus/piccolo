@@ -12,7 +12,6 @@ import (
 
 	"github.com/kimus/piccolo/internal/docker"
 	"github.com/kimus/piccolo/internal/generate"
-	"github.com/kimus/piccolo/internal/manifest"
 	"github.com/kimus/piccolo/internal/wizard"
 	workspacepkg "github.com/kimus/piccolo/internal/workspace"
 )
@@ -32,9 +31,9 @@ type initFlags struct {
 	shell     bool
 	// encryptKeys opts the generated credential into PicoClaw's enc:// storage.
 	// The default is plaintext, so nothing changes for an existing caller.
-	encryptKeys   bool
-	passphraseEnv string
-	yes           bool
+	encryptKeys bool
+	passphrase  string
+	yes         bool
 }
 
 func newInitCmd() *cobra.Command {
@@ -62,7 +61,7 @@ func newInitCmd() *cobra.Command {
 	cmd.Flags().BoolVar(&f.web, "web-search", true, "enable web search tools")
 	cmd.Flags().BoolVar(&f.shell, "shell", false, "enable shell execution")
 	cmd.Flags().BoolVar(&f.encryptKeys, "encrypt-keys", false, "store the API credential as PicoClaw enc:// ciphertext instead of plaintext")
-	cmd.Flags().StringVar(&f.passphraseEnv, "passphrase-env", manifest.DefaultPassphraseEnv, "NAME of the host variable holding the encryption passphrase (not the passphrase)")
+	cmd.Flags().StringVar(&f.passphrase, "passphrase", "", "passphrase for --encrypt-keys; omit to be prompted (stored in piccolo.yaml either way)")
 	cmd.Flags().BoolVar(&f.yes, "yes", false, "non-interactive: use flags/defaults, skip prompts, never overwrite")
 	return cmd
 }
@@ -83,8 +82,9 @@ func runInit(cmd *cobra.Command, f initFlags) error {
 		WebSearch:     boolPtr(f.web),
 		ShellExec:     boolPtr(f.shell),
 		EncryptKeys:   boolPtr(f.encryptKeys),
-		PassphraseEnv: f.passphraseEnv,
-		Workspace:     dirFlag,
+		// Passphrase is not carried through Prefill: init prompts for it after the plan
+		// is confirmed, because encryption cannot happen before the key exists.
+		Workspace: dirFlag,
 	}
 	// Only pin the web-console choice when the flag was set explicitly; otherwise
 	// leave it nil so the interactive wizard asks (and --yes defaults to false).
@@ -132,7 +132,7 @@ func runInit(cmd *cobra.Command, f initFlags) error {
 		err       error
 	)
 	if f.yes {
-		inputs, err = inputsFromPrefill(pre)
+		inputs, err = inputsFromPrefill(pre, f.passphrase)
 		if err != nil {
 			return err
 		}
@@ -227,6 +227,13 @@ func runInit(cmd *cobra.Command, f initFlags) error {
 	//
 	// BuildPlan is pure, so running it twice is safe and deterministic.
 	if inputs.EncryptKeys {
+		if inputs.Passphrase == "" {
+			p, err := initPassphrase(f.passphrase, stdout)
+			if err != nil {
+				return err
+			}
+			inputs.Passphrase = p
+		}
 		if err := prepareEncryption(dir, layout, &inputs, stdout); err != nil {
 			return err
 		}
@@ -269,7 +276,7 @@ func dirHint(dir string) string {
 	return fmt.Sprintf(" -D %s", dir)
 }
 
-func inputsFromPrefill(pre wizard.Prefill) (generate.Inputs, error) {
+func inputsFromPrefill(pre wizard.Prefill, passphrase string) (generate.Inputs, error) {
 	in := generate.Inputs{
 		AssistantName: pre.AssistantName,
 		OwnerName:     pre.OwnerName,
@@ -279,8 +286,7 @@ func inputsFromPrefill(pre wizard.Prefill) (generate.Inputs, error) {
 		// never enters wizard.Run, and a flag that silently did nothing would leave
 		// the user with a plaintext workspace they believed was encrypted. Mirrors of
 		// the same field on two paths are exactly the drift this repo keeps hitting.
-		EncryptKeys:   pre.EncryptKeys != nil && *pre.EncryptKeys,
-		PassphraseEnv: pre.PassphraseEnv,
+		EncryptKeys: pre.EncryptKeys != nil && *pre.EncryptKeys,
 		Model: generate.ModelInput{
 			Alias:    pre.ModelAlias,
 			Provider: pre.Provider,
