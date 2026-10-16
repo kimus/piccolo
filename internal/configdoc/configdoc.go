@@ -10,6 +10,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+
+	"github.com/kimus/piccolo/internal/fileperm"
 	"strconv"
 )
 
@@ -282,12 +284,26 @@ func Obj(pairs ...any) *Doc {
 }
 
 // Write atomically writes the document, first backing up the existing file
-// (if any) to <path>.bak. Mode mirrors the original file, defaulting 0644.
+// (if any) to <path>.bak.
+//
+// The backup is written owner-only and the target is tightened to owner-only, both
+// against the "mirror the original mode" behaviour this function used to have:
+// piccolo secrets encrypt moves a plaintext API key OUT of config.json and into the
+// overlay, then leaves a copy of that same plaintext in config.json.bak — at the mode
+// of the file it came from, which was 0644. The sealing operation was itself the
+// source of the leak, and nothing reported it.
 func Write(path string, d *Doc) error {
-	mode := os.FileMode(0o644)
+	// Target mode, remembered BEFORE the replace: renaming over a file borrows the
+	// TEMP file's mode, so without this a 0444 config.json would come back 0600 and
+	// Piccolo would have granted a write bit the owner withheld. Note what that also
+	// means: a read-only config.json does NOT stop Piccolo editing it, because replace
+	// needs write permission on the DIRECTORY, not the file. The mode is preserved so
+	// the permission signal at least survives; refusing the write would be the honest
+	// reading of "read-only" and is not how this works today.
+	targetMode := fileperm.Private
 	var original []byte
 	if fi, err := os.Stat(path); err == nil {
-		mode = fi.Mode().Perm()
+		targetMode = fileperm.Tighten(fi.Mode().Perm())
 		var err error
 		original, err = os.ReadFile(path)
 		if err != nil {
@@ -296,13 +312,18 @@ func Write(path string, d *Doc) error {
 	}
 	if original != nil {
 		bak := path + ".bak"
-		if err := os.WriteFile(bak, original, mode); err != nil {
+		if err := fileperm.WritePrivate(bak, original); err != nil {
 			return fmt.Errorf("write %s: %w", filepath.Base(bak), err)
 		}
 	}
 	tmp := path + ".piccolo-tmp"
-	if err := os.WriteFile(tmp, d.Marshal(), mode); err != nil {
+	// Private at creation: the tmp file holds the same credentials as the target, and
+	// it outlives a failed rename on a filesystem where Rename cannot be atomic.
+	if err := os.WriteFile(tmp, d.Marshal(), fileperm.Private); err != nil {
 		return err
 	}
-	return os.Rename(tmp, path)
+	if err := os.Rename(tmp, path); err != nil {
+		return err
+	}
+	return os.Chmod(path, targetMode)
 }

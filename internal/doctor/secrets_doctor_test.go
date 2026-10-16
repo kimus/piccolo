@@ -663,3 +663,110 @@ func TestDoctorReportsDeadReadableCopyOwnedByOverlay(t *testing.T) {
 		t.Errorf("overlay-only key not reported as present: %v", results)
 	}
 }
+
+// initPlaintextWorkspace is the --no-encrypt shape: the model key sits in
+// config.json as readable text, which is exactly when that file's permissions are a
+// security property rather than a formality.
+func initPlaintextWorkspace(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	plan, err := generate.BuildPlan(generate.Inputs{
+		AssistantName: "Piccolo", OwnerName: "Kimus", Purpose: "personal",
+		Model:     generate.ModelInput{Alias: "gpt-4o", Provider: "openai", Model: "gpt-4o", APIKey: "sk-real-key"},
+		WebSearch: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := plan.Write(dir, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := generate.EnsureGitignore(dir); err != nil {
+		t.Fatal(err)
+	}
+	return dir
+}
+
+func findMsg(t *testing.T, dir string, sub string) *Result {
+	t.Helper()
+	rs := Run(context.Background(), Options{Workspace: dir, Engine: fakeEngine{imageExists: true}})
+	for i := range rs {
+		if strings.Contains(rs[i].Message, sub) {
+			return &rs[i]
+		}
+	}
+	return nil
+}
+
+// The exposure the backup created: credentials moved out of config.json, a readable
+// copy of the plaintext left behind by the run that moved them.
+func TestDoctorWarnsOnReadablePlaintextConfig(t *testing.T) {
+	dir := initPlaintextWorkspace(t)
+	cfg := filepath.Join(dir, workspace.PicoclawDir, "config.json")
+	if err := os.Chmod(cfg, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	r := findMsg(t, dir, "holds a plaintext credential")
+	if r == nil {
+		t.Fatalf("readable plaintext config.json not reported")
+	}
+	if !strings.Contains(r.Message, "picoclaw/config.json") {
+		t.Errorf("warning must name the file by relative path: %s", r.Message)
+	}
+	if strings.Contains(r.Message, "sk-real-key") {
+		t.Error("warning leaked the credential value")
+	}
+	// Healing it clears the finding.
+	if err := os.Chmod(cfg, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if findMsg(t, dir, "holds a plaintext credential") != nil {
+		t.Error("finding persisted after chmod 600")
+	}
+}
+
+// An encrypted workspace's config.json holds no credentials, so a permission warning
+// there would be noise — and noise is what gets the real warnings ignored.
+func TestDoctorQuietOnReadableEncryptedConfig(t *testing.T) {
+	dir := initEncryptedWorkspace(t)
+	cfg := filepath.Join(dir, workspace.PicoclawDir, "config.json")
+	if err := os.Chmod(cfg, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if r := findMsg(t, dir, "holds a plaintext credential"); r != nil {
+		t.Errorf("warned about a file that carries no plaintext: %s", r.Message)
+	}
+}
+
+// A backup from before encryption is the case that actually bit: the live config.json
+// is clean, and the plaintext survives one filename over.
+func TestDoctorWarnsOnReadableBackupHoldingPlaintext(t *testing.T) {
+	dir := initEncryptedWorkspace(t)
+	bak := filepath.Join(dir, workspace.PicoclawDir, "config.json.bak")
+	if err := os.WriteFile(bak, []byte(`{"model_list":[{"model_name":"gpt-4o","api_keys":["sk-old-plain"]}]}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	r := findMsg(t, dir, "holds a plaintext credential")
+	if r == nil {
+		t.Fatal("readable backup holding a plaintext key not reported")
+	}
+	if !strings.Contains(r.Message, "config.json.bak") {
+		t.Errorf("warning must name the backup: %s", r.Message)
+	}
+	if strings.Contains(r.Message, "sk-old-plain") {
+		t.Error("warning leaked the credential value")
+	}
+}
+
+// An untouched upstream example is not a leak, and flagging one would put a warning on
+// a workspace that has never held a secret.
+func TestDoctorDoesNotCallAPlaceholderACredential(t *testing.T) {
+	dir := initEncryptedWorkspace(t)
+	bak := filepath.Join(dir, workspace.PicoclawDir, "config.json.bak")
+	if err := os.WriteFile(bak, []byte(`{"channel_list":{"discord":{"enabled":true,"settings":{"token":"YOUR_DISCORD_BOT_TOKEN"}}}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if r := findMsg(t, dir, "holds a plaintext credential"); r != nil {
+		t.Errorf("placeholder reported as a credential: %s", r.Message)
+	}
+}

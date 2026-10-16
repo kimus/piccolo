@@ -274,3 +274,26 @@ Because `piccolo.yaml` carries the enc:// passphrase, Piccolo SHALL create it wi
 #### Scenario: No passphrase, no claim to enforce
 - **WHEN** piccolo.yaml holds no passphrase
 - **THEN** its permissions are not reported as an exposure
+
+### Requirement: credential-bearing files SHALL NOT be readable beyond their owner
+Piccolo SHALL create `piccolo.yaml`, `picoclaw/config.json`, its `.bak` backup, and `picoclaw/.security.yml` with owner-only permissions, SHALL tighten a wider existing mode on write, and SHALL report any of them that remains group- or world-readable while holding a passphrase or a usable plaintext credential. The permission rule SHALL exist in one package read by every writer.
+
+#### Scenario: A backup of a plaintext credential is private
+- **WHEN** sealing writes a `config.json.bak` that still holds a pre-encryption plaintext key
+- **THEN** the backup is created owner-only whatever mode `config.json` had
+
+#### Scenario: A rewritten file is tightened, not merely requested
+- **WHEN** Piccolo rewrites an existing `0644` credential-bearing file
+- **THEN** its mode ends owner-only, because the write's mode argument would otherwise apply only to files created here
+
+#### Scenario: A read-only file is not made writable
+- **WHEN** a credential-bearing file the owner made read-only is rewritten or tightened
+- **THEN** group and other bits are removed and no write bit the owner withheld is granted
+
+#### Scenario: An encrypted config.json is not reported
+- **WHEN** `picoclaw/config.json` is group-readable but holds no usable plaintext credential
+- **THEN** no permission warning is raised for it
+
+#### Scenario: An unfilled example is not a credential
+- **WHEN** a readable file holds only an upstream placeholder value
+- **THEN** it is not reported as leaking a credential

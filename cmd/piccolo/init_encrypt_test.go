@@ -314,3 +314,25 @@ func TestDoctorQuietOnReadableManifestWithoutPassphrase(t *testing.T) {
 		t.Error("a workspace with no passphrase was warned about file permissions")
 	}
 }
+
+// A --no-encrypt workspace keeps its API key as readable text in config.json, so
+// that file's mode is a security property. It is private unconditionally rather than
+// only when encryption is on: a mode that depends on which flags were passed is one
+// no user can predict, and the plaintext case is exactly the one that needs it.
+func TestInitWritesConfigJSONPrivate(t *testing.T) {
+	for _, args := range [][]string{{"--passphrase", "pw"}, {"--no-encrypt"}} {
+		dir := t.TempDir()
+		cmd := append([]string{"--yes", "--name", "P", "--owner", "K", "--purpose", "personal",
+			"--provider", "openai", "--model", "gpt-4o", "--api-key", "sk-x"}, args...)
+		if _, err := execInit(t, dir, cmd...); err != nil {
+			t.Fatalf("%v: %v", args, err)
+		}
+		fi, err := os.Stat(filepath.Join(dir, "picoclaw", "config.json"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if perm := fi.Mode().Perm(); perm&0o077 != 0 {
+			t.Errorf("%v: config.json is %o", args, perm)
+		}
+	}
+}

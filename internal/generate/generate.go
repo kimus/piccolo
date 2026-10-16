@@ -14,6 +14,7 @@ import (
 
 	"gopkg.in/yaml.v3"
 
+	"github.com/kimus/piccolo/internal/fileperm"
 	"github.com/kimus/piccolo/internal/manifest"
 	"github.com/kimus/piccolo/internal/picoclaw"
 	"github.com/kimus/piccolo/internal/runtimeimage"
@@ -288,7 +289,10 @@ func BuildPlan(in Inputs) (*Plan, error) {
 	if err != nil {
 		return nil, fmt.Errorf("render config.json: %w", err)
 	}
-	p.add(filepath.Join("picoclaw", "config.json"), append(jsonBytes, '\n'))
+	// Credential-bearing: under --no-encrypt the model API key and channel tokens sit
+	// in this file as readable text, so it gets the same private mode as piccolo.yaml
+	// rather than a mode that depends on which flags the user happened to pass.
+	p.addPrivate(filepath.Join("picoclaw", "config.json"), append(jsonBytes, '\n'))
 	p.addSourced(filepath.Join("picoclaw", "skills", FileHandlingSkillName, "SKILL.md"), SourceFileHandlingSkill, []byte(FileHandlingSkillMD()))
 	agents := append([]string{"main"}, sortedSpecialists(in.Specialists)...)
 	for _, id := range agents {
@@ -333,7 +337,7 @@ func (p *Plan) add(rel string, content []byte) {
 // addPrivate records a file that must not be group- or world-readable, used for
 // piccolo.yaml because it carries the enc:// passphrase.
 func (p *Plan) addPrivate(rel string, content []byte) {
-	p.Files = append(p.Files, File{Rel: rel, Content: content, Mode: manifest.PrivatePerm})
+	p.Files = append(p.Files, File{Rel: rel, Content: content, Mode: fileperm.Private})
 }
 
 func (p *Plan) addSourced(rel, source string, content []byte) {

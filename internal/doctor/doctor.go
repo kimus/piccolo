@@ -1261,6 +1261,83 @@ func checkRunningImage(ctx context.Context, engine Engine, m *manifest.Manifest)
 // variable is exported by whoever runs serve, not stored by Piccolo), and making it
 // a FAIL would turn every daemon-free `doctor` run in a fresh shell into a red
 // board. `serve` is where it becomes fatal, and that guard already exists.
+// readableBeyondOwner reports the permission bits a file grants past its owner.
+func readableBeyondOwner(path string) (os.FileMode, bool) {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return 0, false
+	}
+	perm := fi.Mode().Perm()
+	return perm, perm&0o077 != 0
+}
+
+// relPath keeps a warning readable: an absolute /Users/name/... path in a status line
+// says nothing a relative path does not.
+func relPath(workspaceDir, path string) string {
+	if r, err := filepath.Rel(workspaceDir, path); err == nil {
+		return r
+	}
+	return path
+}
+
+// jsonHoldsPlaintextCredential reports whether a config.json-shaped file still carries
+// a real credential as readable text.
+//
+// Field NAMES decide, not value shape: walking every string would flag assistant names
+// and model ids. The names come from picoclaw.SecretFieldName, verified against the
+// pinned release to appear only on SecureString fields, and picoclaw.HasUsableKey then
+// filters out empty and upstream-placeholder values, so an untouched example is not a
+// leak. enc:// is skipped by construction — it is the state we are asking to reach.
+func jsonHoldsPlaintextCredential(path string) bool {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return false
+	}
+	var root any
+	if err := json.Unmarshal(data, &root); err != nil {
+		return false
+	}
+	var found bool
+	var walk func(any)
+	walk = func(v any) {
+		if found {
+			return
+		}
+		switch t := v.(type) {
+		case map[string]any:
+			for key, child := range t {
+				if picoclaw.IsSecretFieldName(key) && plaintextCredential(child) {
+					found = true
+					return
+				}
+				walk(child)
+			}
+		case []any:
+			for _, child := range t {
+				walk(child)
+			}
+		}
+	}
+	walk(root)
+	return found
+}
+
+// plaintextCredential is true for a non-empty value that is neither ciphertext nor an
+// unfilled example.
+func plaintextCredential(v any) bool {
+	switch t := v.(type) {
+	case string:
+		return !credential.IsEncrypted(t) && picoclaw.HasUsableKey(t)
+	case []any:
+		for _, child := range t {
+			if c, ok := child.(string); ok && !credential.IsEncrypted(c) && picoclaw.HasUsableKey(c) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // configPath2 is the workspace's piccolo.yaml; named to keep the local variable
 // configPath (config.json) unambiguous.
 func configPath2(workspaceDir string) string {
@@ -1283,6 +1360,19 @@ func checkCredentialEncryption(workspaceDir, configPath string, configData []byt
 	plaintext := secrets.PlaintextSecureValues()
 	keyPath := filepath.Join(workspaceDir, workspace.PicoclawDir, workspace.KeysDirName, workspace.KeyFileName)
 	_, keyErr := os.Stat(keyPath)
+
+	// config.json holds credentials as readable text whenever the workspace is not
+	// encrypted, and config.json.bak holds whatever the version before it held. Both
+	// are reported only when they CONTAIN a usable plaintext credential: an encrypted
+	// workspace's config.json has nothing left to hide, and a permission warning there
+	// would be noise — noise is what gets the real warnings ignored.
+	for _, f := range []string{configPath, configPath + ".bak"} {
+		if perm, ok := readableBeyondOwner(f); ok && jsonHoldsPlaintextCredential(f) {
+			rel := relPath(workspaceDir, f)
+			add(WARN, "%s is readable by group/others (%o) and holds a plaintext credential — chmod 600 %s, or delete it and run 'piccolo secrets encrypt'",
+				rel, perm, rel)
+		}
+	}
 
 	// The passphrase lives in piccolo.yaml, so that file's permissions are part of
 	// the security story. Reported rather than silently fixed: tightening a file the
