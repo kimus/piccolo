@@ -104,3 +104,30 @@ Losing the passphrase makes the credentials unrecoverable, and the pre-encryptio
 #### Scenario: Nothing is encrypted without a request
 - **WHEN** no encryption command or flag is used
 - **THEN** Piccolo does not encrypt anything, does not generate a key, and does not change `piccolo.yaml`
+
+### Requirement: Serve delivers both credential inputs and refuses without them
+PicoClaw needs the passphrase AND the exact key file whose bytes feed its derivation, and aborts the config load without either. Piccolo serve SHALL inject both for an encrypted workspace, and SHALL refuse in preflight — before any container is created or any running gateway is parked — when either is missing.
+
+#### Scenario: Both variables reach the container
+- **WHEN** `piccolo serve` starts an encrypted workspace
+- **THEN** the container environment includes `PICOCLAW_KEY_PASSPHRASE` with the resolved host value
+- **AND** `PICOCLAW_SSH_KEY_PATH` naming the key's path inside the mounted PicoClaw home
+
+#### Scenario: A host-set value is not overwritten
+- **WHEN** `piccolo.yaml` already sets either variable in `container.env`
+- **THEN** Piccolo leaves that entry alone
+
+#### Scenario: Preflight refuses an undeliverable credential
+- **WHEN** `config.json` holds an `enc://` value and the named host variable is unset, empty, or the key file is unreadable
+- **THEN** serve exits non-zero before creating a container
+- **AND** the error names the missing variable or file rather than reporting `config.json` as malformed
+- **AND** a running gateway keeps running and nothing is parked
+
+#### Scenario: A rejected promotion restores service
+- **WHEN** an encrypted workspace is promoted to a different image and the candidate cannot decrypt its config
+- **THEN** the health gate fails, the candidate is removed, and the previous gateway is restarted
+- **AND** serve exits non-zero
+
+#### Scenario: The key is not left to PicoClaw's search
+- **WHEN** credential environment is composed
+- **THEN** the key path is given explicitly, because PicoClaw's default location is `~/.ssh`, which inside the container is image content that does not survive a recreate

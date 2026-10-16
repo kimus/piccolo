@@ -35,10 +35,10 @@
 
 ## 5. Delivery at serve time
 
-- [ ] 5.1 In `preflight`, when `config.json` contains `enc://`, require that `secrets.passphrase_env` resolves and the key file exists, before any container is created
-- [ ] 5.2 Compose `PICOCLAW_SSH_KEY_PATH` and `PICOCLAW_KEY_PASSPHRASE` into the container spec for encrypted workspaces, through the same path that already injects `PICOCLAW_GATEWAY_HOST`
-- [ ] 5.3 Confirm the promotion gate treats an exit-1 "cannot decrypt" candidate as a gate failure and reverts, so a bad passphrase restores service rather than leaving the canonical name on a dead container
-- [ ] 5.4 Test that a missing host variable fails preflight naming the variable and leaves a running gateway untouched — not a container that dies after the old one was parked
+- [x] 5.1 In `preflight`, when `config.json` contains `enc://`, require that `secrets.passphrase_env` resolves and the key file exists, before any container is created
+- [x] 5.2 Compose `PICOCLAW_SSH_KEY_PATH` and `PICOCLAW_KEY_PASSPHRASE` into the container spec for encrypted workspaces, through the same path that already injects `PICOCLAW_GATEWAY_HOST`
+- [x] 5.3 Verified live on real containers: running gateway + promotion to a different image + wrong passphrase -> candidate rejected, previous gateway restored and Up, exit 1. The same promotion with the correct passphrase exits 0 and adopts the new image. The launcher image is the interesting case because it stays up while refusing to auto-start its gateway child, so a liveness-only gate could have passed it
+- [x] 5.4 Verified live: with the running gateway up and the variable unset, serve refuses in preflight (exit 1), names the variable, leaves the running container Up, and parks nothing. Covered in tests by driving preflight directly rather than executing serve, which would create real containers
 
 ## 6. Reporting
 

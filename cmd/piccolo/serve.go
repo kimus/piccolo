@@ -15,6 +15,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/kimus/piccolo/internal/configdoc"
 	"github.com/kimus/piccolo/internal/docker"
 	"github.com/kimus/piccolo/internal/manifest"
 	"github.com/kimus/piccolo/internal/picoclaw"
@@ -110,6 +111,25 @@ func preflight(cmd *cobra.Command) (*serveContext, error) {
 		return nil, fmt.Errorf("picoclaw/%s does not parse: %w — PicoClaw will not load config.json while it cannot read that file",
 			picoclaw.SecurityFileName, sec.Err)
 	}
+	// An enc:// credential is unusable without both halves of its unlock: the
+	// passphrase and the exact key file whose bytes feed the derivation. PicoClaw
+	// aborts the config load on either, so the container exits and the health gate
+	// reports a failure naming config.json while the missing thing is a host
+	// variable or a file on the host. Checked here, before any container is created,
+	// because serve parks the running gateway later in this routine and a candidate
+	// that cannot decrypt should never have been allowed to displace it.
+	if n := countEncryptedCredentials(cfgData); n > 0 {
+		envVar := m.PassphraseVar()
+		if envVar == "" {
+			return nil, fmt.Errorf("config.json holds %d enc:// credential(s) but piccolo.yaml names no secrets.passphrase_env, so nothing can deliver the passphrase — set the field, or rewrite the credentials with 'piccolo secrets encrypt'", n)
+		}
+		if v, ok := os.LookupEnv(envVar); !ok || v == "" {
+			return nil, fmt.Errorf("config.json holds %d enc:// credential(s) and host variable %s is unset or empty — export it and retry; PicoClaw will not start the gateway without the passphrase", n, envVar)
+		}
+		if _, err := os.Stat(layout.KeyFile()); err != nil {
+			return nil, fmt.Errorf("config.json holds %d enc:// credential(s) but the key file %s is unreadable — PicoClaw derives its AES key from this file's bytes, so every credential is undecryptable without it (%v)", n, rel(dir, layout.KeyFile()), err)
+		}
+	}
 
 	env, err := m.ResolveEnv(os.LookupEnv)
 	if err != nil {
@@ -130,6 +150,15 @@ func preflight(cmd *cobra.Command) (*serveContext, error) {
 	// a no-op).
 	if m.Container.Network != "host" {
 		env = withGatewayHost(env)
+	}
+	// Credential delivery for an encrypted workspace. PicoClaw needs BOTH the
+	// passphrase and the key location: the derivation hashes the key file's bytes,
+	// so having one without the other is a gateway that exits at startup. Nothing
+	// is injected for a workspace that never opted in. The passphrase is injected
+	// here only because preflight already proved the host variable resolves; the
+	// value comes from the same lookup so there is one resolution, not two.
+	if m.PassphraseVar() != "" {
+		env = withCredentialEnv(env, m, layout, os.Getenv(m.PassphraseVar()))
 	}
 
 	volumes := []string{layout.IntegrationBind()}
@@ -184,6 +213,57 @@ func composePorts(m *manifest.Manifest, gwPort int) []string {
 		ports = append(ports, fmt.Sprintf("127.0.0.1:%d:%d", gwPort, gwPort))
 	}
 	return ports
+}
+
+// credentialEnvVars are the two PicoClaw reads to unlock enc:// credentials.
+const (
+	passphraseEnvVar = "PICOCLAW_KEY_PASSPHRASE"
+	keyPathEnvVar    = "PICOCLAW_SSH_KEY_PATH"
+)
+
+// countEncryptedCredentials counts enc:// values in the raw config bytes. Done on
+// the document rather than picoclaw.Config because channel_list is user-owned and
+// absent from the typed struct, and a channel token is exactly as undecryptable as
+// a model key.
+func countEncryptedCredentials(configData []byte) int {
+	doc, err := configdoc.Parse(configData)
+	if err != nil {
+		return 0 // preflight already refused unparseable config.json
+	}
+	return encryptedCredentialCount(doc)
+}
+
+// withCredentialEnv delivers the passphrase and names the key's in-container
+// path for a workspace whose config.json holds enc:// values.
+//
+// The key path is set explicitly rather than left to PicoClaw's own search because
+// that search targets ~/.ssh, and inside this container that is image content:
+// HOME=/root, Piccolo never sets PICOCLAW_HOME, and nothing mounts /root/.ssh. A
+// key generated there would vanish with the container and every credential would
+// become undecryptable on the next restart. The keys directory lives under the
+// already-mounted picoclaw/ home and is named through PICOCLAW_SSH_KEY_PATH, the
+// one location rule PicoClaw accepts for a path outside ~/.ssh.
+//
+// Like withGatewayHost, a value the user set in piccolo.yaml wins: an explicit
+// container.env entry is respected rather than overwritten.
+func withCredentialEnv(env []string, m *manifest.Manifest, layout workspace.Layout, passphrase string) []string {
+	env = appendEnvUnlessSet(env, passphraseEnvVar, passphrase)
+	return appendEnvUnlessSet(env, keyPathEnvVar, layout.ContainerKeyFile())
+}
+
+// appendEnvUnlessSet adds KEY=value when no earlier entry already sets KEY. Order
+// matters for the container runtime, so the entries stay in the order appended.
+func appendEnvUnlessSet(env []string, key, value string) []string {
+	if value == "" {
+		return env
+	}
+	prefix := key + "="
+	for _, kv := range env {
+		if strings.HasPrefix(kv, prefix) {
+			return env
+		}
+	}
+	return append(env, prefix+value)
 }
 
 // withGatewayHost appends PICOCLAW_GATEWAY_HOST=0.0.0.0 unless the user
