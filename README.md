@@ -367,6 +367,8 @@ Be clear about what that buys, because it is less than `enc://` alone would sugg
 | keeps credentials out of a repo that accidentally commits `config.json` | hide anything from someone with host or Docker access — the passphrase is passed to the container env, visible to `docker inspect` |
 | | protect `config.json.bak`, which holds the plaintext the change replaced — it is git-ignored, but a backup you did not mean to keep is still a copy of the old secret |
 
+  `piccolo.yaml` is written `0600` because it carries the passphrase. An older workspace whose file is still group- or world-readable gets a `piccolo doctor` warning naming the mode, and the next `piccolo secrets encrypt` tightens it. Tightening only ever removes permissions: a `piccolo.yaml` you made read-only stays read-only, since that is a supported way to stop Piccolo editing it.
+
   If "safe to copy" is what you actually need, the passphrase has to live outside the workspace. Losing it is permanent either way: the credentials must be re-entered, and Piccolo keeps no recovery path. Turning encryption off later does not hand the plaintext back — existing `enc://` values stay encrypted and keep working.
 
 - **`.security.yml` is not exempt.** PicoClaw's overlay overrides `config.json` field by field, so an encrypted `config.json` next to a plaintext `.security.yml` is a workspace that only looks encrypted — the gateway loads the plaintext. `piccolo secrets encrypt` seals the overlay's credential values too, in place, leaving every other node and comment intact. It never creates the file: a workspace without one is already in the good state, and it appears only when PicoClaw itself saves.

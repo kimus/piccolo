@@ -278,7 +278,7 @@ func BuildPlan(in Inputs) (*Plan, error) {
 	if err := enc.Close(); err != nil {
 		return nil, fmt.Errorf("render piccolo.yaml: %w", err)
 	}
-	p.add("piccolo.yaml", []byte(manifestHeader+yamlOut.String()))
+	p.addPrivate("piccolo.yaml", []byte(manifestHeader+yamlOut.String()))
 
 	cfg, err := in.PicoclawConfig()
 	if err != nil {
@@ -330,6 +330,12 @@ func (p *Plan) add(rel string, content []byte) {
 
 // addSourced records which template produced the file, so the workspace keeps a
 // pointer from a generated copy back to its source.
+// addPrivate records a file that must not be group- or world-readable, used for
+// piccolo.yaml because it carries the enc:// passphrase.
+func (p *Plan) addPrivate(rel string, content []byte) {
+	p.Files = append(p.Files, File{Rel: rel, Content: content, Mode: manifest.PrivatePerm})
+}
+
 func (p *Plan) addSourced(rel, source string, content []byte) {
 	p.Files = append(p.Files, File{Rel: rel, Content: content, Mode: 0o644, Source: source})
 }
@@ -418,6 +424,12 @@ func (p *Plan) Write(dir string, overwrite map[string]bool) (written, skipped []
 			mode = 0o644
 		}
 		if err := os.WriteFile(path, f.Content, mode); err != nil {
+			return written, skipped, err
+		}
+		// WriteFile's mode only applies when the file is CREATED; an existing
+		// piccolo.yaml kept 0644 through every rewrite, so the declared mode has to
+		// be asserted after the fact to mean anything.
+		if err := os.Chmod(path, mode); err != nil {
 			return written, skipped, err
 		}
 		written = append(written, f.Rel)

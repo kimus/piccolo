@@ -255,3 +255,62 @@ func TestInitRecordsRouteOnlyWhenItCanSeal(t *testing.T) {
 		t.Error("a plaintext workspace has a key directory")
 	}
 }
+
+// init must not create the exposure in the first place, and a rewrite of an old
+// workspace's 0644 file has to tighten it.
+func TestInitWritesPiccoloYamlPrivate(t *testing.T) {
+	dir := t.TempDir()
+	if _, err := execInit(t, dir, "--yes", "--passphrase", "horse",
+		"--name", "P", "--owner", "K", "--purpose", "personal",
+		"--provider", "openai", "--model", "gpt-4o", "--api-key", "sk-x"); err != nil {
+		t.Fatal(err)
+	}
+	fi, err := os.Stat(filepath.Join(dir, "piccolo.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if perm := fi.Mode().Perm(); perm&0o077 != 0 {
+		t.Errorf("init created a group/world-readable piccolo.yaml holding a passphrase: %o", perm)
+	}
+}
+
+// doctor has to say so when a workspace predates the rule: the file is still
+// readable, the passphrase is still in it, and only a chmod closes it.
+func TestDoctorWarnsOnReadableManifestWithPassphrase(t *testing.T) {
+	dir := encryptedWorkspace(t)
+	manPath := filepath.Join(dir, "piccolo.yaml")
+	if err := os.Chmod(manPath, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	res := doctorRun(t, dir)
+	r := findRes(res, "readable by group/others")
+	if r == nil {
+		t.Fatalf("readable manifest with a passphrase not reported: %v", res)
+	}
+	if strings.Contains(r.Message, "horse") {
+		t.Error("warning leaked the passphrase")
+	}
+	if !strings.Contains(r.Message, "chmod 600") {
+		t.Errorf("warning must carry the remedy: %s", r.Message)
+	}
+
+	// Tightening it must clear the finding.
+	if err := os.Chmod(manPath, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if findRes(doctorRun(t, dir), "readable by group/others") != nil {
+		t.Error("finding persisted after chmod 600")
+	}
+}
+
+// No passphrase, no privacy claim to enforce: a plaintext workspace must not be
+// warned at, or doctor's advice becomes noise.
+func TestDoctorQuietOnReadableManifestWithoutPassphrase(t *testing.T) {
+	dir := plaintextWorkspaceForToggle(t)
+	if err := os.Chmod(filepath.Join(dir, "piccolo.yaml"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if findRes(doctorRun(t, dir), "readable by group/others") != nil {
+		t.Error("a workspace with no passphrase was warned about file permissions")
+	}
+}

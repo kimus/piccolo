@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -301,6 +302,13 @@ func confirmPassphrase(out io.Writer) (string, error) {
 // already stored under the old one, which is a rotation and belongs in its own
 // deliberate command.
 func ensurePassphrase(m *manifest.Manifest, passphrase, path string, out io.Writer) error {
+	// Tightened first, so the command closes the exposure even on the paths where
+	// there is nothing new to record.
+	if changed, err := manifest.EnsurePrivate(path); err != nil {
+		return fmt.Errorf("tighten %s: %w", filepath.Base(path), err)
+	} else if changed {
+		fmt.Fprintf(out, "tightened permissions: %s is now 600 (it holds the passphrase)\n", filepath.Base(path))
+	}
 	if passphrase == "" {
 		return nil
 	}

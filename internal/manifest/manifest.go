@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"gopkg.in/yaml.v3"
@@ -190,7 +191,20 @@ func Parse(r io.Reader) (*Manifest, error) {
 	return &m, nil
 }
 
-// Write renders m to path with deterministic 2-space YAML.
+// PrivatePerm is the mode piccolo.yaml is written with.
+//
+// The file holds the enc:// passphrase, so group- or world-readable is a secret
+// readable by any local account. It is deliberately not conditional on whether a
+// passphrase happens to be set: a mode that flips depending on content is one no
+// user can reason about, and the next opt-in would silently widen exposure again.
+const PrivatePerm os.FileMode = 0o600
+
+// Write renders m to path with deterministic 2-space YAML, at PrivatePerm.
+//
+// The explicit chmod is the load-bearing part, not the WriteFile mode: os.WriteFile
+// applies perm only when CREATING, so rewriting an existing 0644 piccolo.yaml left
+// it 0644 and the passphrase world-readable — which is how an already-created
+// workspace stayed exposed even after Piccolo "knew" better.
 func (m *Manifest) Write(path string) error {
 	var out strings.Builder
 	enc := yaml.NewEncoder(&out)
@@ -201,7 +215,46 @@ func (m *Manifest) Write(path string) error {
 	if err := enc.Close(); err != nil {
 		return err
 	}
-	return os.WriteFile(path, []byte(out.String()), 0o644)
+	data := []byte(out.String())
+	if err := os.WriteFile(path, data, PrivatePerm); err != nil {
+		return err
+	}
+	if err := os.Chmod(path, PrivatePerm); err != nil {
+		// A written-but-still-readable file is the exposure this exists to close,
+		// so it is reported rather than tolerated.
+		return fmt.Errorf("write %s: %w (and could not tighten its permissions: %v)", filepath.Base(path), err, err)
+	}
+	return nil
+}
+
+// EnsurePrivate tightens an existing file to PrivatePerm. Needed because a rewrite
+// is not always due: when the passphrase is already recorded, commands that only
+// verify state never call Write, and an old 0644 piccolo.yaml would keep holding
+// the passphrase world-readably while doctor politely told the user to chmod it.
+func EnsurePrivate(path string) (changed bool, err error) {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return false, err
+	}
+	want := privateSubset(fi.Mode().Perm())
+	if want == fi.Mode().Perm() {
+		return false, nil
+	}
+	if err := os.Chmod(path, want); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// privateSubset strips group and other bits while NEVER granting anything the
+// owner did not already have.
+//
+// The obvious implementation, chmod 0600, is wrong: on a deliberately read-only
+// 0444 piccolo.yaml — a supported way to stop Piccolo editing a file — it would add
+// owner write back and quietly undo that protection. 0444 becomes 0400, 0644
+// becomes 0600, and read-only stays read-only.
+func privateSubset(perm os.FileMode) os.FileMode {
+	return perm & 0o700
 }
 
 // Validate checks schema version and container fields.

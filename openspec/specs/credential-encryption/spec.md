@@ -253,3 +253,24 @@ Piccolo SHALL create `picoclaw/.security.yml` when a credential must move there 
 - **WHEN** a workspace records a passphrase but its key file is absent
 - **THEN** a credential write is refused with that reason rather than storing plaintext
 - **AND** doctor and `secrets check` report the same state
+
+### Requirement: piccolo.yaml SHALL NOT be readable beyond its owner
+Because `piccolo.yaml` carries the enc:// passphrase, Piccolo SHALL create it with owner-only permissions, SHALL tighten a wider existing mode, and SHALL report a passphrase-carrying file that remains group- or world-readable. Tightening SHALL only remove permission bits.
+
+#### Scenario: Created private
+- **WHEN** init writes a new piccolo.yaml
+- **THEN** its mode grants access to the owner only
+
+#### Scenario: An existing wider mode is tightened
+- **WHEN** a workspace created before the rule holds a 0644 piccolo.yaml with a passphrase
+- **THEN** doctor warns with the observed mode and the remedy
+- **AND** a subsequent `piccolo secrets encrypt` tightens it and says it did
+
+#### Scenario: Read-only stays read-only
+- **WHEN** tightening is requested for a file the owner made read-only
+- **THEN** group and other bits are removed
+- **AND** no write permission the owner had withheld is granted
+
+#### Scenario: No passphrase, no claim to enforce
+- **WHEN** piccolo.yaml holds no passphrase
+- **THEN** its permissions are not reported as an exposure

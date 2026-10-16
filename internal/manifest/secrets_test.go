@@ -127,3 +127,79 @@ func TestPassphraseSurvivesYamlRoundTrip(t *testing.T) {
 		}
 	}
 }
+
+// The mode has to be asserted, not merely requested: os.WriteFile applies its perm
+// argument only when CREATING, so a workspace created before this rule kept a
+// world-readable piccolo.yaml — holding the passphrase — through every later write.
+func TestWriteTightensAnExistingReadableFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "piccolo.yaml")
+	// Simulate a pre-existing 0644 file, as an old workspace has on disk.
+	if err := os.WriteFile(path, []byte(validYAML), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := mustPerm(t, path); got&0o077 == 0 {
+		t.Fatalf("fixture is already private (%o); the test proves nothing", got)
+	}
+
+	m, err := Parse(strings.NewReader(validYAML))
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.Secrets.Passphrase = "horse"
+	if err := m.Write(path); err != nil {
+		t.Fatal(err)
+	}
+	if got := mustPerm(t, path); got&0o077 != 0 {
+		t.Errorf("rewrite left piccolo.yaml group/world readable: %o", got)
+	}
+	if got := mustPerm(t, path); got != 0o600 {
+		t.Errorf("mode = %o, want 600", got)
+	}
+}
+
+func TestWriteCreatesPrivateFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "piccolo.yaml")
+	m, err := Parse(strings.NewReader(validYAML))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Write(path); err != nil {
+		t.Fatal(err)
+	}
+	if got := mustPerm(t, path); got != 0o600 {
+		t.Errorf("freshly written piccolo.yaml mode = %o, want 600", got)
+	}
+}
+
+func mustPerm(t *testing.T, path string) os.FileMode {
+	t.Helper()
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return fi.Mode().Perm()
+}
+
+// Tightening must never hand back access the owner removed: a read-only
+// piccolo.yaml is a supported way to stop Piccolo editing it, and "make it
+// private" that also adds owner-write would quietly undo that.
+func TestEnsurePrivateNeverGrantsAccess(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "piccolo.yaml")
+	if err := os.WriteFile(path, []byte(validYAML), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(path, 0o444); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := EnsurePrivate(path); err != nil {
+		t.Fatal(err)
+	}
+	got := mustPerm(t, path)
+	if got&0o077 != 0 {
+		t.Errorf("group/other bits survived: %o", got)
+	}
+	if got&0o200 != 0 {
+		t.Errorf("tightening granted owner write to a read-only file: %o", got)
+	}
+}

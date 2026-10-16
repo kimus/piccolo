@@ -2,6 +2,8 @@ package main
 
 import (
 	"bytes"
+	"context"
+	"github.com/kimus/piccolo/internal/doctor"
 	"os"
 	"path/filepath"
 	"strings"
@@ -486,4 +488,20 @@ func TestFinishAdviceAfterTurningOnEncryption(t *testing.T) {
 	if !strings.Contains(normal.String(), "piccolo reload") || strings.Contains(normal.String(), "REQUIRED") {
 		t.Errorf("non-encryption change got the wrong advice: %q", normal.String())
 	}
+}
+
+// doctorRun is the shared entry these permission tests need; kept next to the
+// state fixtures so they do not each rebuild a workspace.
+func doctorRun(t *testing.T, dir string) []doctor.Result {
+	t.Helper()
+	return doctor.Run(context.Background(), doctor.Options{Workspace: dir})
+}
+
+func findRes(rs []doctor.Result, sub string) *doctor.Result {
+	for i := range rs {
+		if strings.Contains(rs[i].Message, sub) {
+			return &rs[i]
+		}
+	}
+	return nil
 }

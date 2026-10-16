@@ -1261,6 +1261,12 @@ func checkRunningImage(ctx context.Context, engine Engine, m *manifest.Manifest)
 // variable is exported by whoever runs serve, not stored by Piccolo), and making it
 // a FAIL would turn every daemon-free `doctor` run in a fresh shell into a red
 // board. `serve` is where it becomes fatal, and that guard already exists.
+// configPath2 is the workspace's piccolo.yaml; named to keep the local variable
+// configPath (config.json) unambiguous.
+func configPath2(workspaceDir string) string {
+	return filepath.Join(workspaceDir, workspace.ManifestName)
+}
+
 func checkCredentialEncryption(workspaceDir, configPath string, configData []byte, m *manifest.Manifest, secrets picoclaw.Secrets) []Result {
 	var results []Result
 	add := func(s Status, format string, args ...any) {
@@ -1277,6 +1283,17 @@ func checkCredentialEncryption(workspaceDir, configPath string, configData []byt
 	plaintext := secrets.PlaintextSecureValues()
 	keyPath := filepath.Join(workspaceDir, workspace.PicoclawDir, workspace.KeysDirName, workspace.KeyFileName)
 	_, keyErr := os.Stat(keyPath)
+
+	// The passphrase lives in piccolo.yaml, so that file's permissions are part of
+	// the security story. Reported rather than silently fixed: tightening a file the
+	// user owns, on a read-only command like doctor, is a side effect nobody asked
+	// for — but leaving it invisible is a claim of protection that is not true.
+	if m.Passphrase() != "" {
+		if fi, err := os.Stat(configPath2(workspaceDir)); err == nil && fi.Mode().Perm()&0o077 != 0 {
+			add(WARN, "piccolo.yaml is readable by group/others (%o) and holds the enc:// passphrase — chmod 600 %s",
+				fi.Mode().Perm(), workspace.ManifestName)
+		}
+	}
 
 	if n == 0 && m.Passphrase() == "" && len(plaintext) == 0 {
 		// Silent by design for a workspace that never opted in. It was NOT silent
