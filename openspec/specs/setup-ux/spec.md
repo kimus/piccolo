@@ -318,3 +318,41 @@ PicoClaw merges `picoclaw/.security.yml` over `config.json` on load, and its own
 #### Scenario: No sidecar at all
 - **WHEN** `picoclaw/.security.yml` does not exist
 - **THEN** doctor judges every credential from `config.json` alone and reports no sidecar finding
+
+### Requirement: Setup refuses to store a credential the gateway cannot read
+When `picoclaw/.security.yml` governs a model's `api_keys` or a channel's token field, writing that credential into `config.json` cannot take effect. Setup SHALL decline the credential, SHALL name the sidecar key that decides instead, and SHALL NOT report a successful write. Non-secret fields on the same entry SHALL still be applied.
+
+#### Scenario: Model key declined with a remedy
+- **WHEN** the user enters an API key for a model whose `api_keys` the sidecar overrides
+- **THEN** setup does not write the key
+- **AND** names the sidecar key to edit
+- **AND** still applies provider, model id and base URL for that entry
+
+#### Scenario: The refusal is visible before the input
+- **WHEN** setup shows the API key or channel token field for an overridden entry
+- **THEN** the field's own description says a write there is inert and names the file that decides
+- **AND** the field still renders and remains reviewable
+
+#### Scenario: A credential about to be refused is not validated
+- **WHEN** setup would refuse the token a user entered for an overridden channel
+- **THEN** setup skips the live provider check rather than reporting success for a credential it will not store
+
+#### Scenario: A rename strands the old sidecar key
+- **WHEN** a model whose key lives in the sidecar is renamed
+- **THEN** setup reports that the old sidecar key now guards nothing and names the key the renamed model needs
+
+#### Scenario: A delete leaves the key behind
+- **WHEN** a model covered by a sidecar key is deleted
+- **THEN** setup reports the orphaned key and the consequence for a model re-added under that name
+
+#### Scenario: Piccolo never writes the sidecar
+- **WHEN** any setup or init flow touches credentials
+- **THEN** Piccolo does not create, edit, or delete `picoclaw/.security.yml`
+
+### Requirement: Serve refuses to start over an unreadable sidecar
+Piccolo serve SHALL fail before starting a container when `picoclaw/.security.yml` exists and cannot be parsed, because PicoClaw aborts its whole config load on that error and the health gate would otherwise report a failure naming the wrong file.
+
+#### Scenario: Malformed sidecar blocks startup
+- **WHEN** `picoclaw/.security.yml` does not parse
+- **THEN** serve exits non-zero without starting a container
+- **AND** names the sidecar file and the parse error

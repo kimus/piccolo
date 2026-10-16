@@ -102,6 +102,14 @@ func preflight(cmd *cobra.Command) (*serveContext, error) {
 	if cfg.Version != picoclaw.SchemaVersion {
 		return nil, fmt.Errorf("config.json schema version %d (want %d)", cfg.Version, picoclaw.SchemaVersion)
 	}
+	// PicoClaw merges picoclaw/.security.yml over config.json during the same load,
+	// and a sidecar it cannot parse fails that load outright — the gateway would
+	// start, answer /health at worst, and never serve a turn. Catch it here rather
+	// than letting the health gate time out on a mistake in a file serve never read.
+	if sec := picoclaw.LoadSecrets(layout.Config()); sec.Err != nil {
+		return nil, fmt.Errorf("picoclaw/%s does not parse: %w — PicoClaw will not load config.json while it cannot read that file",
+			picoclaw.SecurityFileName, sec.Err)
+	}
 
 	env, err := m.ResolveEnv(os.LookupEnv)
 	if err != nil {

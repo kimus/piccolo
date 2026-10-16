@@ -24,6 +24,7 @@ import (
 	"github.com/kimus/piccolo/internal/docker"
 	"github.com/kimus/piccolo/internal/generate"
 	"github.com/kimus/piccolo/internal/manifest"
+	"github.com/kimus/piccolo/internal/picoclaw"
 	"github.com/kimus/piccolo/internal/runtimeimage"
 	"github.com/kimus/piccolo/internal/setup"
 	"github.com/kimus/piccolo/internal/wizard"
@@ -71,6 +72,12 @@ type setupState struct {
 	manifestPath string
 	manifest     *manifest.Manifest
 
+	// secrets is the workspace's picoclaw/.security.yml. PicoClaw merges that file
+	// over config.json on load and it WINS for the fields it carries, so it decides
+	// whether a key Piccolo is about to write will be read at all. Read once at
+	// startup: Piccolo never writes the sidecar, so nothing here changes it.
+	secrets picoclaw.Secrets
+
 	// notice carries a message into the next screen's help line. Printing while a
 	// form is on screen is invisible: huh runs in the alt screen, so text written
 	// between two screens is covered by the next frame before it can be read —
@@ -101,7 +108,7 @@ func runSetup(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("piccolo.yaml does not parse (fix it manually first): %w", err)
 	}
 	orig, _ := os.ReadFile(path)
-	st := &setupState{cmd: cmd, out: os.Stdout, dir: dir, path: path, doc: doc, orig: orig, manifestPath: manifestPath, manifest: mf}
+	st := &setupState{cmd: cmd, out: os.Stdout, dir: dir, path: path, doc: doc, orig: orig, manifestPath: manifestPath, manifest: mf, secrets: picoclaw.LoadSecrets(path)}
 
 	// Deep links.
 	if len(args) >= 1 {
@@ -206,7 +213,7 @@ func (st *setupState) homeMenu() (string, error) {
 	} else if n > 1 {
 		chansSummary = fmt.Sprintf("%d channels", n)
 	}
-	models := setup.Models(st.doc)
+	models := setup.Models(st.doc, st.secrets)
 	modelSummary := "NONE — doctor will fail"
 	if n := len(models); n == 1 {
 		modelSummary = "1 model: " + models[0].Alias
@@ -595,6 +602,12 @@ func (st *setupState) channelForm(t setup.ChannelType, name string, prefill *set
 		case setup.Secret:
 			// Never re-show a stored secret; empty input keeps it (handled after Run).
 			desc := orDefault(f.Help, "stored plaintext in config.json (git-ignored)")
+			if sc := st.secrets.ChannelSecret(name, f.Key); sc.Matched {
+				// A sidecar value for this field replaces config.json's on load, so a
+				// write here is inert — and unlike the empty-list model case, the value
+				// may be perfectly good, which is why the field still renders.
+				desc = fmt.Sprintf("INERT for this channel: picoclaw/.security.yml already sets %q for %s — edit it there instead", f.Key, name)
+			}
 			if prefill != nil {
 				desc += "; leave empty to keep the current value"
 			}
@@ -616,7 +629,13 @@ func (st *setupState) channelForm(t setup.ChannelType, name string, prefill *set
 		st.pendingDiscordApplicationID = discordApplicationID
 		st.pendingDiscordMentionOnly = mentionOnly
 		if token := strings.TrimSpace(valueOf(inputs["token"])); token != "" {
-			st.checkDiscordToken(token)
+			if sc := st.secrets.ChannelSecret("discord", "token"); sc.Matched {
+				// Probing a token that is about to be refused would report success for a
+				// credential Piccolo is not storing, and the gateway would never use it.
+				fmt.Fprintln(st.out, "skipping the Discord token check: config.json cannot deliver a token while picoclaw/.security.yml sets that field")
+			} else {
+				st.checkDiscordToken(token)
+			}
 		}
 	}
 
@@ -640,6 +659,15 @@ func (st *setupState) channelForm(t setup.ChannelType, name string, prefill *set
 			// Empty secret input leaves the stored value untouched
 			// (field omitted from the patch).
 			if *p != "" {
+				if sc := st.secrets.ChannelSecret(name, f.Key); sc.Matched {
+					// Same refusal as the model form: a secret written into a field the
+					// gateway will not read is a credential in the wrong file and a
+					// change that never happens.
+					st.setNotice("%s for %q NOT written: picoclaw/.security.yml already sets that field for %s — change the token there",
+						f.Key, name, name)
+					fmt.Fprintf(st.out, "refusing to write %q to config.json: picoclaw/.security.yml overrides that field for %s\n", f.Key, name)
+					continue
+				}
 				v.Fields[f.Key] = *p
 			}
 			continue
@@ -795,7 +823,7 @@ func modelRef(m setup.ModelInfo) string {
 
 func (st *setupState) modelsScreen() error {
 	for {
-		models := setup.Models(st.doc)
+		models := setup.Models(st.doc, st.secrets)
 		defaultModel := strings.TrimSpace(setup.DefaultModel(st.doc))
 		imageModel := strings.TrimSpace(setup.DefaultImageModel(st.doc))
 		opts := []huh.Option[string]{huh.NewOption("+ Add a model…", "__add__")}
@@ -875,7 +903,15 @@ func (st *setupState) modelsScreen() error {
 // before the user commits to it.
 func modelListLabel(m setup.ModelInfo, defaultModel, imageModel string) string {
 	state := "no key!"
-	if m.KeySet {
+	switch {
+	case m.Shield.Matched && m.Shield.HasKeys:
+		// config.json shows nothing for this entry and the gateway still has a key.
+		state = "key in .security.yml"
+	case m.Shield.Matched && !m.Shield.HasKeys:
+		// The sidecar has a key for this model and it is empty, so config.json's own
+		// api_keys — if any — is discarded. This reads as configured and is not.
+		state = "no key (.security.yml clears it)"
+	case m.EffectiveKeySet():
 		state = "key set"
 	}
 	roles := ""
@@ -905,7 +941,16 @@ func (st *setupState) modelForm(alias string) error {
 		provider, model, key, base, _ = setup.ReadModel(st.doc, alias)
 		// `key` keeps the stored value; a non-empty API key input overrides it.
 	}
+	shield := setup.ModelShield(st.doc, st.secrets, lookup)
 	var newKey string
+	keyDesc := "stored plaintext in config.json (git-ignored)"
+	if shield.Matched {
+		// The one case where typing a key here cannot work: PicoClaw replaces
+		// config.json's api_keys with the sidecar's whenever that model has a key
+		// there, so a config.json edit is inert. Say it BEFORE the input, because a
+		// warning after the fact is how the user finds out on their next failed turn.
+		keyDesc = fmt.Sprintf("INERT for this model: picoclaw/.security.yml %s overrides config.json's api_keys — edit that key to change this model's credential", shield.Key)
+	}
 	form := setupForm(
 		huh.NewGroup(
 			huh.NewInput().Title("Model alias (model_name in config.json)").
@@ -918,7 +963,7 @@ func (st *setupState) modelForm(alias string) error {
 				Description("the provider-side model id, without the provider prefix").
 				Placeholder("gpt-5.4").Value(&model),
 			huh.NewInput().Title("API key").
-				Description("stored plaintext in config.json (git-ignored)").
+				Description(keyDesc).
 				EchoMode(huh.EchoModePassword).Value(&newKey),
 			huh.NewInput().Title("API base URL (optional)").
 				Placeholder("empty = provider default").Value(&base),
@@ -932,7 +977,24 @@ func (st *setupState) modelForm(alias string) error {
 		return fmt.Errorf("model alias is required")
 	}
 	if newKey != "" {
-		key = newKey
+		// Resolve against the document as it now stands: the entry this key belongs
+		// to is the one about to be written, which after a rename carries a name the
+		// pre-form check never saw.
+		final := setup.ShieldAfterWrite(st.doc, st.secrets, lookup, alias)
+		if final.Matched {
+			// Do not write a secret into a field the gateway will not read: that is the
+			// inert-write bug with a fresh credential in it. `key` keeps the value read
+			// from config.json, so the other fields still move and nothing new is stored
+			// somewhere it cannot take effect.
+			st.setNotice("API key for %q NOT written: picoclaw/.security.yml %s overrides config.json for this model — change the key there",
+				alias, final.Key)
+			fmt.Fprintf(st.out, "refusing to write an API key config.json cannot deliver: model %q is overridden by picoclaw/.security.yml key %s\n", alias, final.Key)
+			if lookup != "" {
+				fmt.Fprintf(st.out, "  provider, model and base URL were still updated; the key stays wherever it is today\n")
+			}
+		} else {
+			key = newKey
+		}
 	}
 	if err := setup.PatchModel(st.doc, lookup, alias, strings.TrimSpace(provider), strings.TrimSpace(model), key, strings.TrimSpace(base)); err != nil {
 		return err
@@ -947,11 +1009,33 @@ func (st *setupState) modelForm(alias string) error {
 			what += "; nothing referenced it"
 		}
 		what += ")"
+		// Both findings belong on the next screen, so they are collected rather than
+		// each overwriting the last: setNotice carries one message, and a rename that
+		// trips both must not lose either.
+		var notes []string
 		// An AGENT.md `model:` pin outranks config.json for that agent, and
 		// renaming through it would rewrite a file the user owns.
 		if pins := st.agentFilesPinningModel(lookup); len(pins) > 0 {
-			st.setNotice("%s pin model %q in their own frontmatter — those files are yours to edit",
-				strings.Join(pins, ", "), lookup)
+			notes = append(notes, fmt.Sprintf("%s pin model %q in their own frontmatter — those files are yours to edit",
+				strings.Join(pins, ", "), lookup))
+		}
+		// A rename moves the model out from under its own sidecar key, which is named
+		// after the OLD alias: the key keeps guarding a model that is no in
+		// model_list, and the renamed entry loses the credential that used to cover
+		// it. Nothing in config.json shows this, and every reference still resolves,
+		// so the only symptom is an authentication failure on the next turn.
+		//
+		// A rename onto a name model_list already carries is refused by PatchModel, so
+		// the destination alias is always new and its first occurrence key is
+		// "<alias>:0" — the one bare `<alias>` also covers, since PicoClaw falls back
+		// to it only when the indexed key is absent.
+		if shield.Matched {
+			notes = append(notes, fmt.Sprintf("renaming %s left its picoclaw/.security.yml key behind: %s guards a model that is no longer in model_list, and %q now has no key there — move that key to %q (or bare %q) to keep the credential",
+				lookup, shield.Key, alias, alias+":0", alias))
+			fmt.Fprintf(st.out, "NOTE: picoclaw/.security.yml key %s still guards the OLD alias — %q will run with no API key until you move it\n", shield.Key, alias)
+		}
+		if len(notes) > 0 {
+			st.setNotice("%s", strings.Join(notes, " ; "))
 		}
 	}
 	return st.applyAndConfirm(what)
@@ -990,7 +1074,7 @@ func (st *setupState) defaultModelForm() error {
 // current (the first entry when current is unset or points at a model that no
 // longer exists — a select whose value matches no option renders nothing).
 func (st *setupState) pickModelForm(title, description, current string) (string, error) {
-	models := setup.Models(st.doc)
+	models := setup.Models(st.doc, st.secrets)
 	if len(models) == 0 {
 		return "", fmt.Errorf("add a model first")
 	}
@@ -1031,7 +1115,7 @@ func (st *setupState) pickModelForm(title, description, current string) (string,
 // would leave config.json pointing at an alias that no longer exists, which
 // doctor can only report after the fact.
 func (st *setupState) deleteModelForm() error {
-	models := setup.Models(st.doc)
+	models := setup.Models(st.doc, st.secrets)
 	if len(models) == 0 {
 		fmt.Fprintln(st.out, "no models configured to delete.")
 		return nil
@@ -1071,8 +1155,23 @@ func (st *setupState) deleteModelForm() error {
 	if err := st.applyAndConfirm(fmt.Sprintf("delete model %s", pick)); err != nil {
 		return err
 	}
-	if before == 1 && len(setup.Models(st.doc)) == 0 {
-		st.setNotice("model_list is now empty — doctor will FAIL and no agent can answer until you add a model")
+	// The sidecar outlives the entry it was written for. Nothing removes the key
+	// with the model, and an orphan key is invisible to the user, who will later
+	// re-add the name and find config.json's own key ignored by a leftover they
+	// never saw. Doctor reports the same state.
+	var notes []string
+	for _, m := range models {
+		if m.Alias == pick && m.Shield.Matched {
+			notes = append(notes, fmt.Sprintf("picoclaw/.security.yml still carries %s for the model you deleted — remove that key too, or config.json's api_keys will be ignored the moment a model named %q exists again",
+				m.Shield.Key, pick))
+			break
+		}
+	}
+	if before == 1 && len(setup.Models(st.doc, st.secrets)) == 0 {
+		notes = append(notes, "model_list is now empty — doctor will FAIL and no agent can answer until you add a model")
+	}
+	if len(notes) > 0 {
+		st.setNotice("%s", strings.Join(notes, " ; "))
 	}
 	return nil
 }

@@ -2,6 +2,7 @@ package setup
 
 import (
 	"encoding/json"
+	"github.com/kimus/piccolo/internal/picoclaw"
 	"strings"
 	"testing"
 
@@ -175,7 +176,7 @@ func TestPatchModel(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	models := Models(d)
+	models := Models(d, picoclaw.Secrets{})
 	if len(models) != 2 {
 		t.Fatalf("models = %+v", models)
 	}
@@ -212,7 +213,7 @@ func TestPatchModelRenameEditsInPlace(t *testing.T) {
 	if err := PatchModel(d, "gpt-5.4", "gpt-5.5", "openai", "gpt-5.5", "sk-new", ""); err != nil {
 		t.Fatal(err)
 	}
-	models := Models(d)
+	models := Models(d, picoclaw.Secrets{})
 	if len(models) != 1 || models[0].Alias != "gpt-5.5" || models[0].Model != "gpt-5.5" {
 		t.Fatalf("rename did not edit in place: %+v", models)
 	}
@@ -236,10 +237,10 @@ func TestPatchModelRenameCollision(t *testing.T) {
 		t.Fatalf("want collision refusal, got %v", err)
 	}
 	// Neither entry moved.
-	if got := len(Models(d)); got != 2 {
+	if got := len(Models(d, picoclaw.Secrets{})); got != 2 {
 		t.Fatalf("models = %d, want 2", got)
 	}
-	if m := Models(d)[0]; m.Alias != "gpt-5.4" || m.Model != "openai/gpt-5.4" {
+	if m := Models(d, picoclaw.Secrets{})[0]; m.Alias != "gpt-5.4" || m.Model != "openai/gpt-5.4" {
 		t.Errorf("refused rename still edited: %+v", m)
 	}
 }
@@ -397,7 +398,7 @@ func TestRemoveModelRefusesLoadBearing(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "agents.defaults.model_name") || !strings.Contains(err.Error(), "agents.list[main].model") {
 		t.Fatalf("want refusal naming every load-bearing path, got %v", err)
 	}
-	if len(Models(d)) != 3 {
+	if len(Models(d, picoclaw.Secrets{})) != 3 {
 		t.Fatal("entry removed although the rename was refused")
 	}
 	// subagents.model is a real reference, so "other" is not deletable here.
@@ -415,8 +416,8 @@ func TestRemoveModelDropsFallbackEntries(t *testing.T) {
 	if strings.Contains(out, "other") {
 		t.Errorf("fallback entry not dropped:\n%s", out)
 	}
-	if len(Models(d)) != 2 {
-		t.Fatalf("model_list = %+v", Models(d))
+	if len(Models(d, picoclaw.Secrets{})) != 2 {
+		t.Fatalf("model_list = %+v", Models(d, picoclaw.Secrets{}))
 	}
 
 	// A fallback list emptied by the delete takes its key with it: upstream

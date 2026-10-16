@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/kimus/piccolo/internal/configdoc"
+	"github.com/kimus/piccolo/internal/picoclaw"
 )
 
 // ChannelInfo is the summarized state of one channel_list entry.
@@ -143,10 +144,27 @@ type ModelInfo struct {
 	KeySet   bool
 	APIBase  string
 	Index    int
+	// Shield is what picoclaw/.security.yml has to say about this entry. A matched
+	// shield makes KeySet a statement about a field the gateway will not read:
+	// PicoClaw replaces config.json's api_keys with the sidecar's whenever the
+	// sidecar carries a key for this model — in both directions, so an entry can
+	// look keyed and run keyless, or look empty and run fine.
+	Shield picoclaw.ModelSecret
 }
 
-// Models lists model_list entries in document order.
-func Models(doc *configdoc.Doc) []ModelInfo {
+// EffectiveKeySet reports whether the gateway will actually have a usable key for
+// this model — the only version of "key set" worth showing a user.
+func (m ModelInfo) EffectiveKeySet() bool {
+	if m.Shield.Matched {
+		return m.Shield.HasKeys
+	}
+	return m.KeySet
+}
+
+// Models lists model_list entries in document order. secrets is the workspace's
+// picoclaw/.security.yml; pass the zero value when there is nothing to consult
+// and KeySet keeps its old meaning.
+func Models(doc *configdoc.Doc, secrets picoclaw.Secrets) []ModelInfo {
 	v, ok := doc.Get("model_list")
 	if !ok {
 		return nil
@@ -168,14 +186,76 @@ func Models(doc *configdoc.Doc) []ModelInfo {
 		info.APIBase, _ = m.GetString("api_base")
 		if keys, ok := m.Get("api_keys"); ok {
 			if kl, ok := keys.([]configdoc.Value); ok && len(kl) > 0 {
-				if s, ok := kl[0].(string); ok && s != "" {
+				if s, ok := kl[0].(string); ok && picoclaw.HasUsableKey(s) {
 					info.KeySet = true
 				}
 			}
 		}
 		out = append(out, info)
 	}
+	// Resolve the sidecar over the alias list in document order, then pair it back
+	// by index: PicoClaw's key format counts duplicate aliases, so the mapping has
+	// to be positional rather than by name.
+	shields := secrets.ResolveModels(aliasesOf(out))
+	for i := range out {
+		if i < len(shields) {
+			out[i].Shield = shields[i]
+		}
+	}
 	return out
+}
+
+func aliasesOf(models []ModelInfo) []string {
+	out := make([]string, len(models))
+	for i, m := range models {
+		out[i] = m.Alias
+	}
+	return out
+}
+
+// ModelShield resolves the sidecar's say over one model_list entry by alias.
+// Duplicated aliases share a name, and the sidecar counts them, so this returns
+// the FIRST entry carrying that name — the one a menu offers to edit.
+func ModelShield(doc *configdoc.Doc, secrets picoclaw.Secrets, alias string) picoclaw.ModelSecret {
+	for _, m := range Models(doc, secrets) {
+		if m.Alias == alias {
+			return m.Shield
+		}
+	}
+	return picoclaw.ModelSecret{}
+}
+
+// ShieldAfterWrite resolves the sidecar's say over the entry a write is about to
+// produce, without touching the document. It matters for a rename: the sidecar
+// counts occurrences of the name the entry will HAVE, so asking about the old
+// alias asks the wrong question — a model renamed onto a name the sidecar already
+// covers is shadowed the moment it lands, and a pre-write check on the old name
+// would wave it through.
+//
+// lookup is the alias being edited ("" when adding). PatchModel keeps an edited
+// entry in place and appends a new one, so the occurrence index is the number of
+// entries already carrying finalAlias ahead of that position.
+func ShieldAfterWrite(doc *configdoc.Doc, secrets picoclaw.Secrets, lookup, finalAlias string) picoclaw.ModelSecret {
+	aliases := modelAliases(doc)
+	pos := len(aliases) // an added entry lands at the end
+	if lookup != "" {
+		for i, a := range aliases {
+			if a == lookup {
+				pos = i
+				break
+			}
+		}
+	}
+	occurrence := 0
+	for i, a := range aliases {
+		if i >= pos {
+			break
+		}
+		if a == finalAlias {
+			occurrence++
+		}
+	}
+	return secrets.ResolveModel(finalAlias, occurrence)
 }
 
 // PatchModel adds or updates a model_list entry.
@@ -251,12 +331,34 @@ func PatchModel(doc *configdoc.Doc, lookup, alias, provider, model, apiKey, apiB
 }
 
 func modelExists(doc *configdoc.Doc, alias string) bool {
-	for _, m := range Models(doc) {
-		if m.Alias == alias {
+	// Presence only — the sidecar has nothing to say about whether a name exists.
+	for _, a := range modelAliases(doc) {
+		if a == alias {
 			return true
 		}
 	}
 	return false
+}
+
+// modelAliases is config.json's model_name list in document order. Used where
+// only the names matter, so no caller has to invent a Secrets value.
+func modelAliases(doc *configdoc.Doc) []string {
+	v, ok := doc.Get("model_list")
+	if !ok {
+		return nil
+	}
+	arr, ok := v.([]configdoc.Value)
+	if !ok {
+		return nil
+	}
+	var out []string
+	for _, el := range arr {
+		if m, ok := el.(*configdoc.Doc); ok {
+			a, _ := m.GetString("model_name")
+			out = append(out, a)
+		}
+	}
+	return out
 }
 
 // modelRef is one place config.json names a model alias. owner/key/index locate
@@ -799,7 +901,7 @@ func ReadChannel(doc *configdoc.Doc, name string) (ChannelValues, bool) {
 
 // ReadModel extracts a model_list entry by alias for pre-fill.
 func ReadModel(doc *configdoc.Doc, alias string) (provider, model, apiKey, apiBase string, ok bool) {
-	for _, m := range Models(doc) {
+	for _, m := range Models(doc, picoclaw.Secrets{}) {
 		if m.Alias != alias {
 			continue
 		}
