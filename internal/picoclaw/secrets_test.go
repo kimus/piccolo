@@ -186,15 +186,28 @@ func TestHasUsableKey(t *testing.T) {
 			t.Errorf("%q must not count as usable", bad)
 		}
 	}
-	// KNOWN GAP, asserted rather than fixed: upstream's own example placeholders are
-	// `YOUR_DISCORD_BOT_TOKEN`-shaped (config/config.example.json), and the `your-`
-	// prefix test wants a hyphen, so an untouched example token reads as usable and
-	// doctor stays quiet on the workspace that never got a real credential. Closing
-	// it changes which workspaces warn, which is a separate decision from the
-	// shadowing this file exists for.
-	if !HasUsableKey("YOUR_DISCORD_BOT_TOKEN") {
-		t.Error("YOUR_* placeholder detection changed — update this assertion deliberately, not as a side effect")
+	// Upstream's own example shape (config/config.example.json uses
+	// YOUR_DISCORD_BOT_TOKEN) reads as an unfilled template, not a credential. This
+	// replaced a known gap where only the hyphenated `your-` prefix was caught and an
+	// untouched example token was reported as usable.
+	for _, example := range []string{"YOUR_DISCORD_BOT_TOKEN", "YOUR_BRAVE_API_KEY", "YOUR_CLIENT_SECRET", "MY_KEY_123"} {
+		if HasUsableKey(example) {
+			t.Errorf("%q is the shape of an unfilled example and must not read as usable", example)
+		}
 	}
+	// Narrowness is the point: real tokens carry a lowercase letter, a hyphen or a
+	// colon, so they must NOT be caught. A false positive here is a warning on a
+	// working credential, which is the outcome this rule has to keep avoiding.
+	for _, real := range []string{
+		"sk-proj-abc123", "sk-ant-api03-abc", "xoxb-123-456-abc", "xapp-1-abc",
+		"123456:ABC-DEF1234", "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef123",
+		"AKIAIOSFODNN7EXAMPLE", "hf_AbCdEfGhIjKlMnOpQrStUvWxYz1234", "github_pat_11ABC0xyz_abcdef",
+	} {
+		if !HasUsableKey(real) {
+			t.Errorf("%q is a real credential shape and was flagged as a template", real)
+		}
+	}
+
 	// Reference forms are values the gateway can resolve; emptiness is the only
 	// question Piccolo can answer about them without the passphrase.
 	for _, good := range []string{"sk-abcdef", "file://credentials/openai.key", "enc://AAAA", "dt-1234"} {

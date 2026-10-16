@@ -56,6 +56,24 @@ type Inputs struct {
 	Model     ModelInput
 	WebSearch bool
 	ShellExec bool
+	// EncryptKeys records the opt-in so piccolo.yaml can name the host variable
+	// the passphrase will come from. It does not itself encrypt anything: the
+	// workspace has no key until the caller generates one, which happens after the
+	// user confirms the plan. Carried on Inputs because piccolo.yaml is rendered
+	// here, and the two files must agree about whether this workspace is encrypted.
+	EncryptKeys bool
+	// PassphraseEnv is the host variable NAME recorded when EncryptKeys is set.
+	PassphraseEnv string
+	// Encrypt turns a plaintext credential into the value that gets written. nil
+	// writes plaintext, which is the default and the only behaviour before a
+	// workspace opts in.
+	//
+	// It is a callback rather than a key path plus passphrase so this package stays
+	// free of the crypto and of the filesystem: BuildPlan must be callable before
+	// the workspace directory exists, and it is called a second time after the key
+	// is generated. Whatever it returns is what lands in config.json, so plaintext
+	// never occupies a written byte.
+	Encrypt func(plaintext string) (string, error)
 }
 
 // Validate checks inputs before generation.
@@ -77,6 +95,14 @@ func (in Inputs) Validate() error {
 	}
 	if strings.TrimSpace(in.Model.Alias) == "" || strings.TrimSpace(in.Model.Model) == "" {
 		return fmt.Errorf("model alias and model id are required")
+	}
+	if in.EncryptKeys {
+		// Validated against manifest's own rule rather than a second copy, so
+		// init cannot write a piccolo.yaml that the manifest loader would then
+		// refuse to read.
+		if !manifest.IsEnvVarName(strings.TrimSpace(in.PassphraseEnv)) {
+			return fmt.Errorf("passphrase variable name %q must be uppercase letters, digits and underscores — the NAME of a host variable, not a passphrase", in.PassphraseEnv)
+		}
 	}
 	return nil
 }
@@ -103,12 +129,48 @@ func (in Inputs) Manifest() *manifest.Manifest {
 		m.Container.Ports = []string{LauncherPort}
 		m.Container.Env = map[string]string{"PICOCLAW_GATEWAY_HOST": "0.0.0.0"}
 	}
+	if in.EncryptKeys {
+		// Recorded so serve can resolve the passphrase at launch. Only the NAME of
+		// a host variable is written here; the passphrase itself is never stored by
+		// Piccolo, which is why this field cannot express a value.
+		m.Secrets.PassphraseEnv = in.PassphraseEnv
+	}
 	return m
 }
 
 // PicoclawConfig builds the config.json content (schema v3).
-func (in Inputs) PicoclawConfig() *picoclaw.Config {
+// credentialValues applies the encryption callback when the workspace asked for
+// one. An error is returned rather than falling back to plaintext: writing an
+// unprotected credential after the user asked for protection is the exact silent
+// degradation this feature exists to remove, so a plan that cannot be built is
+// strictly better than a plan that lies.
+//
+// An empty or already-indirect value passes through untouched — encrypting a
+// placeholder would seal a non-secret, and re-wrapping an enc:// value corrupts it.
+func (in Inputs) credentialValues(plaintext string) ([]string, error) {
+	if in.Encrypt == nil {
+		return []string{plaintext}, nil
+	}
+	v := strings.TrimSpace(plaintext)
+	if v == "" || strings.HasPrefix(v, "enc://") || strings.HasPrefix(v, "file://") {
+		return []string{plaintext}, nil
+	}
+	enc, err := in.Encrypt(plaintext)
+	if err != nil {
+		return nil, fmt.Errorf("encrypt generated credential: %w", err)
+	}
+	return []string{enc}, nil
+}
+
+// PicoclawConfig renders the config.json for these inputs. It returns an error
+// only when an encryption callback fails; every other field is derived without
+// I/O, so a caller can build a plan before the workspace directory exists.
+func (in Inputs) PicoclawConfig() (*picoclaw.Config, error) {
 	provider, model := normalizeModelRef(in.Model.Provider, in.Model.Model)
+	apiKeys, err := in.credentialValues(in.Model.APIKey)
+	if err != nil {
+		return nil, err
+	}
 
 	main := picoclaw.Agent{
 		ID:        "main",
@@ -152,7 +214,7 @@ func (in Inputs) PicoclawConfig() *picoclaw.Config {
 			ModelName: in.Model.Alias,
 			Provider:  provider,
 			Model:     model,
-			APIKeys:   []string{in.Model.APIKey},
+			APIKeys:   apiKeys,
 			APIBase:   in.Model.APIBase,
 		}},
 		Tools: picoclaw.Tools{
@@ -162,7 +224,7 @@ func (in Inputs) PicoclawConfig() *picoclaw.Config {
 			Subagent:  picoclaw.ToolToggle{Enabled: true},
 			LoadImage: picoclaw.ToolToggle{Enabled: true},
 		},
-	}
+	}, nil
 }
 
 // normalizeModelRef returns the explicit (provider, model) pair PicoClaw
@@ -222,7 +284,10 @@ func BuildPlan(in Inputs) (*Plan, error) {
 	}
 	p.add("piccolo.yaml", []byte(manifestHeader+yamlOut.String()))
 
-	cfg := in.PicoclawConfig()
+	cfg, err := in.PicoclawConfig()
+	if err != nil {
+		return nil, err
+	}
 	jsonBytes, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
 		return nil, fmt.Errorf("render config.json: %w", err)

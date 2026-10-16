@@ -2,6 +2,7 @@ package doctor
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -372,5 +373,96 @@ func TestDoctorDuplicateAliasesResolvePerEntry(t *testing.T) {
 	}
 	if okLines != 1 || warnLines != 1 {
 		t.Fatalf("want 1 OK + 1 warn across the two entries, got %d/%d: %v", okLines, warnLines, results)
+	}
+}
+
+// Upstream's own example placeholder shape, warned about exactly as the hyphenated
+// one always was. Before this rule an untouched config.example.json value read as a
+// usable credential and doctor stayed quiet on a workspace with no real key.
+func TestDoctorWarnsOnUntouchedExampleToken(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		patch func(map[string]any)
+		want  string
+	}{
+		{
+			"model key",
+			func(cfg map[string]any) {
+				cfg["model_list"].([]any)[0].(map[string]any)["api_keys"] = []any{"YOUR_OPENAI_KEY"}
+			},
+			"placeholder or empty API key",
+		},
+		{
+			"channel token",
+			func(cfg map[string]any) {
+				cfg["channel_list"] = map[string]any{
+					"discord": map[string]any{
+						"enabled": true, "type": "discord",
+						"allow_from": []any{"12345"},
+						"settings":   map[string]any{"token": "YOUR_DISCORD_BOT_TOKEN"},
+					},
+				}
+			},
+			`is empty or a placeholder`,
+		},
+	} {
+		dir := initWorkspace(t)
+		patchConfig(t, dir, tc.patch)
+		results := Run(context.Background(), Options{Workspace: dir, Engine: fakeEngine{imageExists: true}})
+		if Failed(results) {
+			t.Fatalf("%s: example token must warn, not fail: %v", tc.name, results)
+		}
+		if r := find(results, tc.want); r == nil || r.Status != WARN {
+			t.Errorf("%s: no %q warning in %v", tc.name, tc.want, results)
+		}
+	}
+}
+
+// The narrowness guarantee, at the level a user feels it: a real credential in a
+// normal shape must still read as configured. Without this the template rule is a
+// free way to make every workspace warn, and nobody would notice until they
+// ignored the warnings.
+func TestDoctorStillAcceptsRealCredentialShapes(t *testing.T) {
+	for _, real := range []string{"sk-proj-abc123", "xoxb-123-456-abc", "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef123", "AKIAIOSFODNN7EXAMPLE"} {
+		dir := initWorkspace(t)
+		patchConfig(t, dir, func(cfg map[string]any) {
+			cfg["model_list"].([]any)[0].(map[string]any)["api_keys"] = []any{real}
+		})
+		results := Run(context.Background(), Options{Workspace: dir, Engine: fakeEngine{imageExists: true}})
+		if r := find(results, "placeholder or empty API key"); r != nil {
+			t.Errorf("%q was flagged as a placeholder: %s", real, r.Message)
+		}
+		if find(results, "model: gpt-5.4") == nil {
+			t.Errorf("%q: model line missing entirely: %v", real, results)
+		}
+	}
+}
+
+// PicoClaw models more channel secrets than the primary bot token — line has
+// channel_secret/channel_access_token, matrix and onebot have access_token, and
+// several have webhook_url. A credential check that only looks at "token" leaves
+// those in plaintext AND stays silent about them, which is the
+// silent-under-protection shape this whole area exists to close.
+func TestDoctorChecksSecondaryChannelSecrets(t *testing.T) {
+	for _, field := range picoclaw.SecretFieldName {
+		dir := initWorkspace(t)
+		patchConfig(t, dir, func(cfg map[string]any) {
+			cfg["channel_list"] = map[string]any{
+				"line": map[string]any{
+					"enabled": true, "type": "line",
+					"allow_from": []any{"12345"},
+					"settings":   map[string]any{field: "YOUR_LINE_SECRET"},
+				},
+			}
+		})
+		results := Run(context.Background(), Options{Workspace: dir, Engine: fakeEngine{imageExists: true}})
+		r := find(results, "empty or a placeholder")
+		if r == nil || r.Status != WARN {
+			t.Errorf("field %q: no placeholder warning — the credential list does not reach it: %v", field, results)
+			continue
+		}
+		if !strings.Contains(r.Message, fmt.Sprintf("%q", field)) {
+			t.Errorf("field %q: warning does not name the field: %s", field, r.Message)
+		}
 	}
 }

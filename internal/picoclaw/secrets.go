@@ -46,9 +46,23 @@ const FileSchemePrefix = "file://"
 const notHereSentinel = "[NOT_HERE]"
 
 // SecretFieldName lists the channel settings fields PicoClaw models as
-// SecureString. Kept in one place so doctor's channel check and the sidecar
-// reader cannot drift apart on which field counts as a credential.
-var SecretFieldName = []string{"token", "bot_token", "app_token", "client_secret", "app_secret"}
+// SecureString (verified against pkg/config/config.go:594-723 of v0.3.1). Kept in
+// one place so doctor's channel check, the sidecar reader, and encryption cannot
+// drift apart on which field counts as a credential.
+//
+// The order matters, not just the membership: the channel check takes the FIRST
+// listed field present in a channel's settings as "the" credential, so the
+// primary bot token comes before a channel's secondary secrets. Dropping a field
+// here would leave a real credential unencrypted and unwarned about, which is the
+// silent-under-protection failure this list exists to avoid.
+//
+// webhook_url is included because upstream treats it as a secret: a webhook URL
+// carries its own capability, so committing one is committing a credential.
+var SecretFieldName = []string{
+	"token", "bot_token", "app_token", "client_secret", "app_secret",
+	"access_token", "channel_access_token", "channel_secret",
+	"webhook_url", "password",
+}
 
 // Secrets is the parsed sidecar. The zero value means "no file", which is the
 // state of every workspace `piccolo init` wrote and nothing has saved since,
@@ -174,19 +188,53 @@ type ChannelSecret struct {
 }
 
 // HasUsableKey reports whether a raw api_key/token string carries a real value:
-// non-empty, not a wizard placeholder, and not the sentinel PicoClaw writes
-// when the secret lives in the sidecar instead.
+// non-empty, not an unfilled template, and not the sentinel PicoClaw writes when
+// the secret lives in the sidecar instead.
 func HasUsableKey(raw string) bool {
-	k := strings.ToLower(strings.TrimSpace(raw))
+	k := strings.TrimSpace(raw)
 	switch {
 	case k == "":
 		return false
-	case k == strings.ToLower(notHereSentinel):
+	case strings.EqualFold(k, notHereSentinel):
 		return false
-	case strings.HasPrefix(k, "sk-your"), strings.HasPrefix(k, "your-"):
+	}
+	lower := strings.ToLower(k)
+	switch {
+	case strings.HasPrefix(lower, "sk-your"), strings.HasPrefix(lower, "your-"):
 		return false
-	case strings.Contains(k, "placeholder"), strings.Contains(k, "changeme"), strings.Contains(k, "xxx"):
+	case strings.Contains(lower, "placeholder"), strings.Contains(lower, "changeme"), strings.Contains(lower, "xxx"):
 		return false
+	}
+	// Upstream's own example values are ALL_CAPS_WITH_UNDERSCORES
+	// (config/config.example.json: YOUR_DISCORD_BOT_TOKEN, YOUR_BRAVE_API_KEY).
+	// The `your-` prefix rule above cannot see them, so an untouched example read
+	// as a usable credential and doctor stayed silent on a workspace that had never
+	// been given a real key — a warning the user needed, suppressed by a hyphen.
+	//
+	// The shape test stays narrow on purpose. Real tokens almost always carry a
+	// lowercase letter, a hyphen, or a colon (sk-…, xoxb-…, 123456:ABC…), so
+	// requiring an all-uppercase string that also contains an underscore leaves
+	// them alone; AKIAIOSFODNN7EXAMPLE and ghp_AbC… both pass through. A genuine
+	// credential shaped exactly like a template is possible but rare, and the cost
+	// is a warning naming a field that is in fact fine — not a silent failure.
+	if isTemplateShape(k) {
+		return false
+	}
+	return true
+}
+
+// isTemplateShape reports the unfilled-example form PicoClaw's own template uses:
+// only upper-case letters, digits and underscores, and at least one underscore.
+func isTemplateShape(s string) bool {
+	if !strings.Contains(s, "_") {
+		return false
+	}
+	for _, r := range s {
+		switch {
+		case r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '_':
+		default:
+			return false
+		}
 	}
 	return true
 }

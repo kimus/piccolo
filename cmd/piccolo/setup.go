@@ -61,8 +61,11 @@ func setupForm(groups ...*huh.Group) *huh.Form {
 }
 
 type setupState struct {
-	cmd   *cobra.Command
-	out   *os.File
+	cmd *cobra.Command
+	// out is an io.Writer rather than *os.File so the write paths (applyAndConfirm,
+	// sealBeforeWrite) are exercisable in tests. Every production call site passes
+	// os.Stdout, which satisfies this.
+	out   io.Writer
 	dir   string
 	path  string // config.json
 	doc   *configdoc.Doc
@@ -77,6 +80,12 @@ type setupState struct {
 	// whether a key Piccolo is about to write will be read at all. Read once at
 	// startup: Piccolo never writes the sidecar, so nothing here changes it.
 	secrets picoclaw.Secrets
+
+	// encrypted is the workspace's credential posture: a key file exists AND
+	// piccolo.yaml names where the passphrase comes from. Both, because either half
+	// alone describes a workspace that cannot boot, and because a field's help text
+	// must say where the value will actually go.
+	encrypted bool
 
 	// notice carries a message into the next screen's help line. Printing while a
 	// form is on screen is invisible: huh runs in the alt screen, so text written
@@ -109,6 +118,11 @@ func runSetup(cmd *cobra.Command, args []string) error {
 	}
 	orig, _ := os.ReadFile(path)
 	st := &setupState{cmd: cmd, out: os.Stdout, dir: dir, path: path, doc: doc, orig: orig, manifestPath: manifestPath, manifest: mf, secrets: picoclaw.LoadSecrets(path)}
+	// Checked once: nothing inside a setup session generates a key or changes the
+	// manifest's passphrase route.
+	if _, err := os.Stat(workspace.NewLayout(dir).KeyFile()); err == nil && mf.PassphraseVar() != "" {
+		st.encrypted = true
+	}
 
 	// Deep links.
 	if len(args) >= 1 {
@@ -601,7 +615,7 @@ func (st *setupState) channelForm(t setup.ChannelType, name string, prefill *set
 		switch f.Type {
 		case setup.Secret:
 			// Never re-show a stored secret; empty input keeps it (handled after Run).
-			desc := orDefault(f.Help, "stored plaintext in config.json (git-ignored)")
+			desc := st.credentialStorageNote(f.Help)
 			if sc := st.secrets.ChannelSecret(name, f.Key); sc.Matched {
 				// A sidecar value for this field replaces config.json's on load, so a
 				// write here is inert — and unlike the empty-list model case, the value
@@ -943,7 +957,7 @@ func (st *setupState) modelForm(alias string) error {
 	}
 	shield := setup.ModelShield(st.doc, st.secrets, lookup)
 	var newKey string
-	keyDesc := "stored plaintext in config.json (git-ignored)"
+	keyDesc := st.credentialStorageNote("")
 	if shield.Matched {
 		// The one case where typing a key here cannot work: PicoClaw replaces
 		// config.json's api_keys with the sidecar's whenever that model has a key
@@ -1971,6 +1985,54 @@ func updateAgentFrontmatterList(content string, lineRE *regexp.Regexp, key strin
 // ---------- write path ----------
 
 // setNotice stages a message for the next screen's help line.
+// credentialStorageNote says where the value being typed will land. The static
+// help string claimed plaintext unconditionally, which became false the moment a
+// workspace opted into enc:// storage — and a user who believes a field holds
+// plaintext behaves differently around it (sharing it, backing it up, pasting it
+// into an issue) than one who believes it is sealed.
+// sealBeforeWrite converts any plaintext credential the forms just stored into the
+// enc:// form, for a workspace that opted in. It is a no-op when the workspace is
+// not encrypted, and it needs the passphrase from the same host variable serve will
+// read: the credential a user typed must be readable by the gateway that starts
+// later, so there is no second passphrase to reconcile.
+func (st *setupState) sealBeforeWrite(what string) error {
+	if !st.encrypted {
+		return nil
+	}
+	envVar := st.manifest.PassphraseVar()
+	pass, ok := os.LookupEnv(envVar)
+	if !ok || pass == "" {
+		// Loud, because silently writing plaintext in an encrypted workspace is the
+		// one outcome the user cannot detect later.
+		return fmt.Errorf("this workspace stores credentials as enc:// but host variable %s is unset — "+
+			"export it and repeat the change, so the credential written here is one the gateway can decrypt", envVar)
+	}
+	key := workspace.NewLayout(st.dir).KeyFile()
+	res, err := setup.EncryptWorkspace(st.doc, st.secrets, key, pass)
+	if err != nil {
+		return fmt.Errorf("encrypt %s: %w", what, err)
+	}
+	for _, r := range res.Refused {
+		// The field was already refused by the form-level guard in most cases; this
+		// catches anything that reached the document another way.
+		fmt.Fprintf(st.out, "left unencrypted: %s — %s\n", r.Field, r.Reason)
+	}
+	if len(res.Changed) > 0 {
+		fmt.Fprintf(st.out, "encrypted %d credential(s) for this workspace\n", len(res.Changed))
+	}
+	return nil
+}
+
+func (st *setupState) credentialStorageNote(fallback string) string {
+	if st.encrypted {
+		return "encrypted as PicoClaw enc:// before it is written (git-ignored); needs the passphrase from " + st.manifest.PassphraseVar()
+	}
+	if fallback != "" {
+		return fallback
+	}
+	return "stored plaintext in config.json (git-ignored); 'piccolo secrets encrypt' switches this workspace to enc://"
+}
+
 func (st *setupState) setNotice(format string, args ...any) {
 	st.notice = fmt.Sprintf(format, args...)
 }
@@ -2009,6 +2071,15 @@ func (st *setupState) applyManifestAndConfirm(what string) error {
 // (no diff preview — the change summary is shown in the confirm title, and the
 // previous file is always kept as config.json.bak).
 func (st *setupState) applyAndConfirm(what string) error {
+	// An encrypted workspace writes ciphertext, so the value a form collected in
+	// plaintext is sealed here rather than at each call site: the model form and the
+	// channel form both arrive through this function, and encrypting in only one of
+	// them is how two paths start disagreeing about the same workspace posture.
+	// Refusing to encrypt a credential it cannot protect is worse than writing
+	// plaintext nobody asked to seal, so a failure here aborts the write.
+	if err := st.sealBeforeWrite(what); err != nil {
+		return err
+	}
 	newBytes := st.doc.Marshal()
 	configChanged := !bytes.Equal(st.orig, newBytes)
 	manifestChanged := st.pendingDiscordApplicationID != "" && st.pendingDiscordApplicationID != strings.TrimSpace(st.manifest.Setup.Channels.Discord.ApplicationID)

@@ -283,12 +283,10 @@ func TestEncryptWorkspaceNoCredentialsIsByteIdentical(t *testing.T) {
 	}
 }
 
-// Deliberate asymmetry, pinned so nobody "harmonises" it by accident: encryption
-// refuses an unfilled ALL_CAPS example value, while doctor still reports such a
-// value as usable (the KNOWN GAP in internal/picoclaw/secrets_test.go). Sealing a
-// non-secret would give a workspace the look of protected credentials and leave the
-// actual problem untouched; widening the warning rule is a separate decision with
-// its own blast radius.
+// The two rules now agree (task 4.5 widened doctor's warning), and this pins that
+// they cannot drift apart again: a value doctor calls an unfilled template is a
+// value encryption refuses to seal. Sealing one would give a workspace the look of
+// protected credentials while leaving the actual problem untouched.
 func TestPlaceholderIsRefusedEvenThoughDoctorWarnsDifferently(t *testing.T) {
 	key := encryptFixtureKey(t)
 	doc, err := configdoc.Parse([]byte(`{"version":3,"model_list":[{"model_name":"m","api_keys":["YOUR_DISCORD_BOT_TOKEN"]}]}`))
@@ -305,11 +303,71 @@ func TestPlaceholderIsRefusedEvenThoughDoctorWarnsDifferently(t *testing.T) {
 	if strings.Contains(string(doc.Marshal()), credential.Scheme) {
 		t.Error("placeholder sealed into ciphertext")
 	}
-	// The two rules disagree on this value, on purpose.
-	if !picoclaw.HasUsableKey("YOUR_DISCORD_BOT_TOKEN") {
-		t.Error("doctor's rule changed; that is task 4.5, a separate decision")
+	// Agreement, asserted on both sides of the same call.
+	if picoclaw.HasUsableKey("YOUR_DISCORD_BOT_TOKEN") {
+		t.Error("doctor's rule changed without changing encryption's")
 	}
 	if encryptable("YOUR_DISCORD_BOT_TOKEN") {
-		t.Error("encryption started treating a template value as a secret")
+		t.Error("encryption treats a template value as a secret")
+	}
+}
+
+// Encryption must touch only the fields that actually hold credentials. A
+// value-shaped-like-a-token in `proxy`, an agent `workspace`, or any user-owned
+// key must pass through byte-identical: rewriting a non-credential field would
+// corrupt settings nobody asked to protect, and PicoClaw does not model those
+// fields as secrets at all.
+func TestEncryptWorkspaceTouchesOnlyCredentialFields(t *testing.T) {
+	key := encryptFixtureKey(t)
+	doc, err := configdoc.Parse([]byte(`{"version":3,
+      "model_list":[{"model_name":"m","api_keys":["sk-real"]}],
+      "channel_list":{"discord":{"enabled":true,"type":"discord","settings":{"token":"dt-real","proxy":"MY_PROXY_VALUE"}}},
+      "agents":{"defaults":{"workspace":"MY_WORKSPACE_PATH"}},
+      "untouched":{"note":"ALL_CAPS_TOKEN","list":["sk-looking-but-not-a-credential"]}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := EncryptWorkspace(doc, picoclaw.Secrets{}, key, "pw")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Changed) != 2 {
+		t.Fatalf("changed = %v, want exactly the model key and the channel token", res.Changed)
+	}
+	out := string(doc.Marshal())
+	for _, mustSurvive := range []string{"MY_PROXY_VALUE", "MY_WORKSPACE_PATH", "ALL_CAPS_TOKEN", "sk-looking-but-not-a-credential"} {
+		if !strings.Contains(out, mustSurvive) {
+			t.Errorf("non-credential value %q was altered:\n%s", mustSurvive, out)
+		}
+	}
+}
+
+// Every field in picoclaw.SecretFieldName must be sealed by encryption. The
+// credential list is shared with doctor's channel check, so a field missing here
+// is a credential left in plaintext that nothing warns about — the
+// silent-under-protection shape, one layer down from the detection test in
+// internal/doctor. Asserted against the list itself rather than a hardcoded copy,
+// so adding a field in one place and not the other fails.
+func TestEncryptCoversEveryListedSecretField(t *testing.T) {
+	key := encryptFixtureKey(t)
+	for _, field := range picoclaw.SecretFieldName {
+		doc, err := configdoc.Parse([]byte(`{"version":3,"model_list":[{"model_name":"m","api_keys":["sk-model"]}],"channel_list":{"line":{"enabled":true,"type":"line","settings":{` +
+			`"` + field + `":"a-real-value"}}}}`))
+		if err != nil {
+			t.Fatalf("%s: %v", field, err)
+		}
+		res, err := EncryptWorkspace(doc, picoclaw.Secrets{}, key, "PASS")
+		if err != nil {
+			t.Fatalf("%s: %v", field, err)
+		}
+		// Two changes: the model key and this channel field. Anything less means
+		// the field was skipped.
+		if len(res.Changed) != 2 {
+			t.Errorf("field %q: changed = %v, want the model key and this field", field, res.Changed)
+			continue
+		}
+		if strings.Contains(string(doc.Marshal()), "a-real-value") {
+			t.Errorf("field %q left in plaintext", field)
+		}
 	}
 }

@@ -125,12 +125,11 @@ func EncryptWorkspace(doc *configdoc.Doc, secrets picoclaw.Secrets, keyPath, pas
 // encryptable reports whether a stored value is plaintext Piccolo should wrap.
 //
 // Left alone: empty values, the sidecar sentinel, anything already indirect
-// (enc:// or file://), and unfilled template placeholders. The last group matters
-// independently of whether doctor warns about it — encrypting YOUR_DISCORD_BOT_TOKEN
-// would seal a non-secret into ciphertext, give the workspace the appearance of
-// protected credentials, and leave the real failure exactly where it was. A
-// placeholder is not a secret to protect, and treating it as one would make the
-// encryption look like it accomplished something.
+// (enc:// or file://), and unfilled template placeholders. The last group is now
+// decided by the same rule doctor warns with (picoclaw.HasUsableKey), which is the
+// convergence task 4.5 asked for: encrypting YOUR_DISCORD_BOT_TOKEN would seal a
+// non-secret into ciphertext, give the workspace the appearance of protected
+// credentials, and leave the real failure exactly where it was.
 func encryptable(raw string) bool {
 	s := strings.TrimSpace(raw)
 	switch {
@@ -142,34 +141,8 @@ func encryptable(raw string) bool {
 		return false
 	case picoclaw.IsSidecarSentinel(s):
 		return false
-	case isTemplateValue(s):
-		return false
 	}
 	return picoclaw.HasUsableKey(s)
-}
-
-// isTemplateValue catches the unfilled example shapes Piccolo does not generate
-// itself but a user copying from upstream's config.example.json ends up with:
-// ALL_CAPS_WITH_UNDERSCORES. It is intentionally narrower than doctor's warning
-// rule (see the KNOWN GAP in internal/picoclaw), because here the cost of a false
-// positive is a credential silently left in plaintext, while a false negative only
-// means a junk value got sealed.
-func isTemplateValue(s string) bool {
-	if s == strings.ToUpper(s) && strings.Contains(s, "_") && looksLikeTokenChars(s) {
-		return true
-	}
-	return false
-}
-
-func looksLikeTokenChars(s string) bool {
-	for _, r := range s {
-		switch {
-		case r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '_':
-		default:
-			return false
-		}
-	}
-	return true
 }
 
 // EncryptResult is what a run changed and what it declined, with the reason for

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 
@@ -19,10 +20,9 @@ import (
 	"github.com/kimus/piccolo/internal/workspace"
 )
 
-// EnvVarDefault is the host variable Piccolo suggests when a workspace opts in.
-// It is a suggestion the user can override with --passphrase-env, not something
-// Piccolo reads back in: the manifest records whatever name was chosen.
-const EnvVarDefault = "PICCOLO_KEY_PASSPHRASE"
+// EnvVarDefault aliases the manifest's suggestion so the secrets command and the
+// init flag cannot offer different variable names.
+const EnvVarDefault = manifest.DefaultPassphraseEnv
 
 func newSecretsCmd() *cobra.Command {
 	cmd := &cobra.Command{
@@ -314,4 +314,81 @@ func runSecretsCheck(cmd *cobra.Command) error {
 	}
 	fmt.Fprintf(out, "serve will inject PICOCLAW_KEY_PASSPHRASE from %s and PICOCLAW_SSH_KEY_PATH=%s\n", envVar, layout.ContainerKeyFile())
 	return nil
+}
+
+// prepareEncryption generates the workspace key and installs the callback that
+// renders config.json with ciphertext. Called after the plan is confirmed and
+// before it is written, so an aborted init creates no key and a completed init
+// writes no plaintext.
+//
+// The passphrase must exist before anything can be encrypted, which means init
+// cannot defer it to first serve: an encrypted config.json with no way to be
+// decrypted is a broken workspace, not a partially set up one.
+func prepareEncryption(dir string, layout workspace.Layout, inputs *generate.Inputs, out io.Writer) error {
+	envVar := strings.TrimSpace(inputs.PassphraseEnv)
+	if envVar == "" {
+		envVar = manifest.DefaultPassphraseEnv
+	}
+	if !manifest.IsEnvVarName(envVar) {
+		return fmt.Errorf("passphrase variable name %q must be uppercase letters, digits and underscores", envVar)
+	}
+
+	keyPath := layout.KeyFile()
+	if _, err := os.Stat(keyPath); err != nil {
+		if !os.IsNotExist(err) {
+			return fmt.Errorf("inspect key file: %w", err)
+		}
+		generated, err := credential.Generate(layout.Keys())
+		if err != nil {
+			return err
+		}
+		keyPath = generated
+		fmt.Fprintf(out, "credential key: %s\n", rel(dir, keyPath))
+	}
+
+	passphrase, err := initPassphrase(envVar, out)
+	if err != nil {
+		return err
+	}
+
+	pass, key := passphrase, keyPath
+	inputs.PassphraseEnv = envVar
+	inputs.Encrypt = func(plaintext string) (string, error) {
+		return credential.Encrypt(pass, key, plaintext)
+	}
+	return nil
+}
+
+// initPassphrase reads the passphrase for a workspace being created. Host variable
+// first, so --yes and scripted runs work; then the terminal. Never a flag value:
+// a passphrase on the command line is visible in shell history and process lists,
+// which is the exposure this feature is meant to remove.
+func initPassphrase(envVar string, out io.Writer) (string, error) {
+	if v, ok := os.LookupEnv(envVar); ok && v != "" {
+		return v, nil
+	}
+	if !stdinIsTerminal() {
+		return "", fmt.Errorf("encryption was requested but %s is unset and there is no terminal to ask for it — "+
+			"export %s='your passphrase' before running init, or drop --encrypt-keys and run 'piccolo secrets encrypt' later",
+			envVar, envVar)
+	}
+	fmt.Fprintf(out, "Choose a passphrase for %s (Piccolo never stores it): ", envVar)
+	first, err := term.ReadPassword(int(os.Stdin.Fd()))
+	fmt.Fprintln(out)
+	if err != nil {
+		return "", fmt.Errorf("read passphrase: %w", err)
+	}
+	fmt.Fprint(out, "Confirm it: ")
+	second, err := term.ReadPassword(int(os.Stdin.Fd()))
+	fmt.Fprintln(out)
+	if err != nil {
+		return "", fmt.Errorf("read passphrase confirmation: %w", err)
+	}
+	if string(first) != string(second) {
+		return "", errors.New("passphrases did not match — nothing was written; re-run init to try again")
+	}
+	if strings.TrimSpace(string(first)) == "" {
+		return "", errors.New("an empty passphrase would encrypt nothing the gateway could later decrypt")
+	}
+	return string(first), nil
 }

@@ -327,6 +327,12 @@ func parsePortNum(s string) (int, error) {
 // EnvPrefix marks a manifest env value as a reference to a host variable.
 const EnvPrefix = "env:"
 
+// DefaultPassphraseEnv is the host variable Piccolo suggests for the enc://
+// passphrase. One constant in the package that validates the name, so the wizard,
+// the init flag default, and the secrets command cannot suggest three different
+// things and leave a user exporting a variable nothing reads.
+const DefaultPassphraseEnv = "PICCOLO_KEY_PASSPHRASE"
+
 // ResolveEnv turns the manifest env map into KEY=value pairs for the
 // container, resolving env:HOST_VAR references through lookup. The result is
 // sorted by key for deterministic container specs. Missing references return

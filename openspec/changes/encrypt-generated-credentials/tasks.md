@@ -26,12 +26,12 @@
 
 ## 4. Generation and interactive setup
 
-- [ ] 4.1 Add the encryption offer to the `init` wizard after the credential questions, and `--encrypt-keys` to the non-interactive flags
-- [ ] 4.2 Thread the choice into `internal/generate` so a credential is encrypted as it is rendered — plaintext must never be written first
-- [ ] 4.3 Update the credential field help in `internal/setup/channels.go` and `modelForm` so "stored plaintext in config.json" is conditional on the workspace's posture
-- [ ] 4.4 Make `setup` write the `enc://` form for an opted-in workspace, and have the confirmation line name the storage form
-- [ ] 4.5 Widen `picoclaw.HasUsableKey` to treat upstream's `YOUR_*` example shape as a placeholder (spec: setup-ux), and flip the known-gap assertion in `internal/picoclaw/secrets_test.go` deliberately rather than as a side effect
-- [ ] 4.6 Add a test that an untouched example token in `config.json` now warns, and that a normal key still passes
+- [x] 4.1 Wizard question added after the credential input (where the consequence is visible), with the protects/does-not-hide/irreversible text inline; plus `--encrypt-keys` and `--passphrase-env` flags. Caught the real bug here: the `--yes` path never enters `wizard.Run`, so the opt-in was silently dropped and init reported success while writing plaintext — now asserted on the artifact
+- [x] 4.2 Threaded as `Inputs.Encrypt func(string) (string, error)` rather than a key+passphrase, keeping `internal/generate` free of crypto and the filesystem so BuildPlan still works before the directory exists. Ordering: preview the plan, generate the key only after "Proceed?", rebuild the plan (BuildPlan is pure), then write — so an abort leaves no key and a completed run writes no plaintext byte
+- [x] 4.3 Update the credential field help in `internal/setup/channels.go` and `modelForm` so "stored plaintext in config.json" is conditional on the workspace's posture
+- [x] 4.4 `setupState.sealBeforeWrite` seals at `applyAndConfirm`, the single choke point both the model and channel forms pass through, so neither path can be forgotten. Posture = key file AND recorded route (either half alone cannot boot). Refuses the whole write when the passphrase is absent rather than storing plaintext in a workspace the user believes is protected. Required changing `setupState.out` from `*os.File` to `io.Writer` to reach these paths from tests
+- [x] 4.5 Widen `picoclaw.HasUsableKey` to treat upstream's `YOUR_*` example shape as a placeholder (spec: setup-ux), and flip the known-gap assertion in `internal/picoclaw/secrets_test.go` deliberately rather than as a side effect
+- [x] 4.6 Add a test that an untouched example token in `config.json` now warns, and that a normal key still passes
 
 ## 5. Delivery at serve time
 

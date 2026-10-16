@@ -85,7 +85,10 @@ func TestBuildPlanFiles(t *testing.T) {
 }
 
 func TestGeneratedPicoclawConfig(t *testing.T) {
-	cfg := testInputs().PicoclawConfig()
+	cfg, err := testInputs().PicoclawConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
 	if cfg.Version != picoclaw.SchemaVersion {
 		t.Errorf("version = %d", cfg.Version)
 	}
@@ -191,7 +194,10 @@ func TestWebSearchIndependentOfDashboard(t *testing.T) {
 	in.WebSearch = true
 	in.Dashboard = false
 
-	cfg := in.PicoclawConfig()
+	cfg, err := in.PicoclawConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
 	if !cfg.Tools.Web.Enabled {
 		t.Errorf("tools.web.enabled = false, want true (web search on)")
 	}
@@ -206,7 +212,10 @@ func TestWebSearchIndependentOfDashboard(t *testing.T) {
 	// And the reverse: dashboard on does not force web search on.
 	in.WebSearch = false
 	in.Dashboard = true
-	cfg = in.PicoclawConfig()
+	cfg, err = in.PicoclawConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
 	if cfg.Tools.Web.Enabled {
 		t.Errorf("tools.web.enabled = true, want false (web search off)")
 	}

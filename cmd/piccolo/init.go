@@ -12,6 +12,7 @@ import (
 
 	"github.com/kimus/piccolo/internal/docker"
 	"github.com/kimus/piccolo/internal/generate"
+	"github.com/kimus/piccolo/internal/manifest"
 	"github.com/kimus/piccolo/internal/wizard"
 	workspacepkg "github.com/kimus/piccolo/internal/workspace"
 )
@@ -29,7 +30,11 @@ type initFlags struct {
 	apiBase   string
 	web       bool
 	shell     bool
-	yes       bool
+	// encryptKeys opts the generated credential into PicoClaw's enc:// storage.
+	// The default is plaintext, so nothing changes for an existing caller.
+	encryptKeys   bool
+	passphraseEnv string
+	yes           bool
 }
 
 func newInitCmd() *cobra.Command {
@@ -56,6 +61,8 @@ func newInitCmd() *cobra.Command {
 	cmd.Flags().StringVar(&f.apiBase, "api-base", "", "optional API base URL")
 	cmd.Flags().BoolVar(&f.web, "web-search", true, "enable web search tools")
 	cmd.Flags().BoolVar(&f.shell, "shell", false, "enable shell execution")
+	cmd.Flags().BoolVar(&f.encryptKeys, "encrypt-keys", false, "store the API credential as PicoClaw enc:// ciphertext instead of plaintext")
+	cmd.Flags().StringVar(&f.passphraseEnv, "passphrase-env", manifest.DefaultPassphraseEnv, "NAME of the host variable holding the encryption passphrase (not the passphrase)")
 	cmd.Flags().BoolVar(&f.yes, "yes", false, "non-interactive: use flags/defaults, skip prompts, never overwrite")
 	return cmd
 }
@@ -75,6 +82,8 @@ func runInit(cmd *cobra.Command, f initFlags) error {
 		APIBase:       f.apiBase,
 		WebSearch:     boolPtr(f.web),
 		ShellExec:     boolPtr(f.shell),
+		EncryptKeys:   boolPtr(f.encryptKeys),
+		PassphraseEnv: f.passphraseEnv,
 		Workspace:     dirFlag,
 	}
 	// Only pin the web-console choice when the flag was set explicitly; otherwise
@@ -202,9 +211,31 @@ func runInit(cmd *cobra.Command, f initFlags) error {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
-	if err := workspacepkg.NewLayout(dir).EnsureDirs(); err != nil {
+	layout := workspacepkg.NewLayout(dir)
+	if err := layout.EnsureDirs(); err != nil {
 		return err
 	}
+
+	// The key is generated only after the plan was previewed and confirmed, and the
+	// plan is then rebuilt so config.json is rendered with the ciphertext already
+	// in it. The ordering carries two guarantees:
+	//
+	//   * nothing is written before "Proceed?", so init keeps its create-only
+	//     contract and an abort leaves no key file and no secrets block behind;
+	//   * the plaintext credential never occupies a written byte, because the file
+	//     that reaches disk was rendered from the encrypted value.
+	//
+	// BuildPlan is pure, so running it twice is safe and deterministic.
+	if inputs.EncryptKeys {
+		if err := prepareEncryption(dir, layout, &inputs, stdout); err != nil {
+			return err
+		}
+		plan, err = generate.BuildPlan(inputs)
+		if err != nil {
+			return err
+		}
+	}
+
 	written, skipped, err := plan.Write(dir, overwrite)
 	if err != nil {
 		return err
@@ -244,6 +275,12 @@ func inputsFromPrefill(pre wizard.Prefill) (generate.Inputs, error) {
 		OwnerName:     pre.OwnerName,
 		Purpose:       pre.Purpose,
 		Specialists:   pre.Specialists,
+		// The opt-in has to be carried here as well as in the wizard path: --yes
+		// never enters wizard.Run, and a flag that silently did nothing would leave
+		// the user with a plaintext workspace they believed was encrypted. Mirrors of
+		// the same field on two paths are exactly the drift this repo keeps hitting.
+		EncryptKeys:   pre.EncryptKeys != nil && *pre.EncryptKeys,
+		PassphraseEnv: pre.PassphraseEnv,
 		Model: generate.ModelInput{
 			Alias:    pre.ModelAlias,
 			Provider: pre.Provider,

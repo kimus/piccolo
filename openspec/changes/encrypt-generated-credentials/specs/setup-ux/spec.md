@@ -38,3 +38,43 @@ Piccolo warns when a credential is still an unfilled template. The detection SHA
 #### Scenario: Encrypted values count as usable
 - **WHEN** a credential is stored as `enc://`
 - **THEN** doctor treats it as usable, because Piccolo cannot resolve it without the passphrase and emptiness is the only claim it can make
+
+### Requirement: Init carries the encryption choice on every path
+`piccolo init` SHALL offer the credential-storage choice in the interactive wizard and SHALL accept it non-interactively, and a choice made on either path SHALL reach the generated workspace. The key SHALL be generated only after the plan is confirmed, and the plan SHALL be rebuilt from the encrypted value before anything is written.
+
+#### Scenario: Non-interactive opt-in is not dropped
+- **WHEN** `piccolo init --yes --encrypt-keys` runs with the passphrase variable set
+- **THEN** `config.json` is written with the credential as `enc://`
+- **AND** the plaintext appears in no file in the workspace
+- **AND** `piccolo.yaml` records the variable name and `picoclaw/keys/` holds the key
+
+#### Scenario: Declining keeps today's behaviour
+- **WHEN** `init` runs without the encryption choice
+- **THEN** `config.json` is written as it is today
+- **AND** no key directory and no `secrets:` block are created
+
+#### Scenario: Aborted init creates nothing
+- **WHEN** the user declines the generation plan
+- **THEN** no key file exists and no `piccolo.yaml` secrets block was written
+
+#### Scenario: Opt-in without a reachable passphrase stops early
+- **WHEN** encryption is requested but the named host variable is unset and no terminal can supply it
+- **THEN** init fails before writing `config.json`
+- **AND** the error names the variable to export and offers `piccolo secrets encrypt` as the later route
+
+### Requirement: Setup seals credentials at one choke point
+`piccolo setup` SHALL encrypt a credential it is about to write whenever the workspace posture is encrypted, at the single write path every form shares, and SHALL treat that posture as requiring both a key file and a recorded passphrase route.
+
+#### Scenario: Both forms seal through the same path
+- **WHEN** a model key or a channel token is submitted in an encrypted workspace
+- **THEN** the value written is `enc://`
+- **AND** neither form can bypass sealing by taking its own branch
+
+#### Scenario: Missing passphrase refuses the write
+- **WHEN** an encrypted workspace cannot resolve its passphrase variable at write time
+- **THEN** setup does not write `config.json`
+- **AND** the previously stored ciphertext is left intact
+
+#### Scenario: Half-configured posture is not treated as encrypted
+- **WHEN** a key file exists but no passphrase route is recorded, or the reverse
+- **THEN** setup does not behave as though credentials can be sealed

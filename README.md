@@ -355,7 +355,18 @@ The editing counterpart of `init` for an existing workspace. `piccolo setup` ope
 - **v1-editable**: channels (Discord/Telegram/Slack — list, add, toggle, edit with pre-filled values), models (add, edit, rename, delete, and the default/image selection), web/exec/spawn/subagent/load_image/mcp toggles, an advanced remote-exec toggle, and the workspace path guard (`agents.defaults.restrict_to_workspace`, off by default). Agents/container/identity sections are listed but require manual edits for now.
 - Discord setup asks whether you already have an application, helps you create one when needed, requires the Application ID + bot token, validates the token with Discord when possible, and prints direct install/test links afterwards.
 - **Merge-patched writes**: unknown keys and untouched subtrees of your user-owned `config.json` are preserved; every change shows a diff preview, requires confirmation, and backs the previous file up to `config.json.bak`.
-- Bot tokens are stored plaintext in `config.json` when Piccolo generates one (PicoClaw has no env expansion for model keys — verified). Non-secret setup metadata such as Discord Application ID is stored in `piccolo.yaml` so setup can regenerate links later.
+- Bot tokens and model keys are stored plaintext in `config.json` by default (PicoClaw has no env expansion for model keys — verified). Non-secret setup metadata such as Discord Application ID is stored in `piccolo.yaml` so setup can regenerate links later.
+- **Encrypting them is opt-in.** `piccolo init --encrypt-keys` (or `piccolo secrets encrypt` on a workspace that already exists) stores each credential as PicoClaw `enc://` ciphertext, generated with a workspace key at `picoclaw/keys/`. `piccolo.yaml` records only the **name** of the host variable holding the passphrase — never the passphrase — and `piccolo serve` resolves it when the container starts.
+
+| What `enc://` protects | What it does not hide |
+|---|---|
+| a copied or backed-up workspace | anyone with host access |
+| an accidental `git add -A` | anyone with Docker access — the passphrase is in the container env, visible to `docker inspect` |
+| a `config.json` pasted into an issue | a running gateway, which holds every decrypted credential in memory and on its mounted filesystem |
+
+  Losing the passphrase is permanent: the credentials have to be re-entered, and Piccolo keeps no copy of it. `config.json.bak` holds the plaintext the change replaced, so treat that file as the secret it is.
+
+- `piccolo secrets check` answers the question a workspace cannot otherwise ask: whether the passphrase and key file present right now can actually decrypt what `config.json` holds. Run it before `serve`, because a credential that cannot be decrypted is a gateway that exits on startup, not one that degrades.
 - **`.security.yml` outranks `config.json`.** Any save through PicoClaw itself — the web console, `picoclaw model add`, a version migration — moves every credential out of `config.json` into `picoclaw/.security.yml`, which PicoClaw then merges back over `config.json` on load, per field, and wins. So a key that is no longer visible in `config.json` is usually not missing, and a key that *is* visible there may be dead. Piccolo reads that file to tell the two apart: `piccolo doctor` judges every model and channel key by whichever file actually governs it, and `piccolo setup` refuses to write a credential into a field the sidecar overrides — naming the sidecar key to edit instead, because a secret stored where the gateway will not read it is a silent failure with a fresh token in it. Piccolo never creates, edits, or prints `.security.yml`; it is PicoClaw's file and may hold `enc://` values Piccolo cannot decrypt.
 - If the gateway container is running afterwards, setup reminds you to `piccolo reload` (config.json) or `piccolo restart` (piccolo.yaml).
 
