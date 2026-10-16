@@ -185,3 +185,31 @@ Doctor and status SHALL report an encrypted workspace's delivery state, and ever
 #### Scenario: Values stay out of output
 - **WHEN** any credential-encryption line is produced, in any state
 - **THEN** no plaintext token, `enc://` payload, or passphrase appears in the message
+
+### Requirement: The passphrase SHALL be recorded before any credential is sealed
+Piccolo SHALL write `secrets.passphrase` to `piccolo.yaml` before rewriting credentials as `enc://`, and SHALL stop the operation if that record cannot be written.
+
+#### Scenario: A failed config write leaves a bootable workspace
+- **WHEN** the passphrase is recorded and sealing `config.json` then fails
+- **THEN** `config.json` keeps its plaintext credentials and the workspace still starts
+- **AND** the next successful write seals them
+
+#### Scenario: A failed record stops the sealing
+- **WHEN** `piccolo.yaml` cannot be written
+- **THEN** no credential is sealed, because ciphertext with no recorded passphrase cannot be opened
+
+#### Scenario: A declined confirmation writes nothing at all
+- **WHEN** the user declines the confirmation, or no terminal is available to answer it
+- **THEN** `config.json` and `picoclaw/.security.yml` are both unchanged
+
+### Requirement: Closing guidance SHALL not offer reload where it cannot apply
+When a session has just given a workspace its passphrase, Piccolo SHALL tell the user that `piccolo restart` is required and that `piccolo reload` will not work, rather than listing both as options.
+
+#### Scenario: Encryption turned on with a running gateway
+- **WHEN** the gateway container was started before the workspace had a passphrase
+- **THEN** the guidance names `piccolo restart` as required
+- **AND** states that reload reports success while the gateway fails to reload its config
+
+#### Scenario: Ordinary config changes are unaffected
+- **WHEN** a session changed config without introducing a passphrase
+- **THEN** both `piccolo reload` and `piccolo restart` are offered as before
