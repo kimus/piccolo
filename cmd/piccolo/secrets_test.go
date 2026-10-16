@@ -142,7 +142,7 @@ func TestSecretsRefusalLeavesWorkspaceConsistent(t *testing.T) {
 		t.Fatal(err)
 	}
 	if m.Passphrase() != "" {
-		t.Error("refused run recorded secrets.passphrase_env, so the workspace claims to be encrypted")
+		t.Error("refused run recorded secrets.passphrase, so the workspace claims to be encrypted")
 	}
 	cfgData, _ := os.ReadFile(filepath.Join(dir, "picoclaw", "config.json"))
 	if strings.Contains(string(cfgData), credential.Scheme) {

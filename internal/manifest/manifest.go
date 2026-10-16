@@ -1,7 +1,10 @@
 // Package manifest loads and validates piccolo.yaml, Piccolo's own
 // configuration. Runtime PicoClaw-domain config (models, tools, agents,
 // channel tokens) lives in config.json, which is user-owned; piccolo.yaml may
-// also hold non-secret Piccolo setup metadata used by setup flows.
+// also hold non-secret Piccolo setup metadata used by setup flows, and — the one
+// exception, by decision rather than accident — the enc:// passphrase under
+// secrets, which is a secret held in a committed file so that an encrypted
+// workspace needs no host setup to start.
 package manifest
 
 import (
@@ -25,6 +28,12 @@ type Manifest struct {
 	Setup     Setup     `yaml:"setup,omitempty"`
 	Secrets   Secrets   `yaml:"secrets,omitempty"`
 }
+
+// Secrets holds a workspace's enc:// decryption passphrase. It is Piccolo-owned
+// delivery configuration, and unlike every other part of piccolo.yaml it IS a
+// secret: the passphrase is written here so an encrypted workspace needs no host
+// setup to boot. That is a deliberate trade, not an oversight — see the field
+// comment on Secrets.Passphrase for what it costs.
 
 // Secrets describes how a workspace's encrypted credentials are unlocked. It is
 // Piccolo-owned delivery configuration, and it holds NO secret: PassphraseEnv is
