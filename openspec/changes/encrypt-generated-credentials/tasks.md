@@ -1,11 +1,11 @@
 ## 1. Credential format implementation and its proof
 
-- [ ] 1.1 Create `internal/credential/` with `Encrypt`/`Decrypt` producing `enc://base64(salt[16] || nonce[12] || ciphertext)`, info string `picoclaw-credential-v1`, and `ikm = HMAC-SHA256(key = SHA256(sshKeyBytes), msg = passphrase)` per design D1
-- [ ] 1.2 Implement Ed25519 key generation writing the private key at 0600, its directory at 0700, and the public key beside it
-- [ ] 1.3 Generate compatibility fixtures offline from the pinned `sipeed/picoclaw@v0.3.1` `pkg/credential` (ciphertext, passphrase, key) and commit them as testdata
-- [ ] 1.4 Add the both-directions compatibility test from design D8: upstream ciphertext decrypts via Piccolo, Piccolo ciphertext decrypts via a locally built upstream decoder; confirm it fails when a constant is altered
-- [ ] 1.5 Test failure modes explicitly: wrong passphrase, wrong key, truncated payload, empty passphrase — each must return a distinguishable error, never a wrong plaintext
-- [ ] 1.6 Add `golang.org/x/crypto` to `go.mod` only if 1.1 needs it; verify the module graph did not otherwise grow
+- [x] 1.1 Create `internal/credential/` with `Encrypt`/`Decrypt` producing `enc://base64(salt[16] || nonce[12] || ciphertext)`, info string `picoclaw-credential-v1`, and `ikm = HMAC-SHA256(key = SHA256(sshKeyBytes), msg = passphrase)` per design D1
+- [x] 1.2 Implement Ed25519 key generation writing the private key at 0600, its directory at 0700, and the public key beside it
+- [x] 1.3 Generate compatibility fixtures offline from the pinned `sipeed/picoclaw@v0.3.1` `pkg/credential` (ciphertext, passphrase, key) and commit them as testdata
+- [x] 1.4 Add the both-directions compatibility test from design D8: upstream ciphertext decrypts via Piccolo, Piccolo ciphertext decrypts via a locally built upstream decoder; confirm it fails when a constant is altered
+- [x] 1.5 Test failure modes explicitly: wrong passphrase, wrong key, truncated payload, empty passphrase — each must return a distinguishable error, never a wrong plaintext
+- [x] 1.6 Add `golang.org/x/crypto` as a direct dependency — keygen needs `ssh.MarshalPrivateKey`, while the encrypt/decrypt half is stdlib-only (Go 1.26 ships `crypto/hkdf`, so design D1's assumption that x/crypto was needed for derivation was wrong). Pinned at v0.31.0: the first attempt at v0.58.0 needlessly bumped `x/sync` and `x/text`, and at v0.31.0 nothing else in the graph moved
 
 ## 2. Workspace layout and manifest
 

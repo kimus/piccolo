@@ -33,7 +33,9 @@ Verified constraints that shape every decision below:
 
 Add `internal/credential/` implementing HKDF-SHA256 + AES-256-GCM with the exact wire format: `enc://base64(salt[16] || nonce[12] || ciphertext)`, info `"picoclaw-credential-v1"`, and `ikm = HMAC-SHA256(SHA256(sshKeyBytes), passphrase)`.
 
-*Alternative considered:* depend on `github.com/sipeed/picoclaw/pkg/credential` and call it directly. Rejected — the whole module and its `pkg/config` tree would enter Piccolo's graph for one function, and Piccolo's position has been that it does not link against PicoClaw. `x/crypto/ssh` is already adjacent to Piccolo's existing `x/term` dependency, so this adds one indirect module.
+*Alternative considered:* depend on `github.com/sipeed/picoclaw/pkg/credential` and call it directly. Rejected — that module's `pkg/config` tree would enter Piccolo's graph for one function, and Piccolo's position has been that it does not link against PicoClaw.
+
+Measured, not assumed: `golang.org/x/crypto` was **not** in Piccolo's graph at all, so keygen adds it as a direct dependency. Go 1.26 ships `crypto/hkdf` in the standard library, so the derivation itself needs nothing new — only `ssh.MarshalPrivateKey` does. Pinning x/crypto at v0.31.0 adds one module and bumps nothing else; v0.58.0 gratuitously pulled `x/sync` and `x/text` forward.
 
 *The cost is real and accepted:* a wire-format drift in a future PicoClaw silently produces ciphertext Piccolo can write but the gateway cannot read. Mitigation is a compatibility test, not a guess — D8.
 
@@ -86,6 +88,8 @@ New check, placed next to the secret-sidecar check:
 ### D8: A compatibility test pins the wire format
 
 `internal/credential` carries a test vector: a ciphertext produced by PicoClaw v0.3.1's own `pkg/credential` (generated offline, committed as a fixture with its passphrase and key), which Piccolo must decrypt, plus the reverse — Piccolo's output decrypted by upstream. This is what makes D1's reimplementation safe rather than hopeful, and it fails loudly on a format drift instead of shipping a workspace the gateway cannot boot.
+
+Implemented as of group 1, with two shape notes. The upstream half of direction 2 runs as a **nested module** at `internal/credential/testdata/upstreamcheck/` — Go skips any directory with its own `go.mod`, so it is the only place in the repo referencing PicoClaw while Piccolo's graph stays clean. And upstream exposes no public decrypt: its `resolveEncrypted` is unexported, so the checker goes through `Resolver.Resolve`, which is in fact the closer test because it is the call PicoClaw's config loader makes on an `api_keys` value.
 
 ## Risks / Trade-offs
 
