@@ -248,7 +248,7 @@ func (st *setupState) homeMenu() (string, error) {
 				huh.NewOption(fmt.Sprintf("Channels   (%s)", chansSummary), "channels"),
 				huh.NewOption(fmt.Sprintf("Models     (%s)", modelSummary), "models"),
 				huh.NewOption(fmt.Sprintf("Tools      (%s)", toolSummary), "tools"),
-				huh.NewOption(fmt.Sprintf("Container  (web console: %s)", yesNo(st.webConsoleEnabled())), "container"),
+				huh.NewOption(fmt.Sprintf("Container  (%s)", st.containerSummary()), "container"),
 				huh.NewOption("Agents       (not editable yet — edit config.json manually)", "__agents__"),
 				huh.NewOption("Identity     (not editable yet — edit picoclaw/agents/*/SOUL.md manually)", "__identity__"),
 				huh.NewOption("Quit", "__quit__"),
@@ -270,29 +270,102 @@ func (st *setupState) webConsoleEnabled() bool {
 	return webConsoleURL(st.manifest) != ""
 }
 
+// containerToggle is one switch on the Container screen. The home menu's summary
+// and the screen's own rows both come from containerToggles, because the row used
+// to name only the web console and silently fell behind the section it labelled —
+// encryption was added to the screen and never appeared on the row, so the toggle
+// was undiscoverable unless you already knew it was in there.
+type containerToggle struct {
+	id     string // stable prefix of the select's value
+	name   string // label on the screen
+	detail string // what it controls
+	on     bool
+}
+
+func (t containerToggle) verb() string {
+	if t.on {
+		return "disable"
+	}
+	return "enable"
+}
+
+func (t containerToggle) status() string {
+	if t.on {
+		return "on"
+	}
+	return "off"
+}
+
+// option renders the screen row: name, current state, and what choosing it does.
+func (t containerToggle) option() string {
+	return fmt.Sprintf("%s [%s] — %s %s", t.name, t.status(), t.verb(), t.detail)
+}
+
+func (t containerToggle) value() string { return t.id + ":" + t.verb() }
+
+func (st *setupState) containerToggles() []containerToggle {
+	return []containerToggle{
+		{id: "web_console", name: "Web console", detail: "browser dashboard", on: st.webConsoleEnabled()},
+		{id: "encrypt", name: "Credential encryption", detail: "enc:// storage for stored credentials", on: st.encrypted},
+	}
+}
+
+// containerRow is how one toggle reads on the home menu's summary line.
+type containerRow struct {
+	label string
+	on    string // state when enabled
+	off   string // state when disabled
+}
+
+// containerRows is the display naming for the summary, kept separate from
+// containerToggles because the home line has room for far less text than the
+// screen row does. Listed in the same order, so a new toggle added to
+// containerToggles without an entry here is caught by the test.
+func containerRows() map[string]containerRow {
+	return map[string]containerRow{
+		"web_console": {label: "web console", on: "on", off: "off"},
+		"encrypt":     {label: "credentials", on: "encrypted", off: "plaintext"},
+	}
+}
+
+// containerSummary is the home menu's one-line state for the section: every
+// toggle it contains, in screen order. A row that names only some of them is how
+// the encryption toggle became undiscoverable in the first place.
+func (st *setupState) containerSummary() string {
+	rows := containerRows()
+	toggles := st.containerToggles()
+	parts := make([]string, 0, len(toggles))
+	for _, t := range toggles {
+		row, ok := rows[t.id]
+		if !ok {
+			// Unnamed rather than dropped: an unlabelled toggle would recreate the
+			// invisibility this exists to fix, just quieter.
+			parts = append(parts, t.id+": "+t.status())
+			continue
+		}
+		state := row.off
+		if t.on {
+			state = row.on
+		}
+		parts = append(parts, row.label+": "+state)
+	}
+	return strings.Join(parts, ", ")
+}
+
 func (st *setupState) containerScreen() error {
 	for {
-		enabled := st.webConsoleEnabled()
-		status := "off"
-		verb := "enable"
-		if enabled {
-			status = "on"
-			verb = "disable"
+		toggles := st.containerToggles()
+		opts := make([]huh.Option[string], 0, len(toggles)+1)
+		for _, t := range toggles {
+			opts = append(opts, huh.NewOption(t.option(), t.value()))
 		}
-		encStatus, encVerb := "off", "enable"
-		if st.encrypted {
-			encStatus, encVerb = "on", "disable"
-		}
+		opts = append(opts, huh.NewOption("← Back", "__back__"))
 		var pick string
 		form := setupForm(huh.NewGroup(
 			huh.NewSelect[string]().
 				Title("Container").
 				Description("Container launch settings; esc back.").
-				Options(
-					huh.NewOption(fmt.Sprintf("Web console [%s] — %s browser dashboard", status, verb), "web_console:"+verb),
-					huh.NewOption(fmt.Sprintf("Credential encryption [%s] — %s enc:// for this workspace", encStatus, encVerb), "encrypt:"+encVerb),
-					huh.NewOption("← Back", "__back__"),
-				).
+				Options(opts...).
 				Value(&pick),
 		))
 		if err := form.Run(); err != nil {

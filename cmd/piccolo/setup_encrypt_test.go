@@ -367,3 +367,78 @@ func plaintextWorkspaceForToggle(t *testing.T) string {
 	}
 	return dir
 }
+
+// The home menu's Container row used to name only the web console, so the
+// encryption toggle inside that section was invisible unless you already knew it
+// existed. These pin the property that failed, not the current wording: the row
+// must account for every toggle the section contains.
+func TestContainerSummaryNamesEveryToggle(t *testing.T) {
+	st := &setupState{manifest: &manifest.Manifest{}}
+	toggles := st.containerToggles()
+	if len(toggles) < 2 {
+		t.Fatalf("Container section should hold both toggles, got %d", len(toggles))
+	}
+	summary := st.containerSummary()
+	for _, want := range []string{"web console", "credentials"} {
+		if !strings.Contains(summary, want) {
+			t.Errorf("row omits %q while the section contains it: %q", want, summary)
+		}
+	}
+	// Every toggle id must be labelled; an unnamed one would go invisible again,
+	// just without the "dropped from the list" shape that caused this.
+	rows := containerRows()
+	for _, tg := range toggles {
+		if _, ok := rows[tg.id]; !ok {
+			t.Errorf("toggle %q has no summary label, so it will not be discoverable on the home menu", tg.id)
+		}
+	}
+}
+
+func TestContainerSummaryTracksState(t *testing.T) {
+	off := (&setupState{manifest: &manifest.Manifest{}}).containerSummary()
+	if !strings.Contains(off, "credentials: plaintext") {
+		t.Errorf("unencrypted workspace should say plaintext on the row: %q", off)
+	}
+	if strings.Contains(off, "encrypted") {
+		t.Errorf("plaintext workspace claimed encryption: %q", off)
+	}
+
+	// Both halves are required for the row to say "encrypted", matching the
+	// posture rule the sealing path uses.
+	st := &setupState{manifest: &manifest.Manifest{}, encrypted: true}
+	got := st.containerSummary()
+	if !strings.Contains(got, "credentials: encrypted") {
+		t.Errorf("encrypted workspace should say encrypted: %q", got)
+	}
+
+	// A change must be visible on the next render, since the loop re-reads it.
+	st.encrypted = false
+	if strings.Contains(st.containerSummary(), "encrypted") {
+		t.Error("row did not follow the posture change")
+	}
+}
+
+// The screen rows and the summary come from one list; assert the screen still
+// offers both toggles with the verb that describes the action available.
+func TestContainerScreenOptionsCoverBothToggles(t *testing.T) {
+	st := &setupState{manifest: &manifest.Manifest{}}
+	seen := map[string]string{}
+	for _, tg := range st.containerToggles() {
+		seen[tg.id] = tg.option()
+		if !strings.Contains(tg.value(), tg.id+":") {
+			t.Errorf("value %q does not carry the id %q the dispatcher splits on", tg.value(), tg.id)
+		}
+	}
+	for id, wantVerb := range map[string]string{"web_console": "enable", "encrypt": "enable"} {
+		if !strings.Contains(seen[id], wantVerb) {
+			t.Errorf("%s row should offer %q: %q", id, wantVerb, seen[id])
+		}
+	}
+	// Turning one on flips the verb, which is the only cue that it is already on.
+	st.encrypted = true
+	for _, tg := range st.containerToggles() {
+		if tg.id == "encrypt" && !strings.Contains(tg.option(), "disable") {
+			t.Errorf("enabled toggle should offer disable: %q", tg.option())
+		}
+	}
+}
