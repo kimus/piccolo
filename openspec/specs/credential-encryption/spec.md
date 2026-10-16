@@ -213,3 +213,21 @@ When a session has just given a workspace its passphrase, Piccolo SHALL tell the
 #### Scenario: Ordinary config changes are unaffected
 - **WHEN** a session changed config without introducing a passphrase
 - **THEN** both `piccolo reload` and `piccolo restart` are offered as before
+
+### Requirement: A credential SHALL exist in one place
+When `picoclaw/.security.yml` carries a usable value for a field, Piccolo SHALL NOT also keep a value for that field in `config.json`: the overlay replaces it on load, so the second copy is never read while remaining readable on disk.
+
+#### Scenario: Sealing the overlay drops the config.json copy
+- **WHEN** `piccolo secrets encrypt` seals a value the overlay also governs
+- **THEN** the `config.json` field is removed rather than left as a plaintext duplicate
+- **AND** the model or channel entry itself is preserved, since it carries provider, model and non-secret settings
+- **AND** the run reports the removal as a removal, not as an encryption, so a reader comparing files afterwards finds the credential in one place
+
+#### Scenario: An unsealed overlay copy never justifies a deletion
+- **WHEN** the overlay governs a field but its own value is still plaintext
+- **THEN** the `config.json` value is kept, because deleting it would destroy the only usable copy
+- **AND** the field is reported as refused with that reason
+
+#### Scenario: An overlay-only credential is not reported as missing
+- **WHEN** `config.json` carries no value for a field the overlay supplies
+- **THEN** doctor reports the credential as present and names the overlay, rather than warning about a missing or placeholder key

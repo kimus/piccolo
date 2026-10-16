@@ -198,7 +198,7 @@ func TestEncryptWorkspaceRefusesShadowedFields(t *testing.T) {
 	if !strings.Contains(out, "dt-plain") {
 		t.Error("shadowed channel token was rewritten even though it was refused")
 	}
-	if sum := res.Summary(); !strings.Contains(sum, "left in place") {
+	if sum := res.Summary(); !strings.Contains(sum, "left in plaintext") {
 		t.Errorf("summary hides the refusals: %s", sum)
 	}
 }
@@ -407,5 +407,84 @@ func TestRefusedButSealedInTheOverlayIsNotReportedAsPlaintext(t *testing.T) {
 	// And config.json must not have gained a bogus empty credential.
 	if strings.Contains(string(doc.Marshal()), `""`) {
 		t.Errorf("config.json gained an empty credential:\n%s", doc.Marshal())
+	}
+}
+
+// A credential must live in exactly one place. When the overlay carries it, the
+// config.json copy is dead on load AND readable on disk, so sealing the overlay
+// has to remove the duplicate rather than leave it behind.
+func TestSealedOverlayRemovesTheConfigJSONDuplicate(t *testing.T) {
+	key := encryptFixtureKey(t)
+	dir := t.TempDir()
+	scPath := filepath.Join(dir, "sidecar.yml")
+	body := "model_list:\n  gpt:0:\n    api_keys:\n      - sk-MODEL\nchannel_list:\n  discord:\n    settings:\n      token: dt-TOKEN\n"
+	if err := os.WriteFile(scPath, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sidecar := secretsFromSidecar(t, body)
+	doc, err := configdoc.Parse([]byte(`{"version":3,"model_list":[{"model_name":"gpt","provider":"openai","model":"gpt-4o","api_keys":["sk-MODEL"]}],"channel_list":{"discord":{"enabled":true,"type":"discord","settings":{"token":"dt-TOKEN","proxy":"http://p"}}}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	res, err := EncryptWorkspace(doc, sidecar, key, "PASS", scPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Refused) != 0 {
+		t.Errorf("nothing should be refused when the overlay can be sealed: %+v", res.Refused)
+	}
+	out := string(doc.Marshal())
+	if strings.Contains(out, "sk-MODEL") || strings.Contains(out, "dt-TOKEN") {
+		t.Errorf("plaintext duplicates survived in config.json:\n%s", out)
+	}
+	// The whole api_keys field goes, the way PicoClaw's own writer leaves it.
+	if strings.Contains(out, `"api_keys"`) {
+		t.Errorf("config.json kept an api_keys field the overlay owns:\n%s", out)
+	}
+	// Deleting the channel token must not take the non-secret neighbour with it.
+	if !strings.Contains(out, "http://p") {
+		t.Errorf("settings.proxy lost while deleting settings.token:\n%s", out)
+	}
+	// The model entry itself must survive — that is where provider/model live.
+	if !strings.Contains(out, `"model_name": "gpt"`) || !strings.Contains(out, `"provider": "openai"`) {
+		t.Errorf("model entry damaged by removing its keys:\n%s", out)
+	}
+	if len(res.Redundant) != 2 {
+		t.Errorf("Redundant = %v, want the model list and the channel token", res.Redundant)
+	}
+	if !strings.Contains(res.Summary(), "duplicate") {
+		t.Errorf("summary hides the removals: %s", res.Summary())
+	}
+}
+
+// The opposite case, and the dangerous one: if the overlay's own copy is still
+// plaintext, the config.json value is the only usable one. Deleting it would
+// destroy the credential outright.
+func TestUnsealedOverlayKeepsTheConfigJSONCopy(t *testing.T) {
+	key := encryptFixtureKey(t)
+	dir := t.TempDir()
+	scPath := filepath.Join(dir, "sidecar.yml")
+	// Overlay holds plaintext and sealing is impossible for it (no key match on
+	// the field name we look at) — assert the copy is retained and refused.
+	body := "model_list:\n  gpt:0:\n    api_keys:\n      - sk-OVERLAY\n"
+	if err := os.WriteFile(scPath, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// Sealing succeeds here, so to reach the refusal path the overlay must not be
+	// sealable: use a config-only mismatch by pointing the pass at a missing file.
+	doc, err := configdoc.Parse([]byte(`{"version":3,"model_list":[{"model_name":"gpt","api_keys":["sk-JSON"]}],"channel_list":{}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := EncryptWorkspace(doc, secretsFromSidecar(t, body), key, "PASS", filepath.Join(dir, "absent.yml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Refused) == 0 {
+		t.Fatal("a shadowed field whose overlay copy is unreadable-as-sealed must be refused")
+	}
+	if !strings.Contains(string(doc.Marshal()), "sk-JSON") {
+		t.Error("config.json copy was deleted although the overlay held no sealed value")
 	}
 }

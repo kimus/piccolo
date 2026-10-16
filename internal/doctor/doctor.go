@@ -1000,7 +1000,7 @@ func checkModels(cfg picoclaw.Config, secrets picoclaw.Secrets) []Result {
 			// Both files carry a key and the sidecar's is the one loaded: the config.json
 			// value the user can SEE is dead. Named by its sidecar key, because that is
 			// what they have to edit — and without repeating it twice in one line.
-			add(WARN, "model %q (%s): config.json api_keys is ignored — picoclaw/.security.yml key %q overrides it, so change the key there",
+			add(WARN, "model %q (%s): config.json api_keys is ignored — picoclaw/.security.yml key %q overrides it, so this value is never loaded; edit the key there, or run 'piccolo secrets encrypt' to drop the dead copy",
 				mdl.ModelName, mdl.Model, shield[i].Key)
 		case shield[i].Matched && shield[i].HasKeys:
 			add(OK, "model: %s (%s) — key from picoclaw/.security.yml", mdl.ModelName, mdl.Model)

@@ -620,3 +620,46 @@ func TestDoctorNeverPrintsCredentialValues(t *testing.T) {
 		}
 	}
 }
+
+// config.json holding a readable key for a field the overlay owns is a dead
+// duplicate: never loaded, still plaintext on disk. The message must say the value
+// is dead and offer the way to drop it, not merely "edit the key there" — which
+// leaves a user with a readable copy they never chose to keep.
+func TestDoctorReportsDeadReadableCopyOwnedByOverlay(t *testing.T) {
+	dir := initEncryptedWorkspace(t)
+	writeSidecar(t, dir, "model_list:\n  gpt-5.4:0:\n    api_keys:\n      - \"enc://AAAA\"\n")
+	patchConfig(t, dir, func(cfg map[string]any) {
+		cfg["model_list"].([]any)[0].(map[string]any)["api_keys"] = []any{"sk-DEAD-DUPLICATE"}
+	})
+
+	results := Run(context.Background(), Options{Workspace: dir, Engine: fakeEngine{imageExists: true}})
+	r := find(results, "is ignored")
+	if r == nil || r.Status != WARN {
+		t.Fatalf("dead duplicate not reported: %v", results)
+	}
+	for _, want := range []string{"never loaded", "secrets encrypt", "gpt-5.4:0"} {
+		if !strings.Contains(r.Message, want) {
+			t.Errorf("message must contain %q: %s", want, r.Message)
+		}
+	}
+	if strings.Contains(r.Message, "sk-DEAD-DUPLICATE") {
+		t.Errorf("warning leaked the credential value: %s", r.Message)
+	}
+
+	// Once the dead copy is gone, neither the duplicate warning nor a false
+	// "no API key" warning may remain: the key legitimately lives only in the
+	// overlay, and that is the state PicoClaw's own writer produces.
+	patchConfig(t, dir, func(cfg map[string]any) {
+		delete(cfg["model_list"].([]any)[0].(map[string]any), "api_keys")
+	})
+	results = Run(context.Background(), Options{Workspace: dir, Engine: fakeEngine{imageExists: true}})
+	if find(results, "is ignored") != nil {
+		t.Errorf("finding persisted after the copy was removed: %v", results)
+	}
+	if r := find(results, "placeholder or empty API key"); r != nil {
+		t.Errorf("overlay-only key wrongly called keyless: %s", r.Message)
+	}
+	if r := find(results, "key from picoclaw/.security.yml"); r == nil || r.Status != OK {
+		t.Errorf("overlay-only key not reported as present: %v", results)
+	}
+}

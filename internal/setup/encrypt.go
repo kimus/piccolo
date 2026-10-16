@@ -48,7 +48,12 @@ func EncryptWorkspace(doc *configdoc.Doc, secrets picoclaw.Secrets, keyPath, pas
 		}
 	}
 	res.Sidecar = sc
-	sealed := sealedTargets(sc.Encrypted)
+	// A config.json value may only be DISCARDED when the overlay provably holds a
+	// usable value for the same field: sealed by this run, or already ciphertext
+	// there. If the overlay's own copy is still plaintext, deleting config.json's
+	// would destroy the only readable form of the credential, so those fields are
+	// refused instead.
+	sealed := sealedTargets(append(append([]string(nil), sc.Encrypted...), secrets.EncryptedSecureValues()...))
 
 	// Model keys. The sidecar decides per model_list entry, keyed by the alias
 	// plus its duplicate ordinal, so this walks the entries positionally rather
@@ -79,6 +84,17 @@ func EncryptWorkspace(doc *configdoc.Doc, secrets picoclaw.Secrets, keyPath, pas
 		alias, _ := entry.GetString("model_name")
 		name := fmt.Sprintf("model %q api_keys", alias)
 
+		if shields[i].Matched && sealed["model:"+alias] {
+			// The overlay replaces this entry's WHOLE list on load, so every value
+			// here is dead whether plaintext or ciphertext. A dead plaintext value is
+			// worse than dead: it is a readable copy of a credential that already
+			// exists encrypted elsewhere. Drop the field, matching what PicoClaw's
+			// own SaveConfig leaves behind (it omits secure fields entirely).
+			entry.Delete("api_keys")
+			res.addChanged(fmt.Sprintf("model %q api_keys (only copy now in picoclaw/%s)", alias, picoclaw.SecurityFileName))
+			res.Redundant = append(res.Redundant, fmt.Sprintf("model %q api_keys", alias))
+			continue
+		}
 		changed := false
 		out := make([]configdoc.Value, 0, len(kv))
 		for _, k := range kv {
@@ -91,19 +107,9 @@ func EncryptWorkspace(doc *configdoc.Doc, secrets picoclaw.Secrets, keyPath, pas
 				continue
 			}
 			if shields[i].Matched {
-				// The sidecar replaces this entry's whole list on load, so a fresh
-				// enc:// value here would be dead the moment it was written. But if the
-				// overlay pass sealed that entry, the credential is protected — saying
-				// it was left in plaintext would send the user hunting a problem that
-				// does not exist.
-				if sealed["model:"+alias] {
-					// Nothing to write here: the overlay now carries the sealed value,
-					// and config.json keeps whatever it held. Appending anything would
-					// add a credential the gateway does not use.
-					res.addChanged(fmt.Sprintf("model %q api_keys (in picoclaw/%s)", alias, picoclaw.SecurityFileName))
-					continue
-				}
-				res.addRefused(name, fmt.Sprintf("picoclaw/.security.yml %s governs this model's api_keys", shields[i].Key))
+				// Reached only when the overlay's copy is still readable plaintext, so
+				// the config.json value is the only usable one and must stay.
+				res.addRefused(name, fmt.Sprintf("picoclaw/.security.yml %s governs this model's api_keys and still holds it as plaintext; seal it first", shields[i].Key))
 				// Leave the entry exactly as it was: writing an enc:// value the
 				// sidecar discards would make the workspace look encrypted while the
 				// gateway keeps loading the old plaintext from elsewhere.
@@ -143,7 +149,15 @@ func EncryptWorkspace(doc *configdoc.Doc, secrets picoclaw.Secrets, keyPath, pas
 				}
 				name := fmt.Sprintf("channel %q settings.%s", channel, field)
 				if sc := secrets.ChannelSecret(channel, field); sc.Matched {
-					res.addRefused(name, "picoclaw/.security.yml sets this field, so config.json's value is not read")
+					if sealed["channel:"+channel+"."+field] {
+						// The overlay owns this field; the copy here is a readable
+						// duplicate of a credential that is already sealed there.
+						settings.Delete(field)
+						res.addChanged(fmt.Sprintf("channel %q settings.%s (only copy now in picoclaw/%s)", channel, field, picoclaw.SecurityFileName))
+						res.Redundant = append(res.Redundant, name)
+						continue
+					}
+					res.addRefused(name, "picoclaw/.security.yml sets this field and still holds it as plaintext; seal it first")
 					continue
 				}
 				enc, err := credential.Encrypt(passphrase, keyPath, raw)
@@ -203,6 +217,11 @@ type EncryptResult struct {
 	// SidecarPath is where SidecarBytes belongs, echoed back so the caller does not
 	// have to remember which of its own paths to write.
 	SidecarPath string
+	// Redundant lists config.json values DELETED because the overlay owns them.
+	// Reported separately: "encrypted" and "removed as a duplicate" are different
+	// facts, and a user comparing config.json afterwards would otherwise find
+	// nothing where they expected ciphertext and conclude the run failed.
+	Redundant []string
 }
 
 // RefusedField names one credential left in plaintext and why.
@@ -229,13 +248,26 @@ func (r EncryptResult) NothingChanged() bool {
 // Summary reports the outcome in one line, keeping refusals visible rather than
 // folding them into "done".
 func (r EncryptResult) Summary() string {
-	if len(r.Changed) == 0 && len(r.Refused) == 0 {
+	if r.NothingChanged() && len(r.Refused) == 0 {
 		return "nothing to encrypt: every credential in config.json is already encrypted or empty"
 	}
+	// Changed counts every mutation, because callers decide whether to write on it.
+	// The summary must still separate sealing from deleting a duplicate: reporting a
+	// removal as "encrypted" implies ciphertext the user will not find in
+	// config.json, which reads like a failed run.
+	sealed := len(r.Changed) - len(r.Redundant)
+	if sealed < 0 {
+		sealed = 0
+	}
 	var parts []string
-	parts = append(parts, fmt.Sprintf("%d credential(s) encrypted", len(r.Changed)))
-	if len(r.Refused) > 0 {
-		parts = append(parts, fmt.Sprintf("%d left in place because picoclaw/.security.yml governs them", len(r.Refused)))
+	if sealed > 0 {
+		parts = append(parts, fmt.Sprintf("%d credential(s) encrypted", sealed))
+	}
+	if n := len(r.Redundant); n > 0 {
+		parts = append(parts, fmt.Sprintf("%d duplicate(s) removed from config.json, picoclaw/%s holds the only copy", n, picoclaw.SecurityFileName))
+	}
+	if n := len(r.Refused); n > 0 {
+		parts = append(parts, fmt.Sprintf("%d left in plaintext because picoclaw/%s governs them and its own copy is unsealed", n, picoclaw.SecurityFileName))
 	}
 	return strings.Join(parts, ", ")
 }
