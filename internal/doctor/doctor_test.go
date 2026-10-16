@@ -12,6 +12,7 @@ import (
 	"github.com/kimus/piccolo/internal/docker"
 	"github.com/kimus/piccolo/internal/generate"
 	"github.com/kimus/piccolo/internal/manifest"
+	"github.com/kimus/piccolo/internal/picoclaw"
 	"github.com/kimus/piccolo/internal/runtimeimage"
 	"github.com/kimus/piccolo/internal/runtimeplan"
 )
@@ -948,7 +949,7 @@ func TestCheckChannels(t *testing.T) {
 		"slack":{"enabled":false,"type":"slack","settings":{"bot_token":"xoxb-1"}},
 		"open":{"enabled":true,"type":"discord","allow_from":["*"],"settings":{"token":"t"}}
 	}}`)
-	res := checkChannels(cfg)
+	res := checkChannels(cfg, picoclaw.Secrets{})
 	var got = map[string]Status{}
 	for _, r := range res {
 		got[r.Message] = r.Status
@@ -984,7 +985,7 @@ func TestCheckChannels(t *testing.T) {
 	_ = got
 
 	// No channel_list → no results, never a failure.
-	if n := len(checkChannels([]byte(`{"version":3}`))); n != 0 {
+	if n := len(checkChannels([]byte(`{"version":3}`), picoclaw.Secrets{})); n != 0 {
 		t.Errorf("absent channel_list gave %d results", n)
 	}
 }

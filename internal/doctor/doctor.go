@@ -248,11 +248,25 @@ func Run(ctx context.Context, opts Options) []Result {
 	}
 	add(OK, "picoclaw config: config.json (schema v%d)", cfg.Version)
 
+	// 6b. PicoClaw's secret sidecar. Anything the gateway has saved once (the web
+	// console, `picoclaw model add`, a version migration) moves every secure field
+	// out of config.json and into picoclaw/.security.yml, and that file then WINS
+	// on load — so config.json alone cannot say what the gateway will actually
+	// use. Read it before the checks that depend on it. A file that does not parse
+	// is fatal: PicoClaw's LoadConfig refuses to start the gateway over it.
+	secrets := picoclaw.LoadSecrets(configPath)
+	if secrets.Err != nil {
+		add(FAIL, "picoclaw/.security.yml does not parse: %v — PicoClaw will not load config.json while it cannot read the sidecar", secrets.Err)
+		secrets = picoclaw.Secrets{Present: true}
+	} else if secrets.Present {
+		add(OK, "secret sidecar: picoclaw/.security.yml (secure fields here override config.json)")
+	}
+
 	// 7. Agents.
 	results = append(results, checkAgents(opts.Workspace, cfg)...)
 
 	// 8. Models.
-	results = append(results, checkModels(cfg)...)
+	results = append(results, checkModels(cfg, secrets)...)
 	results = append(results, checkLegacyAgentModelNames(data)...)
 
 	// 9. Image understanding. PicoClaw can receive channel attachments; Piccolo
@@ -265,7 +279,7 @@ func Run(ctx context.Context, opts Options) []Result {
 
 	// 11. Channels (raw parse — setup manages channel_list; unknown fields
 	// are user-owned and ignored here).
-	results = append(results, checkChannels(data)...)
+	results = append(results, checkChannels(data, secrets)...)
 
 	// 12. MCP reachability: a registered integration server is not a callable tool.
 	results = append(results, checkIntegrationRegistration(m, data)...)
@@ -697,8 +711,10 @@ func checkExecSafety(configData []byte) []Result {
 }
 
 // checkChannels inspects channel_list entries for the classic half-configured
-// state: enabled channel without a real token (empty/placeholder).
-func checkChannels(configData []byte) []Result {
+// state: enabled channel without a real token (empty/placeholder). A token in
+// picoclaw/.security.yml counts, and the `[NOT_HERE]` sentinel in config.json is
+// PicoClaw saying exactly that — it is not a placeholder to warn about.
+func checkChannels(configData []byte, secrets picoclaw.Secrets) []Result {
 	var results []Result
 	add := func(s Status, format string, args ...any) {
 		results = append(results, Result{Status: s, Message: fmt.Sprintf(format, args...)})
@@ -726,10 +742,21 @@ func checkChannels(configData []byte) []Result {
 			continue
 		}
 		tokenKey := ""
-		for _, k := range []string{"token", "bot_token", "app_token", "client_secret", "app_secret"} {
+		for _, k := range picoclaw.SecretFieldName {
 			if _, ok := ch.Settings[k]; ok {
 				tokenKey = k
 				break
+			}
+		}
+		// config.json may carry the sentinel instead of the value, and the
+		// sidecar may hold the value for a field config.json never names — PicoClaw
+		// saved a token for a channel whose settings it stripped.
+		if tokenKey == "" {
+			for _, k := range picoclaw.SecretFieldName {
+				if sc := secrets.ChannelSecret(name, k); sc.Matched {
+					tokenKey = k
+					break
+				}
 			}
 		}
 		if tokenKey == "" {
@@ -737,8 +764,37 @@ func checkChannels(configData []byte) []Result {
 			continue
 		}
 		tok, _ := ch.Settings[tokenKey].(string)
-		if isPlaceholderKey(tok) {
-			add(WARN, "channel %q is enabled but %q is empty or a placeholder", name, tokenKey)
+		// The question is which FILE governs this field, not which one looks better.
+		// A sidecar that names the field at all replaces config.json's value for it —
+		// including with an empty string, which upstream loads as an empty token while
+		// config.json still displays a real one. Confirmed by driving the real loader
+		// over each shape. Values are never printed: only the field name.
+		sc := secrets.ChannelSecret(name, tokenKey)
+		jsonUsable := picoclaw.HasUsableKey(tok)
+		switch {
+		case sc.Matched && !picoclaw.HasUsableKey(sc.Value) && jsonUsable:
+			// The inverse of the shadow, and worse to debug: the channel looks keyed in
+			// config.json and the gateway loads an empty token.
+			add(WARN, "channel %q: config.json carries a token but picoclaw/.security.yml sets %q empty, so the gateway starts with no token", name, tokenKey)
+			continue
+		case sc.Matched && picoclaw.HasUsableKey(sc.Value) && jsonUsable && sc.Value != tok:
+			add(WARN, "channel %q: config.json %q is ignored — picoclaw/.security.yml sets that field, so change the token there", name, tokenKey)
+			continue
+		case sc.Matched && !picoclaw.HasUsableKey(sc.Value):
+			// Sidecar governs and carries nothing usable, with nothing behind it in
+			// config.json either.
+			add(WARN, "channel %q is enabled but picoclaw/.security.yml %q is empty or a placeholder", name, tokenKey)
+			continue
+		case jsonUsable:
+			// config.json decides: no sidecar value for this field.
+		case picoclaw.HasUsableKey(sc.Value):
+			// The value lives only in the sidecar; the OK line says so below.
+		default:
+			if picoclaw.IsSidecarSentinel(tok) {
+				add(WARN, "channel %q: config.json marks %q as stored in picoclaw/.security.yml, but that file carries no usable value — the gateway starts with no token", name, tokenKey)
+			} else {
+				add(WARN, "channel %q is enabled but %q is empty or a placeholder", name, tokenKey)
+			}
 			continue
 		}
 		if len(ch.AllowFrom) == 0 {
@@ -749,7 +805,11 @@ func checkChannels(configData []byte) []Result {
 			add(WARN, "channel %q: allow_from is \"*\" — open to everyone who can reach the bot", name)
 			continue
 		}
-		add(OK, "channel: %s", name)
+		if sc.Matched && !jsonUsable {
+			add(OK, "channel: %s (token from picoclaw/.security.yml)", name)
+		} else {
+			add(OK, "channel: %s", name)
+		}
 	}
 	return results
 }
@@ -896,7 +956,14 @@ func knownModels(cfg picoclaw.Config) map[string]bool {
 	return names
 }
 
-func checkModels(cfg picoclaw.Config) []Result {
+// checkModels reports the models the gateway will actually run with, which is
+// not always what config.json shows: picoclaw/.security.yml overrides a
+// model_list entry's api_keys whenever it carries a matching key, and it
+// overrides in BOTH directions — a sidecar entry with a populated list replaces
+// the config.json key (so a `piccolo setup` edit there is a silent no-op), and a
+// sidecar entry with an empty list strips a key config.json still displays.
+// Values are never printed: only which file decides, and which key matched.
+func checkModels(cfg picoclaw.Config, secrets picoclaw.Secrets) []Result {
 	var results []Result
 	add := func(s Status, format string, args ...any) {
 		results = append(results, Result{Status: s, Message: fmt.Sprintf(format, args...)})
@@ -907,12 +974,35 @@ func checkModels(cfg picoclaw.Config) []Result {
 		return results
 	}
 	names := knownModels(cfg)
-	for _, mdl := range cfg.ModelList {
-		if len(mdl.APIKeys) == 0 || isPlaceholderKey(mdl.APIKeys[0]) {
+	shield := secrets.ResolveModels(cfg.ModelAliases())
+	for i, mdl := range cfg.ModelList {
+		jsonKey := len(mdl.APIKeys) > 0 && picoclaw.HasUsableKey(mdl.APIKeys[0])
+		switch {
+		case shield[i].Matched && shield[i].HasKeys && jsonKey:
+			// Both files carry a key and the sidecar's is the one loaded: the config.json
+			// value the user can SEE is dead. Named by its sidecar key, because that is
+			// what they have to edit — and without repeating it twice in one line.
+			add(WARN, "model %q (%s): config.json api_keys is ignored — picoclaw/.security.yml key %q overrides it, so change the key there",
+				mdl.ModelName, mdl.Model, shield[i].Key)
+		case shield[i].Matched && shield[i].HasKeys:
+			add(OK, "model: %s (%s) — key from picoclaw/.security.yml", mdl.ModelName, mdl.Model)
+		case shield[i].Matched && !shield[i].HasKeys && jsonKey:
+			add(WARN, "model %q: config.json carries an api key but picoclaw/.security.yml key %s lists none, so the gateway runs this model with no key",
+				mdl.ModelName, shield[i].Key)
+		case shield[i].Matched && !shield[i].HasKeys:
 			add(WARN, "model %q has a placeholder or empty API key", mdl.ModelName)
-		} else {
+		case jsonKey:
 			add(OK, "model: %s (%s)", mdl.ModelName, mdl.Model)
+		default:
+			add(WARN, "model %q has a placeholder or empty API key", mdl.ModelName)
 		}
+	}
+	// A sidecar key no model_list entry claims is a stale guard, and the usual way
+	// to make one is a rename: the key keeps protecting a model name that no longer
+	// exists while the renamed model runs with whatever config.json says. Silent
+	// either way, and invisible from config.json alone.
+	for _, orphan := range secrets.OrphanKeys(cfg.ModelAliases()) {
+		add(WARN, "picoclaw/.security.yml %s matches no model_list entry — a model renamed or deleted in config.json leaves its key behind here", orphan)
 	}
 	// Every model alias config.json references must exist in model_list. Walked
 	// per location and reported with it, so a dangling alias says where to fix
@@ -1045,19 +1135,6 @@ func checkImageUnderstanding(workspace string, cfg picoclaw.Config, configData [
 		}
 	}
 	return results
-}
-
-func isPlaceholderKey(key string) bool {
-	k := strings.ToLower(strings.TrimSpace(key))
-	switch {
-	case k == "":
-		return true
-	case strings.HasPrefix(k, "sk-your"), strings.HasPrefix(k, "your-"):
-		return true
-	case strings.Contains(k, "placeholder"), strings.Contains(k, "changeme"), strings.Contains(k, "xxx"):
-		return true
-	}
-	return false
 }
 
 func hasTool(tools []string, want string) bool {

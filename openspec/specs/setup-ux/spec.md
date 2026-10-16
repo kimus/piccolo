@@ -285,3 +285,36 @@ Piccolo doctor SHALL warn when `piccolo.yaml` records an integration that names 
 #### Scenario: An integration that needs no MCP server
 - **WHEN** an installed integration records no `mcp_server_key`
 - **THEN** doctor does not report a missing server entry for it
+
+### Requirement: Doctor judges a credential by the file that governs it
+PicoClaw merges `picoclaw/.security.yml` over `config.json` on load, and its own save path relocates every secure field there, so a field's presence in `config.json` SHALL NOT be treated as the state the gateway will use. Doctor SHALL read the sidecar before judging any model key or channel token, SHALL report which file decides, and SHALL never print a credential value.
+
+#### Scenario: A key that moved to the sidecar is not a missing key
+- **WHEN** `config.json` carries no `api_keys` for a model and `picoclaw/.security.yml` names that model with a usable key
+- **THEN** doctor reports the model as having a key and says it comes from `picoclaw/.security.yml`
+- **AND** does not warn about a placeholder or empty key
+
+#### Scenario: A sidecar key overrides one config.json still displays
+- **WHEN** both files carry a usable key for the same model
+- **THEN** doctor warns that `config.json`'s value is ignored and names the sidecar key to edit
+- **AND** the warning is a warning, never a failure
+
+#### Scenario: A sidecar entry clears a displayed credential
+- **WHEN** the sidecar names a model's `api_keys` with an empty list, or a channel's token with an empty string, while `config.json` still shows a value
+- **THEN** doctor warns that the gateway runs without that credential
+
+#### Scenario: A null sidecar entry does not shadow
+- **WHEN** the sidecar names a model key with no body at all
+- **THEN** doctor treats `config.json`'s own value as in force and reports no shadowing
+
+#### Scenario: A sidecar key guards nothing
+- **WHEN** the sidecar carries a model key that no `config.json` model_list entry resolves to
+- **THEN** doctor warns that the key matches no model, naming the key and never its value
+
+#### Scenario: The sidecar does not parse
+- **WHEN** `picoclaw/.security.yml` exists and cannot be parsed
+- **THEN** doctor fails, stating that PicoClaw will not load `config.json` while it cannot read the sidecar
+
+#### Scenario: No sidecar at all
+- **WHEN** `picoclaw/.security.yml` does not exist
+- **THEN** doctor judges every credential from `config.json` alone and reports no sidecar finding
