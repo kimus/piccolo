@@ -297,3 +297,24 @@ Piccolo SHALL create `piccolo.yaml`, `picoclaw/config.json`, its `.bak` backup, 
 #### Scenario: An unfilled example is not a credential
 - **WHEN** a readable file holds only an upstream placeholder value
 - **THEN** it is not reported as leaking a credential
+
+### Requirement: piccolo.yaml rewrites SHALL preserve comments
+Piccolo SHALL render `piccolo.yaml` from its own configuration structure and transplant the replaced file's comments onto that render, matched by location. It SHALL NOT build the file by merging the old document, and SHALL NOT report an error when the old content cannot be parsed — an unparseable predecessor yields the plain render.
+
+#### Scenario: A note on a pinned image survives
+- **WHEN** a workspace whose piccolo.yaml carries user comments is rewritten by a Piccolo command
+- **THEN** each comment still stands above the field it annotates
+- **AND** the field's value reflects the new state rather than the commented one
+
+#### Scenario: Piccolo's own header survives
+- **WHEN** the init-written header block is present in the file being replaced
+- **THEN** it is present again after the rewrite
+
+#### Scenario: A field Piccolo stops writing takes its comment with it
+- **WHEN** the rendered state omits a field the old file carried with a comment
+- **THEN** the field is absent
+- **AND** it is not re-added merely to host the comment
+
+#### Scenario: Unparseable predecessor does not block the write
+- **WHEN** the existing piccolo.yaml cannot be parsed as YAML
+- **THEN** the rewrite succeeds with the plain render and valid loadable content

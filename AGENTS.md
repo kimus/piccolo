@@ -67,7 +67,8 @@ secrets:                                    # optional block; absent means plain
   passphrase: ""                            # enc:// passphrase, stored here (default on writes it)
 ```
 
-- Strict decoding: unknown keys SHALL cause a parse error.
+- Strict decoding: unknown keys SHALL cause a parse error. This is also what makes a comment-preserving writer safe: a file carrying a stray key cannot be loaded, so it can never be re-written with that key transplanted into it.
+- `piccolo.yaml` rewrites SHALL preserve comments. `Manifest.Write` renders FROM the struct and transplants comments onto that render by location (mapping keys matched by name, sequence items by index) — it SHALL NOT merge the old document into a tree the writer then maintains, because a field such a walker misses is deleted from the file holding the passphrase rather than merely un-commented. Comments before the first key attach to the yaml **Document** node, not the root mapping, so the `piccolo init` header is only kept by merging the document node too. A key the struct no longer emits (an empty `omitempty` block) loses its comment, and SHALL NOT be re-added to host it.
 - `secrets.passphrase` holds the enc:// decryption passphrase. This is a deliberate trade: it buys a workspace that starts with no host setup, and it costs the at-rest protection `enc://` would otherwise provide, because `piccolo.yaml` is the one workspace file meant to be committed and shared. Only whitespace-only is rejected; any other string is a valid passphrase. An absent `secrets:` block means the workspace stores plaintext.
 - `env:HOST_VAR` refs resolve from host env at `serve`; missing refs → doctor warning + serve-time error.
 
