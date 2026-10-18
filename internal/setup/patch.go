@@ -920,3 +920,65 @@ func ReadModel(doc *configdoc.Doc, alias string) (provider, model, apiKey, apiBa
 	}
 	return "", "", "", "", false
 }
+
+// --- MCP server entries -------------------------------------------------------
+
+// mcpServers returns the tools.mcp.servers object, or nil when there is none.
+func mcpServers(doc *configdoc.Doc) *configdoc.Doc {
+	tools, ok := doc.GetObject("tools")
+	if !ok {
+		return nil
+	}
+	mcp, ok := tools.GetObject("mcp")
+	if !ok {
+		return nil
+	}
+	servers, _ := mcp.GetObject("servers")
+	return servers
+}
+
+// MCPServerKeys lists the registered server keys in document order.
+func MCPServerKeys(doc *configdoc.Doc) []string {
+	servers := mcpServers(doc)
+	if servers == nil {
+		return nil
+	}
+	return servers.Keys()
+}
+
+// HasMCPServer reports whether config.json registers this server key.
+func HasMCPServer(doc *configdoc.Doc, key string) bool {
+	servers := mcpServers(doc)
+	if servers == nil {
+		return false
+	}
+	_, ok := servers.Get(key)
+	return ok
+}
+
+// RemoveMCPServer deletes one registered server entry. It reports whether anything
+// changed and never creates the objects it walks through.
+//
+// This is the inverse of what `piccolo integration setup` writes from a configPatch,
+// and it is load-bearing for uninstall: a servers.<key> entry whose integration is
+// gone is not merely inert. With tools.mcp.enabled true, PicoClaw tries to start
+// every listed server, and a server whose command no longer exists in the image
+// FAILS THE WHOLE TURN — every chat message errors, not just the removed
+// integration's. Removing the manifest record without removing this entry turns an
+// uninstall into a broken gateway, which is why the command cannot be a manifest edit
+// alone.
+func RemoveMCPServer(doc *configdoc.Doc, key string) (bool, error) {
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return false, fmt.Errorf("mcp server key is required")
+	}
+	servers := mcpServers(doc)
+	if servers == nil {
+		return false, nil
+	}
+	if _, ok := servers.Get(key); !ok {
+		return false, nil
+	}
+	servers.Delete(key)
+	return true, nil
+}

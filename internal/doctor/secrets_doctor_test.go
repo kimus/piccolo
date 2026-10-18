@@ -770,3 +770,54 @@ func TestDoctorDoesNotCallAPlaceholderACredential(t *testing.T) {
 		t.Errorf("placeholder reported as a credential: %s", r.Message)
 	}
 }
+
+// The mirror of installed-but-unregistered, and the more dangerous one: an orphaned
+// servers.<key> entry is not inert. With tools.mcp.enabled on the gateway starts every
+// listed server, and a missing command fails the whole turn — every chat message, not
+// just the removed integration's. This is what a half-finished uninstall leaves.
+func TestDoctorWarnsOnOrphanedMCPServerEntry(t *testing.T) {
+	dir := initEncryptedWorkspace(t)
+	cfg := filepath.Join(dir, workspace.PicoclawDir, "config.json")
+
+	writeConfig := func(body string) {
+		t.Helper()
+		if err := os.WriteFile(cfg, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Registered, enabled, and no integration claims it.
+	writeConfig(`{"version":3,"tools":{"mcp":{"enabled":true,"servers":{"piccolo_gws":{"command":"piccolo-gws"}}}}}`)
+	r := findMsg(t, dir, "no installed integration provides it")
+	if r == nil {
+		t.Fatal("orphaned server entry not reported")
+	}
+	if !strings.Contains(r.Message, "every chat turn fails") {
+		t.Errorf("must state the consequence, not just the mismatch: %s", r.Message)
+	}
+
+	// Same entry with the toggle off is inert, and must be described that way rather
+	// than as a breakage that is not happening.
+	writeConfig(`{"version":3,"tools":{"mcp":{"enabled":false,"servers":{"piccolo_gws":{"command":"piccolo-gws"}}}}}`)
+	r = findMsg(t, dir, "no installed integration provides it")
+	if r == nil {
+		t.Fatal("orphaned entry not reported while disabled")
+	}
+	if strings.Contains(r.Message, "chat turn fails") {
+		t.Errorf("claimed a failure that cannot happen while the tool is off: %s", r.Message)
+	}
+
+	// An entry a recorded integration does claim is normal, not an orphan.
+	writeConfig(`{"version":3,"tools":{"mcp":{"enabled":true,"servers":{"piccolo_gws":{"command":"piccolo-gws"}}}}}`)
+	m, err := manifest.Load(filepath.Join(dir, workspace.ManifestName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.Runtime.Integrations = []manifest.Integration{{Package: "github:acme/gws", Name: "gws", MCPServerKey: "piccolo_gws"}}
+	if err := m.Write(filepath.Join(dir, workspace.ManifestName)); err != nil {
+		t.Fatal(err)
+	}
+	if r := findMsg(t, dir, "no installed integration provides it"); r != nil {
+		t.Errorf("a properly installed integration was reported as an orphan: %s", r.Message)
+	}
+}

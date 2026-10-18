@@ -82,3 +82,42 @@ The system SHALL allow adding and setting up an integration without an already-r
 - **WHEN** no gateway container is running
 - **THEN** `piccolo integration setup <name>` can still run the setup command in a temporary container
 
+
+### Requirement: Uninstalling an integration SHALL undo every file that records it
+An integration is recorded in four places: its `runtime.integrations` entry, the content of the workspace runtime image, its `tools.mcp.servers.<key>` entry in `config.json`, and its state directory under `integrations/`. Piccolo SHALL remove all four as one operation, SHALL build the replacement image before editing any file, and SHALL preserve the state directory unless the user asks for its deletion.
+
+#### Scenario: The registered server entry goes with the record
+- **WHEN** an installed integration with a registered MCP server is removed
+- **THEN** its `tools.mcp.servers.<key>` entry is deleted from config.json
+- **AND** the manifest record is dropped only afterwards
+
+#### Scenario: The last server removes the promise
+- **WHEN** removing the entry leaves no registered servers and `tools.mcp.enabled` is on
+- **THEN** the toggle is turned off
+- **AND** the run states that it did
+
+#### Scenario: Surviving servers keep their toggle
+- **WHEN** other registered servers remain
+- **THEN** `tools.mcp.enabled` is left unchanged
+- **AND** the run reports that it was left as-is
+
+#### Scenario: A refused removal edits nothing
+- **WHEN** the user declines the confirmation
+- **THEN** the manifest, config.json, and the state directory are byte-for-byte unchanged
+
+#### Scenario: A failed image build leaves the workspace untouched
+- **WHEN** building the replacement image fails
+- **THEN** no file in the workspace has been edited
+
+#### Scenario: State survives by default
+- **WHEN** an integration is removed without requesting deletion of its state
+- **THEN** `integrations/<name>` remains, including any stored credentials
+
+#### Scenario: Requested deletion stays inside the workspace
+- **WHEN** state deletion is requested and the recorded state path resolves outside the workspace `integrations/` directory
+- **THEN** the deletion is refused
+- **AND** nothing is removed
+
+#### Scenario: An abandoned server entry is visible
+- **WHEN** config.json registers a server no installed integration provides
+- **THEN** doctor warns, naming whether the enabled toggle makes it actively breaking or merely inert

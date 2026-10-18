@@ -292,6 +292,7 @@ func Run(ctx context.Context, opts Options) []Result {
 
 	// 12. MCP reachability: a registered integration server is not a callable tool.
 	results = append(results, checkIntegrationRegistration(m, data)...)
+	results = append(results, checkOrphanMCPServers(m, data)...)
 	results = append(results, checkMCPAccess(opts.Workspace, cfg, data)...)
 
 	return results
@@ -341,6 +342,60 @@ func checkIntegrationRegistration(m *manifest.Manifest, configData []byte) []Res
 			label = ref
 		}
 		results = append(results, Result{Status: WARN, Message: fmt.Sprintf("integration %s is installed and configured but never registered: config.json has no tools.mcp.servers.%s entry — its tools are not offered to any agent; finish it with 'piccolo integration setup %s' and accept the config change", label, key, ref)})
+	}
+	return results
+}
+
+// checkOrphanMCPServers reports the mirror image of checkIntegrationRegistration: a
+// servers.<key> entry in config.json that NO installed integration claims. That is what
+// a half-finished uninstall leaves, and it is the more dangerous of the two states,
+// because an orphan is not inert — with tools.mcp.enabled true PicoClaw tries to start
+// every listed server, and a server whose command no longer exists in the image fails
+// the whole turn, so EVERY chat message errors, not only the removed integration's.
+//
+// Warning rather than failure for one reason: the entry might belong to a server the
+// user registered by hand, which is legal and which Piccolo must not call a mistake.
+// The consequence is therefore stated in the message instead of asserted by the exit
+// code.
+func checkOrphanMCPServers(m *manifest.Manifest, configData []byte) []Result {
+	var raw struct {
+		Tools struct {
+			MCP struct {
+				Enabled *bool                      `json:"enabled"`
+				Servers map[string]json.RawMessage `json:"servers"`
+			} `json:"mcp"`
+		} `json:"tools"`
+	}
+	if err := json.Unmarshal(configData, &raw); err != nil {
+		return nil
+	}
+	if len(raw.Tools.MCP.Servers) == 0 {
+		return nil
+	}
+	claimed := map[string]bool{}
+	if m != nil {
+		for _, in := range m.Runtime.Integrations {
+			if k := strings.TrimSpace(in.MCPServerKey); k != "" {
+				claimed[k] = true
+			}
+		}
+	}
+	keys := make([]string, 0, len(raw.Tools.MCP.Servers))
+	for k := range raw.Tools.MCP.Servers {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	var results []Result
+	enabled := raw.Tools.MCP.Enabled != nil && *raw.Tools.MCP.Enabled
+	for _, key := range keys {
+		if claimed[key] {
+			continue
+		}
+		if enabled {
+			results = append(results, Result{Status: WARN, Message: fmt.Sprintf("config.json registers tools.mcp.servers.%s but no installed integration provides it; tools.mcp.enabled is on, so the gateway will try to start it and every chat turn fails if it cannot — remove the entry (or reinstall the integration with 'piccolo integration add <package>')", key)})
+			continue
+		}
+		results = append(results, Result{Status: WARN, Message: fmt.Sprintf("config.json registers tools.mcp.servers.%s but no installed integration provides it; the entry is inert while tools.mcp.enabled is off", key)})
 	}
 	return results
 }

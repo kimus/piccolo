@@ -208,7 +208,9 @@ piccolo integration setup kimus/piccolo-gws
 piccolo restart
 
 # later, advance latest-channel integrations
+piccolo integration remove <name>    # undo manifest record + image + registered MCP server; state preserved
 piccolo integration upgrade kimus/piccolo-gws
+piccolo integration remove <name>    # undo manifest record + image + registered MCP server; state preserved
 piccolo integration upgrade        # all latest-channel integrations
 piccolo restart
 

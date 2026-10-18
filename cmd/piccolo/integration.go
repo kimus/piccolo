@@ -58,7 +58,7 @@ var newIntegrationRunner = func() integrationRunner { return docker.New() }
 
 func newIntegrationCmd() *cobra.Command {
 	cmd := &cobra.Command{Use: "integration", Short: "Install and set up containerized integrations"}
-	cmd.AddCommand(newIntegrationAddCmd(), newIntegrationListCmd(), newIntegrationSetupCmd(), newIntegrationUpgradeCmd(), newIntegrationStatusCmd(), newIntegrationRollbackCmd(), newRetiredIntegrationBuildCmd())
+	cmd.AddCommand(newIntegrationAddCmd(), newIntegrationListCmd(), newIntegrationSetupCmd(), newIntegrationUpgradeCmd(), newIntegrationStatusCmd(), newIntegrationRollbackCmd(), newIntegrationRemoveCmd(), newRetiredIntegrationBuildCmd())
 	return rejectUnknownArgs(cmd)
 }
 
