@@ -63,8 +63,8 @@ smoke: build
 	@dir=$$(mktemp -d); \
 	echo "smoke workspace: $$dir"; \
 	./$(BINARY) -D "$$dir" init --yes --name Piccolo --owner Smoke \
-		--purpose personal --agents research --mode terminal \
-		--provider openai --model gpt-5.4 --api-key sk-smoke && \
+		--purpose personal --agents research --no-encrypt \
+		--provider openai --model gpt-5.4 --api-key sk-smokekey123 && \
 	./$(BINARY) -D "$$dir" doctor; \
 	status=$$?; rm -rf "$$dir"; exit $$status
 
