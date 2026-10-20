@@ -104,14 +104,14 @@ func TestDoctorSidecarKeyIsNotAPlaceholderWarning(t *testing.T) {
 		t.Fatalf("unexpected failure: %v", results)
 	}
 	if r := find(results, "placeholder or empty API key"); r != nil {
-		t.Errorf("sidecar-held key warned anyway: %s", r.Message)
+		t.Errorf("sidecar-held key warned anyway: %s", r.Text())
 	}
 	r := find(results, "model: gpt-5.4")
 	if r == nil || r.Status != OK {
 		t.Fatalf("want OK naming the sidecar, got %v", results)
 	}
-	if !strings.Contains(r.Message, ".security.yml") {
-		t.Errorf("OK line does not say which file holds the key: %s", r.Message)
+	if !strings.Contains(r.Text(), ".security.yml") {
+		t.Errorf("OK line does not say which file holds the key: %s", r.Text())
 	}
 	// And the sidecar itself is reported, so a user knows the second file exists.
 	if find(results, "secret sidecar") == nil {
@@ -135,13 +135,13 @@ func TestDoctorWarnsWhenSidecarShadowsConfigJSONKey(t *testing.T) {
 		t.Fatalf("want shadow WARN, got %v", results)
 	}
 	for _, want := range []string{"gpt-5.4:0", "config.json api_keys is ignored"} {
-		if !strings.Contains(r.Message, want) {
-			t.Errorf("message %q missing %q", r.Message, want)
+		if !strings.Contains(r.Text(), want) {
+			t.Errorf("message %q missing %q", r.Text(), want)
 		}
 	}
 	// The warning must never repeat the secret itself.
-	if strings.Contains(r.Message, "sk-sidecar-wins") {
-		t.Errorf("warning leaked a secret value: %s", r.Message)
+	if strings.Contains(r.Text(), "sk-sidecar-wins") {
+		t.Errorf("warning leaked a secret value: %s", r.Text())
 	}
 }
 
@@ -169,8 +169,8 @@ func TestDoctorWarnsWhenSidecarShadowsChannelToken(t *testing.T) {
 		t.Fatalf("want channel shadow WARN, got %v", results)
 	}
 	for _, secret := range []string{"dt-SIDECAR-WINS", "dt-IN-CONFIG"} {
-		if strings.Contains(r.Message, secret) {
-			t.Errorf("shadow warning leaked %q: %s", secret, r.Message)
+		if strings.Contains(r.Text(), secret) {
+			t.Errorf("shadow warning leaked %q: %s", secret, r.Text())
 		}
 	}
 }
@@ -196,8 +196,8 @@ func TestDoctorSidecarEmptyTokenOverridesConfigJSON(t *testing.T) {
 	if r == nil || r.Status != WARN {
 		t.Fatalf("want empty-override WARN, got %v", results)
 	}
-	if !strings.Contains(r.Message, "no token") {
-		t.Errorf("warning must state the consequence: %s", r.Message)
+	if !strings.Contains(r.Text(), "no token") {
+		t.Errorf("warning must state the consequence: %s", r.Text())
 	}
 }
 
@@ -218,7 +218,7 @@ func TestDoctorIdenticalSidecarAndConfigTokenDoesNotWarn(t *testing.T) {
 
 	results := Run(context.Background(), Options{Workspace: dir, Engine: fakeEngine{imageExists: true}})
 	if r := find(results, "is ignored"); r != nil {
-		t.Errorf("matching tokens warned anyway: %s", r.Message)
+		t.Errorf("matching tokens warned anyway: %s", r.Text())
 	}
 	if r := find(results, "channel: discord"); r == nil || r.Status != OK {
 		t.Fatalf("want OK, got %v", results)
@@ -239,8 +239,8 @@ func TestDoctorWarnsWhenSidecarClearsAKey(t *testing.T) {
 		if r == nil || r.Status != WARN {
 			t.Fatalf("body %q: want cleared WARN, got %v", body, results)
 		}
-		if strings.Contains(r.Message, "sk-real-key") {
-			t.Errorf("message leaked the config.json key: %s", r.Message)
+		if strings.Contains(r.Text(), "sk-real-key") {
+			t.Errorf("message leaked the config.json key: %s", r.Text())
 		}
 	}
 }
@@ -255,8 +255,8 @@ func TestDoctorNullSidecarEntryDoesNotShadow(t *testing.T) {
 		t.Fatalf("unexpected failure: %v", results)
 	}
 	for _, r := range results {
-		if strings.Contains(r.Message, "api_keys is ignored") || strings.Contains(r.Message, "lists none") {
-			t.Errorf("null entry read as a shadow: %s", r.Message)
+		if strings.Contains(r.Text(), "api_keys is ignored") || strings.Contains(r.Text(), "lists none") {
+			t.Errorf("null entry read as a shadow: %s", r.Text())
 		}
 	}
 	if r := find(results, "model: gpt-5.4"); r == nil || r.Status != OK {
@@ -281,11 +281,11 @@ func TestDoctorReportsOrphanedSidecarKey(t *testing.T) {
 	if r == nil || r.Status != WARN {
 		t.Fatalf("want orphan WARN, got %v", results)
 	}
-	if !strings.Contains(r.Message, "gpt-5.4:0") {
-		t.Errorf("orphan warning must name the key: %s", r.Message)
+	if !strings.Contains(r.Text(), "gpt-5.4:0") {
+		t.Errorf("orphan warning must name the key: %s", r.Text())
 	}
-	if strings.Contains(r.Message, "sk-orphaned") {
-		t.Errorf("orphan warning leaked a secret: %s", r.Message)
+	if strings.Contains(r.Text(), "sk-orphaned") {
+		t.Errorf("orphan warning leaked a secret: %s", r.Text())
 	}
 	// And the renamed model must be reported as the keyless one it now is.
 	if find(results, `model "renamed" has a placeholder or empty API key`) == nil {
@@ -327,17 +327,17 @@ func TestDoctorChannelTokenFromSidecar(t *testing.T) {
 
 	results := Run(context.Background(), Options{Workspace: dir, Engine: fakeEngine{imageExists: true}})
 	if r := find(results, "has no token in settings"); r != nil {
-		t.Errorf("sidecar-held channel token warned anyway: %s", r.Message)
+		t.Errorf("sidecar-held channel token warned anyway: %s", r.Text())
 	}
 	r := find(results, "channel: discord")
 	if r == nil || r.Status != OK {
 		t.Fatalf("want OK channel line, got %v", results)
 	}
-	if !strings.Contains(r.Message, ".security.yml") {
-		t.Errorf("channel line must say where the token is: %s", r.Message)
+	if !strings.Contains(r.Text(), ".security.yml") {
+		t.Errorf("channel line must say where the token is: %s", r.Text())
 	}
-	if strings.Contains(r.Message, "dt-from-sidecar") {
-		t.Errorf("channel line leaked the token: %s", r.Message)
+	if strings.Contains(r.Text(), "dt-from-sidecar") {
+		t.Errorf("channel line leaked the token: %s", r.Text())
 	}
 }
 
@@ -363,8 +363,8 @@ func TestDoctorSentinelWithoutSidecarValue(t *testing.T) {
 	if r == nil || r.Status != WARN {
 		t.Fatalf("want sentinel WARN naming the gap, got %v", results)
 	}
-	if !strings.Contains(r.Message, ".security.yml") {
-		t.Errorf("sentinel warning must name the sidecar: %s", r.Message)
+	if !strings.Contains(r.Text(), ".security.yml") {
+		t.Errorf("sentinel warning must name the sidecar: %s", r.Text())
 	}
 }
 
@@ -388,13 +388,13 @@ func TestDoctorNoSidecarStaysClean(t *testing.T) {
 	}
 	for _, r := range results {
 		for _, bad := range []string{"sidecar", ".security.yml", "overridden", "matches no model_list"} {
-			if strings.Contains(r.Message, bad) {
-				t.Errorf("no-sidecar workspace mentioned %q: %s", bad, r.Message)
+			if strings.Contains(r.Text(), bad) {
+				t.Errorf("no-sidecar workspace mentioned %q: %s", bad, r.Text())
 			}
 		}
 	}
 	// The generated key still reads as a key.
-	if r := find(results, "model: gpt-5.4"); r == nil || r.Status != OK || strings.Contains(r.Message, "security.yml") {
+	if r := find(results, "model: gpt-5.4"); r == nil || r.Status != OK || strings.Contains(r.Text(), "security.yml") {
 		t.Errorf("plain config.json key mis-reported: %v", results)
 	}
 }
@@ -423,10 +423,10 @@ func TestDoctorDuplicateAliasesResolvePerEntry(t *testing.T) {
 		// Count the per-entry lines only: "default model: gpt-5.4" and the image
 		// model line name the same alias and are not statements about its key. Only
 		// the per-entry line carries "(<model id>)" after the alias.
-		if strings.Contains(r.Message, "model: gpt-5.4 (") && r.Status == OK {
+		if strings.Contains(r.Text(), "model: gpt-5.4 (") && r.Status == OK {
 			okLines++
 		}
-		if strings.Contains(r.Message, "placeholder or empty API key") {
+		if strings.Contains(r.Text(), "placeholder or empty API key") {
 			warnLines++
 		}
 	}
@@ -489,7 +489,7 @@ func TestDoctorStillAcceptsRealCredentialShapes(t *testing.T) {
 		})
 		results := Run(context.Background(), Options{Workspace: dir, Engine: fakeEngine{imageExists: true}})
 		if r := find(results, "placeholder or empty API key"); r != nil {
-			t.Errorf("%q was flagged as a placeholder: %s", real, r.Message)
+			t.Errorf("%q was flagged as a placeholder: %s", real, r.Text())
 		}
 		if find(results, "model: gpt-5.4") == nil {
 			t.Errorf("%q: model line missing entirely: %v", real, results)
@@ -520,8 +520,8 @@ func TestDoctorChecksSecondaryChannelSecrets(t *testing.T) {
 			t.Errorf("field %q: no placeholder warning — the credential list does not reach it: %v", field, results)
 			continue
 		}
-		if !strings.Contains(r.Message, fmt.Sprintf("%q", field)) {
-			t.Errorf("field %q: warning does not name the field: %s", field, r.Message)
+		if !strings.Contains(r.Text(), fmt.Sprintf("%q", field)) {
+			t.Errorf("field %q: warning does not name the field: %s", field, r.Text())
 		}
 	}
 }
@@ -538,11 +538,11 @@ func TestDoctorReportsCredentialDeliveryState(t *testing.T) {
 		t.Fatalf("healthy encrypted workspace not reported OK: %v", results)
 	}
 	// The honest half: it must say the passphrase sits in a committed file.
-	if r := find(results, "credential encryption"); !strings.Contains(r.Message, "committed") {
-		t.Errorf("encryption line omits the piccolo.yaml exposure: %s", r.Message)
+	if r := find(results, "credential encryption"); !strings.Contains(r.Text(), "committed") {
+		t.Errorf("encryption line omits the piccolo.yaml exposure: %s", r.Text())
 	}
 	if r := find(results, "placeholder or empty API key"); r != nil {
-		t.Errorf("the enc:// value was judged an empty key: %s", r.Message)
+		t.Errorf("the enc:// value was judged an empty key: %s", r.Text())
 	}
 
 	// Passphrase removed from piccolo.yaml.
@@ -554,8 +554,8 @@ func TestDoctorReportsCredentialDeliveryState(t *testing.T) {
 	}
 	// Never phrase it as a broken config file: that sends the user to the wrong
 	// file, which is the misdirection this check exists to remove.
-	if strings.Contains(r.Message, "does not parse") || strings.Contains(r.Message, "malformed") {
-		t.Errorf("misattributed to config.json: %s", r.Message)
+	if strings.Contains(r.Text(), "does not parse") || strings.Contains(r.Text(), "malformed") {
+		t.Errorf("misattributed to config.json: %s", r.Text())
 	}
 	if Failed(results) {
 		t.Error("a missing passphrase must warn, not fail: doctor stays a report, serve is the gate")
@@ -570,8 +570,8 @@ func TestDoctorReportsCredentialDeliveryState(t *testing.T) {
 	if r == nil || r.Status != WARN {
 		t.Fatalf("missing key file not warned: %v", results)
 	}
-	if !strings.Contains(r.Message, "derives its AES key") {
-		t.Errorf("warning should explain why the file matters: %s", r.Message)
+	if !strings.Contains(r.Text(), "derives its AES key") {
+		t.Errorf("warning should explain why the file matters: %s", r.Text())
 	}
 }
 
@@ -581,10 +581,10 @@ func TestDoctorSilentOnUnencryptedWorkspace(t *testing.T) {
 	dir := initWorkspace(t)
 	results := Run(context.Background(), Options{Workspace: dir, Engine: fakeEngine{imageExists: true}, LookupEnv: func(string) (string, bool) { return "", false }})
 	if r := find(results, "credential encryption"); r != nil {
-		t.Errorf("plaintext workspace got an encryption finding: %s", r.Message)
+		t.Errorf("plaintext workspace got an encryption finding: %s", r.Text())
 	}
 	if r := find(results, "enc://"); r != nil {
-		t.Errorf("plaintext workspace was warned about enc://: %s", r.Message)
+		t.Errorf("plaintext workspace was warned about enc://: %s", r.Text())
 	}
 }
 
@@ -613,8 +613,8 @@ func TestDoctorNeverPrintsCredentialValues(t *testing.T) {
 		results := Run(context.Background(), Options{Workspace: dir, Engine: fakeEngine{imageExists: true}, LookupEnv: lookup})
 		for _, r := range results {
 			for _, forbidden := range []string{secret, "sk-SIDECAR-SECRET", "pw"} {
-				if strings.Contains(r.Message, forbidden) {
-					t.Errorf("%s: output leaked %q: %s", name, forbidden, r.Message)
+				if strings.Contains(r.Text(), forbidden) {
+					t.Errorf("%s: output leaked %q: %s", name, forbidden, r.Text())
 				}
 			}
 		}
@@ -638,12 +638,12 @@ func TestDoctorReportsDeadReadableCopyOwnedByOverlay(t *testing.T) {
 		t.Fatalf("dead duplicate not reported: %v", results)
 	}
 	for _, want := range []string{"never loaded", "secrets encrypt", "gpt-5.4:0"} {
-		if !strings.Contains(r.Message, want) {
-			t.Errorf("message must contain %q: %s", want, r.Message)
+		if !strings.Contains(r.Text(), want) {
+			t.Errorf("message must contain %q: %s", want, r.Text())
 		}
 	}
-	if strings.Contains(r.Message, "sk-DEAD-DUPLICATE") {
-		t.Errorf("warning leaked the credential value: %s", r.Message)
+	if strings.Contains(r.Text(), "sk-DEAD-DUPLICATE") {
+		t.Errorf("warning leaked the credential value: %s", r.Text())
 	}
 
 	// Once the dead copy is gone, neither the duplicate warning nor a false
@@ -657,7 +657,7 @@ func TestDoctorReportsDeadReadableCopyOwnedByOverlay(t *testing.T) {
 		t.Errorf("finding persisted after the copy was removed: %v", results)
 	}
 	if r := find(results, "placeholder or empty API key"); r != nil {
-		t.Errorf("overlay-only key wrongly called keyless: %s", r.Message)
+		t.Errorf("overlay-only key wrongly called keyless: %s", r.Text())
 	}
 	if r := find(results, "key from picoclaw/.security.yml"); r == nil || r.Status != OK {
 		t.Errorf("overlay-only key not reported as present: %v", results)
@@ -710,10 +710,10 @@ func TestDoctorWarnsOnReadablePlaintextConfig(t *testing.T) {
 	if r == nil {
 		t.Fatalf("readable plaintext config.json not reported")
 	}
-	if !strings.Contains(r.Message, "picoclaw/config.json") {
-		t.Errorf("warning must name the file by relative path: %s", r.Message)
+	if !strings.Contains(r.Text(), "picoclaw/config.json") {
+		t.Errorf("warning must name the file by relative path: %s", r.Text())
 	}
-	if strings.Contains(r.Message, "sk-real-key") {
+	if strings.Contains(r.Text(), "sk-real-key") {
 		t.Error("warning leaked the credential value")
 	}
 	// Healing it clears the finding.
@@ -734,7 +734,7 @@ func TestDoctorQuietOnReadableEncryptedConfig(t *testing.T) {
 		t.Fatal(err)
 	}
 	if r := findMsg(t, dir, "holds a plaintext credential"); r != nil {
-		t.Errorf("warned about a file that carries no plaintext: %s", r.Message)
+		t.Errorf("warned about a file that carries no plaintext: %s", r.Text())
 	}
 }
 
@@ -750,10 +750,10 @@ func TestDoctorWarnsOnReadableBackupHoldingPlaintext(t *testing.T) {
 	if r == nil {
 		t.Fatal("readable backup holding a plaintext key not reported")
 	}
-	if !strings.Contains(r.Message, "config.json.bak") {
-		t.Errorf("warning must name the backup: %s", r.Message)
+	if !strings.Contains(r.Text(), "config.json.bak") {
+		t.Errorf("warning must name the backup: %s", r.Text())
 	}
-	if strings.Contains(r.Message, "sk-old-plain") {
+	if strings.Contains(r.Text(), "sk-old-plain") {
 		t.Error("warning leaked the credential value")
 	}
 }
@@ -767,7 +767,7 @@ func TestDoctorDoesNotCallAPlaceholderACredential(t *testing.T) {
 		t.Fatal(err)
 	}
 	if r := findMsg(t, dir, "holds a plaintext credential"); r != nil {
-		t.Errorf("placeholder reported as a credential: %s", r.Message)
+		t.Errorf("placeholder reported as a credential: %s", r.Text())
 	}
 }
 
@@ -792,8 +792,8 @@ func TestDoctorWarnsOnOrphanedMCPServerEntry(t *testing.T) {
 	if r == nil {
 		t.Fatal("orphaned server entry not reported")
 	}
-	if !strings.Contains(r.Message, "every chat turn fails") {
-		t.Errorf("must state the consequence, not just the mismatch: %s", r.Message)
+	if !strings.Contains(r.Text(), "every chat turn fails") {
+		t.Errorf("must state the consequence, not just the mismatch: %s", r.Text())
 	}
 
 	// Same entry with the toggle off is inert, and must be described that way rather
@@ -803,8 +803,8 @@ func TestDoctorWarnsOnOrphanedMCPServerEntry(t *testing.T) {
 	if r == nil {
 		t.Fatal("orphaned entry not reported while disabled")
 	}
-	if strings.Contains(r.Message, "chat turn fails") {
-		t.Errorf("claimed a failure that cannot happen while the tool is off: %s", r.Message)
+	if strings.Contains(r.Text(), "chat turn fails") {
+		t.Errorf("claimed a failure that cannot happen while the tool is off: %s", r.Text())
 	}
 
 	// An entry a recorded integration does claim is normal, not an orphan.
@@ -818,6 +818,6 @@ func TestDoctorWarnsOnOrphanedMCPServerEntry(t *testing.T) {
 		t.Fatal(err)
 	}
 	if r := findMsg(t, dir, "no installed integration provides it"); r != nil {
-		t.Errorf("a properly installed integration was reported as an orphan: %s", r.Message)
+		t.Errorf("a properly installed integration was reported as an orphan: %s", r.Text())
 	}
 }

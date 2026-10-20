@@ -66,7 +66,7 @@ func TestGeneratedProvenanceCustomisedIsSilentAndNotStale(t *testing.T) {
 	writeSkill(t, dir, "as generated plus the user's own line")
 	results := checkGeneratedProvenance(dir)
 	for _, r := range results {
-		if strings.Contains(r.Message, "predates the current template") || r.Status == WARN {
+		if strings.Contains(r.Text(), "predates the current template") || r.Status == WARN {
 			t.Fatalf("a customised file must not be reported as stale or warned: %+v", results)
 		}
 	}
@@ -95,8 +95,8 @@ func TestGeneratedProvenanceStaleNamesTheSource(t *testing.T) {
 		t.Errorf("stale is a warning, not a failure: %v", stale.Status)
 	}
 	for _, want := range []string{"piccolo setup", "internal/generate/templates.go", "not in the copy"} {
-		if !strings.Contains(stale.Message, want) {
-			t.Errorf("stale message missing %q: %q", want, stale.Message)
+		if !strings.Contains(stale.Text(), want) {
+			t.Errorf("stale message missing %q: %q", want, stale.Text())
 		}
 	}
 	if Failed(results) {
@@ -214,11 +214,11 @@ func TestGitignoreHygieneReportsMissingEntries(t *testing.T) {
 	if warn.Status != WARN || Failed(results) {
 		t.Errorf("a missing ignore rule is a warning, never a failure: %+v", *warn)
 	}
-	if !strings.Contains(warn.Message, generate.GitignoreOSMetadata) {
-		t.Errorf("report must name the rule: %q", warn.Message)
+	if !strings.Contains(warn.Text(), generate.GitignoreOSMetadata) {
+		t.Errorf("report must name the rule: %q", warn.Text())
 	}
-	if !strings.Contains(warn.Message, "piccolo init") {
-		t.Errorf("report must name the remedy: %q", warn.Message)
+	if !strings.Contains(warn.Text(), "piccolo init") {
+		t.Errorf("report must name the remedy: %q", warn.Text())
 	}
 	if len(results) != 1 {
 		t.Errorf("several missing rules must collapse to one line, got %d", len(results))
@@ -248,8 +248,8 @@ func TestDoctorRunIncludesGitignoreCheck(t *testing.T) {
 	r := find(results, "workspace .gitignore is missing")
 	if r == nil {
 		t.Errorf("Run must surface the missing OS-metadata rule: %+v", results)
-	} else if !strings.Contains(r.Message, generate.GitignoreOSMetadata) {
-		t.Errorf("Run report must name the rule: %q", r.Message)
+	} else if !strings.Contains(r.Text(), generate.GitignoreOSMetadata) {
+		t.Errorf("Run report must name the rule: %q", r.Text())
 	}
 }
 
@@ -265,8 +265,8 @@ func TestProvenanceNamesTheLegacyFileWhenFound(t *testing.T) {
 	if r == nil {
 		t.Fatalf("legacy record not reported: %+v", results)
 	}
-	if !strings.Contains(r.Message, generate.LegacyFileName) {
-		t.Errorf("message must name the file it found: %s", r.Message)
+	if !strings.Contains(r.Text(), generate.LegacyFileName) {
+		t.Errorf("message must name the file it found: %s", r.Text())
 	}
 	if r.Status == FAIL {
 		t.Error("a renamed record is informational, never a failure")

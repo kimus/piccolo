@@ -189,7 +189,7 @@ setup:                                      # optional non-secret setup metadata
 
 Interactive wizard: assistant name, owner, purpose template, specialist agents (research/planner/coder/ops), whether to expose the optional web console, model provider + API key, tool toggles (web search default on, shell exec default off), workspace path.
 
-The PicoClaw gateway always runs; the **web console** is an optional add-on. It is recorded purely by the `:18800` binding in `piccolo.yaml` — to enable it later, set `container.image` to the `:launcher` tag and add `"127.0.0.1:18800:18800"` to `container.ports`; to disable it, use the pinned gateway image and remove that binding. `piccolo doctor` warns if a `:18800` binding is paired with a non-launcher image.
+The PicoClaw gateway always runs; the **web console** is an optional add-on. It is recorded purely by the `:18800` binding in `piccolo.yaml` — to enable it later, set `container.image` to the `:launcher` tag and add `"127.0.0.1:18800:18800"` to `container.ports`; to disable it, use the pinned gateway image and remove that binding. `piccolo doctor` warns if a `:18800` binding is paired with a non-launcher image, and also checks the channel the console's chat actually rides on (see [`piccolo doctor`](#piccolo-doctor)).
 
 - Create-only: existing files are never overwritten without explicit per-file confirmation.
 - Non-interactive flags (`--name`, `--owner`, `--purpose`, `--yes`, ...) are supported for scripting.
@@ -337,13 +337,16 @@ piccolo runs: call X  → answers on STDIN · NDJSON events on STDOUT · logs on
 - **Config writes are Piccolo's.** An integration *proposes* a `configPatch`; Piccolo validates it against a fixed allowlist (only that integration's `tools.mcp.servers.<key>` entry), shows a diff, asks for confirmation, then writes `config.json.bak` and the file atomically. A patch reaching any other path is refused. That confinement is deliberate — an integration must not be able to flip tool toggles — so Piccolo owns the one toggle registration depends on, `tools.mcp.enabled`, and writes it only after it has verified the server itself.
 - **Headless** (no TTY, CI): Piccolo refuses rather than hanging, so setup stays deterministic.
 
-A registered integration is not automatically a usable one, and nothing used to say the difference out loud. Two gates stand between a server entry and a tool the model can call: `tools.mcp.enabled` (PicoClaw returns from MCP initialization before it reads the servers map while it is false, and it defaults to false), and a `tools:` line in an agent's `AGENT.md` — which PicoClaw treats as a strict, exact-name allowlist, while MCP tools are named `mcp_<server>_<tool>` only at runtime, so no written-out list can contain them. Piccolo generates the coordinator with **no `tools:` allowlist** so every tool `config.json` enables reaches it (specialists keep their reduced lists), and it verifies the handshake before the toggle is ever turned on: each registered server's recorded stdio command is started in a one-shot container, given one `initialize` request, and judged on the first line it writes back. Only a JSON-RPC result enables the tool — **on both paths**, `piccolo integration setup` applying a server entry and `piccolo setup` → Tools flipping the toggle by hand, because a manual enable is the one that can leave you with a verified-good image and a stale container. `piccolo doctor` reports the result as a status line — `[OK] mcp: 1 server(s) reachable by coordinator "main" (…)` — or names whichever gate is closed, and warns when an integration in `piccolo.yaml` was installed but never registered at all.
+A registered integration is not automatically a usable one, and nothing used to say the difference out loud. Two gates stand between a server entry and a tool the model can call: `tools.mcp.enabled` (PicoClaw returns from MCP initialization before it reads the servers map while it is false, and it defaults to false), and a `tools:` line in an agent's `AGENT.md` — which PicoClaw treats as a strict, exact-name allowlist, while MCP tools are named `mcp_<server>_<tool>` only at runtime, so no written-out list can contain them. Piccolo generates the coordinator with **no `tools:` allowlist** so every tool `config.json` enables reaches it (specialists keep their reduced lists), and it verifies the handshake before the toggle is ever turned on: each registered server's recorded stdio command is started in a one-shot container, given one `initialize` request, and judged on the first line it writes back. Only a JSON-RPC result enables the tool — **on both paths**, `piccolo integration setup` applying a server entry and `piccolo setup` → Tools flipping the toggle by hand, because a manual enable is the one that can leave you with a verified-good image and a stale container. `piccolo doctor` reports the result as a status line — `✔ ok mcp: 1 server(s) reachable by coordinator "main" (…)` — or names whichever gate is closed, and warns when an integration in `piccolo.yaml` was installed but never registered at all.
 
 The toggle is withheld rather than forced, because an enabled MCP tool with an unreachable server is worse than a disabled one: PicoClaw fails the **whole turn** when a registered server cannot initialize, so every chat message errors, not just the ones asking about that integration. One real example: `piccolo-gws` 0.3.4 accepted both framings on stdin but answered with LSP-style `Content-Length:` headers, which the MCP transport PicoClaw uses cannot read (`invalid character 'C' looking for beginning of value`); 0.3.5 answers one JSON line per message. That bug came back a second way worth knowing about: after upgrading, the **new image** handshook perfectly while the **still-running container** held the 0.3.4 binary, and chat failed anyway — because `integration add` bakes an image and rewrites `container.image`, but only a restart swaps the running binaries, while `config.json` is re-read immediately. So the enable check probes every image that could serve the toggle (the manifest's and the running container's), and both `piccolo doctor` and `piccolo status` now report the running container's image against `piccolo.yaml`:
 
 ```text
-[OK]   running container image: piccolo/picoclaw-runtime:cd4c6f2a1baa
-[WARN] container "piccolo-gateway" serves image piccolo/picoclaw-runtime:5f6018fa00b8, but piccolo.yaml names …:cd4c6f2a1baa — the running gateway holds the OLD integration binaries while config.json is re-read immediately; run 'piccolo restart' before enabling anything the new image provides
+✔ ok   running container image: piccolo/picoclaw-runtime:cd4c6f2a1baa
+⚠ warn container "piccolo-gateway" serves image piccolo/picoclaw-runtime:5f6018fa00b8, but
+       piccolo.yaml names …:cd4c6f2a1baa
+       → the running gateway holds the OLD integration binaries while config.json is re-read
+         immediately; run 'piccolo restart' before enabling anything the new image provides
 ```
 
 If the verification fails on the manual path, Piccolo prints every failing server with its reason, says plainly that enabling anyway means all chat traffic fails, and asks — defaulting to keeping MCP off. On the registration path the server entry is still written, because it is the integration's own configuration output and worth keeping; only the enablement is withheld. If there is no daemon to ask, Piccolo reports the check as unverifiable rather than passing it silently.
@@ -376,7 +379,7 @@ Be clear about what that buys, because it is less than `enc://` alone would sugg
 
 - **`.security.yml` is not exempt.** PicoClaw's overlay overrides `config.json` field by field, so an encrypted `config.json` next to a plaintext `.security.yml` is a workspace that only looks encrypted — the gateway loads the plaintext. `piccolo secrets encrypt` seals the overlay's credential values too, in place, leaving every other node and comment intact. It never creates the file: a workspace without one is already in the good state, and it appears only when PicoClaw itself saves.
 - `piccolo secrets check` answers the question a workspace cannot otherwise ask: whether the passphrase and key file present right now can actually decrypt what `config.json` holds. Run it before `serve`, because a credential that cannot be decrypted is a gateway that exits on startup, not one that degrades.
-- **`.security.yml` outranks `config.json`.** Any save through PicoClaw itself — the web console, `picoclaw model add`, a version migration — moves every credential out of `config.json` into `picoclaw/.security.yml`, which PicoClaw then merges back over `config.json` on load, per field, and wins. So a key that is no longer visible in `config.json` is usually not missing, and a key that *is* visible there may be dead. Piccolo reads that file to tell the two apart: `piccolo doctor` judges every model and channel key by whichever file actually governs it, and `piccolo setup` refuses to write a credential into a field the sidecar overrides — naming the sidecar key to edit instead, because a secret stored where the gateway will not read it is a silent failure with a fresh token in it. Piccolo never creates, edits, or prints `.security.yml`; it is PicoClaw's file and may hold `enc://` values Piccolo cannot decrypt.
+- **`.security.yml` outranks `config.json`.** Any save through PicoClaw itself — the web console, `picoclaw model add`, a version migration — moves every credential out of `config.json` into `picoclaw/.security.yml`, which PicoClaw then merges back over `config.json` on load, per field, and wins. So a key that is no longer visible in `config.json` is usually not missing, and a key that *is* visible there may be dead. Piccolo reads that file to tell the two apart: `piccolo doctor` judges every model and channel key by whichever file actually governs it, and `piccolo setup` refuses to write a credential into a field the sidecar overrides — naming the sidecar key to edit instead, because a secret stored where the gateway will not read it is a silent failure with a fresh token in it. Piccolo never creates, edits, or prints `.security.yml`; it is PicoClaw's file and may hold `enc://` values Piccolo cannot decrypt. Doctor reports the two states of that file that look identical from `config.json`: a credential parked for a channel you switched off (an `[OK]` line naming the file), and a credential for a channel `config.json` no longer lists at all — a `[WARN]`, because PicoClaw re-adds the entry when it merges the sidecar, so deleting a channel does not drop the secret that guards it, and Piccolo cannot remove it for you.
 - If the gateway container is running afterwards, setup reminds you to `piccolo reload` (config.json) or `piccolo restart` (piccolo.yaml).
 
 #### Models
@@ -520,25 +523,88 @@ The relevant agent `AGENT.md` frontmatter must also include `load_image`, `exec`
 
 ### `piccolo doctor`
 
-Validates the setup and prints `[OK]` / `[WARN]` / `[FAIL]` lines:
+Validates the setup and prints one line per finding, **grouped into the five parts of a
+setup**, in the order a broken workspace is worth debugging — the layer everything else
+rides on comes first:
+
+| section | the question it answers |
+|---|---|
+| **Environment** | is Docker up, is the image here, is it current, is the container the one `piccolo.yaml` names |
+| **Workspace** | `piccolo.yaml`, the directory layout, `.gitignore`, and the record of what Piccolo generated |
+| **Credentials** | the secret sidecar, `enc://` values, the passphrase, the key file, file permissions, exec posture |
+| **Assistant** | `config.json`, agents, models, image understanding |
+| **Channels & integrations** | channels, the web console's chat, installed integrations, MCP reachability |
+
+A section that produced nothing prints **no heading**. Many checks are deliberately silent
+(env references, a stale container, MCP with nothing installed, a console with no `pico`
+entry), and an empty heading would advertise a problem where the code decided there was none.
+
+On a terminal each line leads with a glyph **and** the word — `✔ ok`, `⚠ warn`, `✖ fail`.
+Neither form is colour-only or glyph-only: piped, `NO_COLOR`, and `TERM=dumb` output keeps
+the `[OK]` / `[WARN]` / `[FAIL]` markers this command has always printed, so `grep '\[FAIL\]'`
+still means what it did. The remedy of a finding is stored separately from the condition, so
+it gets its own `→` line instead of being appended to a paragraph, and long lines wrap at the
+terminal width with a hanging indent (piped output is never wrapped — one finding per line,
+so it stays copyable and diffable).
 
 ```text
-[OK]   docker daemon reachable
-[OK]   image present: docker.io/sipeed/picoclaw:v0.3.1
-[OK]   workspace: .
-[OK]   manifest: piccolo.yaml
-[OK]   picoclaw config: config.json (schema v3)
-[OK]   generated files: 7 as generated by piccolo 0.3.0
-[WARN] generated file predates the current template: picoclaw/skills/file-handling/SKILL.md — refresh with 'piccolo setup' (fix belongs in internal/generate/templates.go:FileHandlingSkillMD, not in the copy)
-[OK]   agent: main (default)
-[OK]   model: gpt-5.4 (gpt-5.4)
-[OK]   default model: gpt-5.4
-[WARN] model "gpt-5.4" has placeholder API key
-[FAIL] agents.defaults.model_fallbacks[0] references model "old-free-model" missing from model_list
-[FAIL] missing agent file: picoclaw/agents/research/AGENT.md
+Environment
+✔ ok   docker daemon reachable
+✔ ok   image present: docker.io/sipeed/picoclaw:v0.3.1
+⚠ warn runtime image retention: 2 unreferenced runtime image(s), up to 9.8GB
+       → reclaim with 'piccolo image prune' (keeps the image in use and the rollback target);
+         Piccolo never deletes images on its own
+
+Workspace
+✔ ok   manifest: piccolo.yaml
+✔ ok   workspace layout: structured
+⚠ warn generated file predates the current template: picoclaw/skills/file-handling/SKILL.md
+       → refresh with 'piccolo setup' (fix belongs in internal/generate/templates.go:
+         FileHandlingSkillMD, not in the copy)
+
+Credentials
+✔ ok   secret sidecar: picoclaw/.security.yml
+       → secure fields here override config.json
+⚠ warn piccolo.yaml is readable by group/others (644) and holds the enc:// passphrase
+       → chmod 600 piccolo.yaml
+⚠ warn picoclaw/.security.yml apodex-1.1-mini:0 matches no model_list entry
+       → a model renamed or deleted in config.json leaves its key behind here
+
+Assistant
+✔ ok   picoclaw config: config.json (schema v3)
+✔ ok   agent: main (default)
+✖ fail agent "research": missing agent file: …/picoclaw/agents/research/AGENT.md
+⚠ warn model "gpt-5.4" has a placeholder or empty API key
+
+Channels & integrations
+✔ ok   mcp: 1 server(s) reachable by coordinator "main" (google_workspace)
+⚠ warn web console chat: channel "pico" is disabled, so the gateway mounts no /pico/ handler
+       → the dashboard opens and logs in but cannot chat; enable it ('piccolo setup' → Channels),
+         or restart the console, whose launcher re-enables it and rewrites config.json
+
+⚠ warn doctor: 1 blocking, 5 to look at, 10 ok
 ```
 
-Exit code is non-zero only on `[FAIL]`; warnings never fail.
+The last line is the whole verdict, and it is the only line `piccolo doctor` exists to
+answer.
+
+- `--compact` prints findings only. A passing section still gets its heading and a line
+  saying how many checks it held, because a report that dropped headings would hide which
+  checks ran at all.
+- `--json` emits the same grouping structurally (`sections[].name`, `results[].status /
+message / hint`) plus a `summary`, so a script never has to re-derive it from prose.
+
+**A Docker daemon that will not answer is one finding, not a reason to stop.** Earlier
+behaviour printed `docker daemon not reachable` and nothing else, which hid the half of the
+answer you can act on while Docker is starting: whether the workspace itself is intact.
+Now every file and config check still runs, the Docker-dependent checks stay silent (the
+daemon was never asked, so an absence is not evidence), and the exit code is still non-zero.
+
+Exit code is non-zero only on `✖ fail` / `[FAIL]`; warnings never fail.
+
+**A disabled channel is never a warning.** PicoClaw does not construct a channel, mount its HTTP handler, or open any connection while its entry is off, so "off" is the absence of a configuration rather than a broken one. Doctor only distinguishes *why* an entry is off: one that still holds a credential (in `config.json`, in `picoclaw/.security.yml`, or both) was configured and switched off, and gets its own `[OK]` line naming where the credential is parked; empty ones are almost certainly PicoClaw's own defaults, which it serializes for every channel type it knows whenever anything saves through the gateway. Those collapse into one line, because deleting them is undone by the next save and a per-channel line would imply each one is a thing to look at.
+
+The console's chat is the exception worth a warning: the dashboard proxies its websocket to the gateway's `pico` channel, so `piccolo.yaml` can look perfectly configured (`:18800` published, launcher image, gateway healthy) while the chat page connects to nothing. Doctor checks that channel's state, and stays quiet when no `pico` entry exists at all — the launcher creates and enables its own on first startup.
 
 ### `piccolo serve` / `piccolo restart`
 

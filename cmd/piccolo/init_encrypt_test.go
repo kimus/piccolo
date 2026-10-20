@@ -287,11 +287,11 @@ func TestDoctorWarnsOnReadableManifestWithPassphrase(t *testing.T) {
 	if r == nil {
 		t.Fatalf("readable manifest with a passphrase not reported: %v", res)
 	}
-	if strings.Contains(r.Message, "horse") {
+	if strings.Contains(r.Text(), "horse") {
 		t.Error("warning leaked the passphrase")
 	}
-	if !strings.Contains(r.Message, "chmod 600") {
-		t.Errorf("warning must carry the remedy: %s", r.Message)
+	if !strings.Contains(r.Text(), "chmod 600") {
+		t.Errorf("warning must carry the remedy: %s", r.Text())
 	}
 
 	// Tightening it must clear the finding.

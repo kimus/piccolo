@@ -109,17 +109,34 @@ func (s styler) Crashf(format string, a ...any) string {
 func (s styler) Okf(format string, a ...any) string    { return s.report("ok", fmt.Sprintf(format, a...)) }
 func (s styler) Mutedf(format string, a ...any) string { return s.muted(fmt.Sprintf(format, a...)) }
 
-// doctorStatus renders a doctor result prefix with the same vocabulary as the
-// setup flow, so one problem looks like one thing wherever it is reported.
-func (s styler) doctorStatus(marker string) string {
-	switch marker {
-	case "[OK]":
-		return s.severity("ok", marker)
-	case "[WARN]":
-		return s.severity("warn", marker)
-	case "[FAIL]":
-		return s.severity("fail", marker)
-	default:
-		return marker
+// doctorMark renders the severity column of a doctor line.
+//
+// On a terminal it is a glyph AND the word (`✔ ok`); anywhere else it is the
+// bracket form this command has always printed (`[OK]`). Both carry the word,
+// because a glyph alone is the never-colour-only rule broken in miniature: on a
+// font missing the codepoint the line becomes a box or a question mark, and
+// "is this the problem or the proof" is the one distinction this whole report
+// exists to make. Keeping the brackets when the output is piped also means
+// `grep '\[FAIL\]'` still means what it always did.
+//
+// The returned string is padded to markerWidth runes so the condition text starts
+// at one column for every line, and colour wraps the padded text: the escapes are
+// invisible to alignment but not to a terminal that would otherwise left-justify
+// the next field.
+func (s styler) doctorMark(word, marker string) string {
+	text := marker
+	if s.enabled {
+		glyph := "✔"
+		switch word {
+		case "warn":
+			glyph = "⚠"
+		case "fail":
+			glyph = "✖"
+		}
+		text = glyph + " " + word
 	}
+	if r := []rune(text); len(r) < markerWidth {
+		text += strings.Repeat(" ", markerWidth-len(r))
+	}
+	return s.severity(word, text)
 }

@@ -166,7 +166,7 @@ Doctor and status SHALL report an encrypted workspace's delivery state, and ever
 
 #### Scenario: Healthy encrypted workspace
 - **WHEN** `config.json` holds `enc://` values, `secrets.passphrase` is set, and the key file is readable
-- **THEN** doctor reports an `[OK]` line, and states that the passphrase sits in a file the workspace commits
+- **THEN** doctor reports a passing line for it, and states that the passphrase sits in a file the workspace commits
 - **AND** does not report the ciphertext as a placeholder or empty key
 
 #### Scenario: Passphrase variable unset

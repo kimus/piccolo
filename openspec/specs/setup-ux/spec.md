@@ -463,3 +463,49 @@ Piccolo warns when a credential is still an unfilled template. The detection SHA
 #### Scenario: Turning it on with credentials already encrypted
 - **WHEN** a user enables encryption on a workspace that is already encrypted
 - **THEN** setup reports that there is nothing left to encrypt rather than rewriting or failing
+
+### Requirement: Doctor's report is grouped, marked, and separates remedy from finding
+`piccolo doctor` SHALL group its findings into the parts of a setup they describe — Environment, Workspace, Credentials, Assistant, Channels & integrations — printed in that order, and SHALL render each finding's remedy apart from its condition. Grouping SHALL be declared by the check that produced the result and SHALL NOT be inferred from message text. The report SHALL stay readable without colour or glyphs: on a terminal a line leads with a glyph and the severity word, and piped or `NO_COLOR` output keeps the bracketed markers.
+
+#### Scenario: A section with no findings prints no heading
+- **WHEN** every check in a section stayed silent (no env references, no stale container, no installed integration)
+- **THEN** the report prints no heading for that section, because an empty heading would claim a problem the code decided not to claim
+
+#### Scenario: The condition and the remedy are two lines
+- **WHEN** a warning has both a condition and an action
+- **THEN** the condition is the finding line and the action follows on its own indented remedy line
+- **AND** searching the result still matches either half
+
+#### Scenario: A pipe keeps the text markers
+- **WHEN** the report is written to a pipe, a file, or with `NO_COLOR` set
+- **THEN** severity is carried by `[OK]` / `[WARN]` / `[FAIL]` as before, with no escape sequences, and lines are not wrapped
+
+#### Scenario: A terminal gets the glyph and the word
+- **WHEN** the report is written to a terminal
+- **THEN** each line leads with a glyph AND the severity word, so a font missing the codepoint still reads
+
+#### Scenario: Long findings wrap only on a screen
+- **WHEN** a finding exceeds the terminal width
+- **THEN** it wraps with a hanging indent that keeps every path, image reference, and quoted command copyable
+
+#### Scenario: Passing checks are folded on request, never by default
+- **WHEN** the user asks for compact output
+- **THEN** findings are shown and passing checks are folded to a count, under a heading that still names the section
+- **AND** without that flag every check is listed, because a silent failure needs a positive statement to be trustworthy
+
+#### Scenario: Machine consumers get the same structure
+- **WHEN** the user asks for JSON output
+- **THEN** sections, statuses, conditions, and remedies arrive as fields rather than as prose to parse
+
+### Requirement: Doctor asks the daemon once, concurrently
+`piccolo doctor` SHALL gather the Docker daemon's answers in one snapshot, probed concurrently, and its checks SHALL judge that snapshot instead of each querying the daemon. An unanswered ping SHALL be one finding: the file and configuration checks SHALL still run, and the Docker-dependent checks SHALL stay silent rather than report an absence they never observed.
+
+#### Scenario: The daemon is asked in one round
+- **WHEN** doctor needs the image's presence, its labels, the container's state, a parked promotion target, and the image list
+- **THEN** those probes run concurrently and every check reads the collected answer
+- **AND** no check inspects the daemon on its own behalf
+
+#### Scenario: Docker is down but the workspace is fine
+- **WHEN** the ping fails on a workspace whose files are intact
+- **THEN** doctor reports the daemon as a failure, still reports the workspace and configuration findings, and exits non-zero
+- **AND** it prints no image, container, or retention finding, because the daemon was never asked

@@ -63,10 +63,31 @@ const (
 	FAIL
 )
 
-func (s Status) String() string {
+// String keeps `%v` on a Result readable: without it an int type prints 0/1/2 and
+// every test failure that dumps a result list loses the severity it is showing.
+func (s Status) String() string { return s.Marker() }
+
+// Word is the severity in the vocabulary the styler colours and the JSON report
+// emits: "ok", "warn", "fail".
+func (s Status) Word() string {
 	switch s {
 	case OK:
-		return "[OK]  "
+		return "ok"
+	case WARN:
+		return "warn"
+	default:
+		return "fail"
+	}
+}
+
+// Marker is the plain-text severity marker, one bracketed word with no padding.
+// It lives here rather than at the call sites because the renderer, the styler,
+// and anyone grepping a CI log all have to agree on these exact strings: a second
+// copy of the vocabulary is how `[FAIL]` and `[fail]` end up in one report.
+func (s Status) Marker() string {
+	switch s {
+	case OK:
+		return "[OK]"
 	case WARN:
 		return "[WARN]"
 	default:
@@ -76,8 +97,28 @@ func (s Status) String() string {
 
 // Result is one check outcome.
 type Result struct {
-	Status  Status
+	Status Status
+	// Section is the group this result belongs to in the rendered report. It is
+	// set by the check that produced the result, never inferred from the message
+	// text: a renderer that classifies by substring silently loses every line it
+	// cannot spell, and a lost FAIL is worse than an ugly one.
+	Section Section
+	// Message is the finding. It states the condition, not the remedy.
 	Message string
+	// Hint is the remedy or the consequence, rendered on its own muted line.
+	// Kept out of Message so a finding that runs 300 characters does not wrap
+	// into an unreadable block, and so "what is wrong" stays scannable.
+	// Optional.
+	Hint string
+}
+
+// Text is the whole finding — condition plus remedy — for callers that search
+// results without rendering them (tests, grep-like helpers).
+func (r Result) Text() string {
+	if r.Hint == "" {
+		return r.Message
+	}
+	return r.Message + " \u2014 " + r.Hint
 }
 
 // Failed reports whether any result is a FAIL.
@@ -90,6 +131,34 @@ func Failed(results []Result) bool {
 	return false
 }
 
+// GroupBySection reorders results into report order: grouped by section, the
+// declared section order, and stable within a section so the checks keep the
+// order they were written in. Two consequences worth having: the rendered report
+// reads as a checklist of the parts of a setup rather than one long list, and a
+// caller that only wants the problems can take a whole section at a time.
+//
+// A result with an unknown or empty section sorts last rather than being dropped:
+// a new check that forgot to declare a group must still be reported.
+func GroupBySection(results []Result) []Result {
+	order := Sections()
+	rank := make(map[Section]int, len(order)+1)
+	for i, sec := range order {
+		rank[sec] = i
+	}
+	last := len(order)
+	key := func(s Section) int {
+		if i, ok := rank[s]; ok {
+			return i
+		}
+		return last
+	}
+	out := append([]Result(nil), results...)
+	sort.SliceStable(out, func(i, j int) bool {
+		return key(out[i].Section) < key(out[j].Section)
+	})
+	return out
+}
+
 // Options control a doctor run.
 type Options struct {
 	// Workspace is the absolute workspace directory.
@@ -99,203 +168,6 @@ type Options struct {
 	Engine Engine
 	// LookupEnv resolves host environment variables for env: references.
 	LookupEnv func(string) (string, bool)
-}
-
-// Run executes every check in order and returns the results.
-func Run(ctx context.Context, opts Options) []Result {
-	var results []Result
-	add := func(s Status, format string, args ...any) {
-		results = append(results, Result{Status: s, Message: fmt.Sprintf(format, args...)})
-	}
-
-	// 1. Docker daemon.
-	if opts.Engine != nil {
-		if err := opts.Engine.Ping(ctx); err != nil {
-			add(FAIL, "docker daemon not reachable: %v", err)
-			return results // nothing else is actionable without a daemon
-		}
-		add(OK, "docker daemon reachable")
-	}
-
-	// 2. Workspace + manifest.
-	if _, err := os.Stat(opts.Workspace); err != nil {
-		add(FAIL, "workspace missing: %s", opts.Workspace)
-		return results
-	}
-	add(OK, "workspace: %s", opts.Workspace)
-
-	manifestPath := filepath.Join(opts.Workspace, "piccolo.yaml")
-	m, err := manifest.Load(manifestPath)
-	if err != nil {
-		add(FAIL, "manifest: %v", err)
-		return results
-	}
-	add(OK, "manifest: piccolo.yaml")
-	layout := workspace.NewLayout(opts.Workspace)
-	if workspace.IsLegacyFlat(opts.Workspace) {
-		add(FAIL, "workspace layout: legacy flat layout detected — run 'piccolo workspace migrate'")
-	} else if _, err := os.Stat(layout.PicoclawHome()); err != nil {
-		add(FAIL, "workspace layout: missing picoclaw/ directory — run 'piccolo init' or 'piccolo workspace migrate'")
-	} else {
-		missing := []string{}
-		for _, dir := range []struct{ label, path string }{
-			{"integrations/", layout.Integrations()},
-			{"runtime/media/", layout.RuntimeMedia()},
-		} {
-			if st, err := os.Stat(dir.path); err != nil || !st.IsDir() {
-				missing = append(missing, dir.label)
-			}
-		}
-		if len(missing) > 0 {
-			add(WARN, "workspace layout: missing %s — run 'piccolo workspace migrate --yes' or 'piccolo serve' to create runtime dirs", strings.Join(missing, ", "))
-		} else {
-			add(OK, "workspace layout: structured")
-		}
-	}
-
-	results = append(results, checkGeneratedProvenance(opts.Workspace)...)
-	results = append(results, checkGitignoreHygiene(opts.Workspace)...)
-
-	// 3. Image presence (warning only).
-	imagePresent := true
-	if opts.Engine != nil {
-		present, err := opts.Engine.ImageExists(ctx, m.Container.Image)
-		imagePresent = present && err == nil
-		switch {
-		case err != nil:
-			add(WARN, "image check failed for %s: %v", m.Container.Image, err)
-		case !present:
-			if isPiccoloLocalRuntimeImage(m.Container.Image) {
-				add(WARN, "local Piccolo runtime image not present: %s (run 'piccolo image build --set')", m.Container.Image)
-			} else {
-				add(WARN, "image not present locally: %s (serve will pull it once)", m.Container.Image)
-			}
-		default:
-			add(OK, "image present: %s", m.Container.Image)
-		}
-	}
-
-	// 3b. Runtime image currency. The image in use must contain the toolchain and
-	// the integration versions the workspace describes. Doctor reports the drift
-	// and names the rebuild; it never starts one, because a stale image is not an
-	// error — adopting a rebuild is a user decision.
-	results = append(results, checkImageDrift(ctx, opts.Engine, m, imagePresent)...)
-	results = append(results, checkImageRetention(ctx, opts.Engine, m)...)
-
-	// 3c. An interrupted promotion leaves the previous gateway parked under the
-	// reserved name. The canonical name always belongs to what should be running,
-	// so this is the one abnormal state to look for.
-	if opts.Engine != nil {
-		if parked, err := opts.Engine.ContainerExists(ctx, docker.PreviousName(m.Container.Name)); err == nil && parked {
-			add(WARN, "parked promotion target %q exists — a previous restart was interrupted; 'piccolo serve' restores it", docker.PreviousName(m.Container.Name))
-		}
-	}
-
-	// 3d. Web console consistency: a published :18800 binding only makes sense
-	// with the launcher image (which serves the dashboard). A plain gateway
-	// image would publish a dead port with nothing listening behind it.
-	results = append(results, checkWebConsole(m)...)
-
-	// 3e. Runtime toolchain configuration (live command availability is reported
-	// by `piccolo runtime status`; doctor stays daemon-free here).
-	results = append(results, checkRuntimeToolchain(m)...)
-	results = append(results, checkIntegrations(m)...)
-
-	// 4. Env references.
-	lookup := opts.LookupEnv
-	if lookup == nil {
-		lookup = os.LookupEnv
-	}
-	for _, ref := range m.EnvRefs() {
-		if _, found := lookup(ref); !found {
-			add(WARN, "piccolo.yaml env reference %s: host variable not set", "env:"+ref)
-		}
-	}
-
-	// 5. Stale container (warning only): one that exists but is NOT running. A
-	// running container built from the current image is the service itself, not a
-	// leftover, and calling it stale made every healthy workspace carry a permanent
-	// false warning. A running container built from a DIFFERENT image is reported by
-	// checkRunningImage below with the accurate verb (restart), so it is not
-	// double-reported here.
-	if opts.Engine != nil {
-		exists, err := opts.Engine.ContainerExists(ctx, m.Container.Name)
-		state, serr := opts.Engine.StateByName(ctx, m.Container.Name)
-		if err == nil && exists && !(serr == nil && state.Found && state.Running) {
-			add(WARN, "stale container %q exists (serve will replace it)", m.Container.Name)
-		}
-		results = append(results, checkRunningImage(ctx, opts.Engine, m)...)
-		// One-shot setup/status containers are reclaimed automatically before
-		// the next run, but a leftover means a previous attempt was interrupted.
-		if names, err := opts.Engine.ListByPrefix(ctx, docker.SetupContainerPrefix); err == nil && len(names) > 0 {
-			add(WARN, "%d abandoned integration one-shot container(s): %s (removed on the next setup/status run)", len(names), strings.Join(names, ", "))
-		}
-	}
-
-	// 6. PicoClaw config.
-	configPath := layout.Config()
-	data, err := os.ReadFile(configPath)
-	if err != nil {
-		add(FAIL, "picoclaw config: %v", err)
-		return results
-	}
-	var cfg picoclaw.Config
-	if err := json.Unmarshal(data, &cfg); err != nil {
-		add(FAIL, "config.json does not parse: %v", err)
-		return results
-	}
-	if cfg.Version != picoclaw.SchemaVersion {
-		add(FAIL, "config.json schema version %d (want %d)", cfg.Version, picoclaw.SchemaVersion)
-		return results
-	}
-	add(OK, "picoclaw config: config.json (schema v%d)", cfg.Version)
-
-	// 6b. PicoClaw's secret sidecar. Anything the gateway has saved once (the web
-	// console, `picoclaw model add`, a version migration) moves every secure field
-	// out of config.json and into picoclaw/.security.yml, and that file then WINS
-	// on load — so config.json alone cannot say what the gateway will actually
-	// use. Read it before the checks that depend on it. A file that does not parse
-	// is fatal: PicoClaw's LoadConfig refuses to start the gateway over it.
-	secrets := picoclaw.LoadSecrets(configPath)
-	if secrets.Err != nil {
-		add(FAIL, "picoclaw/.security.yml does not parse: %v — PicoClaw will not load config.json while it cannot read the sidecar", secrets.Err)
-		secrets = picoclaw.Secrets{Present: true}
-	} else if secrets.Present {
-		add(OK, "secret sidecar: picoclaw/.security.yml (secure fields here override config.json)")
-	}
-
-	// 6c. Credential encryption. An enc:// value is only as good as the two things
-	// that unlock it, and both are checked before the gateway ever starts: a
-	// passphrase that reaches the container, and the exact key file whose bytes feed
-	// the derivation. Neither failure is visible from config.json, and both end the
-	// same way — the gateway exits on a config error that names config.json.
-	results = append(results, checkCredentialEncryption(opts.Workspace, configPath, data, m, secrets)...)
-
-	// 7. Agents.
-	results = append(results, checkAgents(opts.Workspace, cfg)...)
-
-	// 8. Models.
-	results = append(results, checkModels(cfg, secrets)...)
-	results = append(results, checkLegacyAgentModelNames(data)...)
-
-	// 9. Image understanding. PicoClaw can receive channel attachments; Piccolo
-	// recommends routing them through a vision-capable image_model and the
-	// load_image tool.
-	results = append(results, checkImageUnderstanding(opts.Workspace, cfg, data)...)
-
-	// 10. Exec safety.
-	results = append(results, checkExecSafety(data)...)
-
-	// 11. Channels (raw parse — setup manages channel_list; unknown fields
-	// are user-owned and ignored here).
-	results = append(results, checkChannels(data, secrets)...)
-
-	// 12. MCP reachability: a registered integration server is not a callable tool.
-	results = append(results, checkIntegrationRegistration(m, data)...)
-	results = append(results, checkOrphanMCPServers(m, data)...)
-	results = append(results, checkMCPAccess(opts.Workspace, cfg, data)...)
-
-	return results
 }
 
 // checkIntegrationRegistration closes the half of "installed" that the manifest
@@ -341,7 +213,9 @@ func checkIntegrationRegistration(m *manifest.Manifest, configData []byte) []Res
 		if label == "" {
 			label = ref
 		}
-		results = append(results, Result{Status: WARN, Message: fmt.Sprintf("integration %s is installed and configured but never registered: config.json has no tools.mcp.servers.%s entry — its tools are not offered to any agent; finish it with 'piccolo integration setup %s' and accept the config change", label, key, ref)})
+		results = append(results, Result{Status: WARN,
+			Message: fmt.Sprintf("integration %s is installed and configured but never registered: config.json has no tools.mcp.servers.%s entry", label, key),
+			Hint:    fmt.Sprintf("its tools are not offered to any agent; finish it with 'piccolo integration setup %s' and accept the config change", ref)})
 	}
 	return results
 }
@@ -392,10 +266,14 @@ func checkOrphanMCPServers(m *manifest.Manifest, configData []byte) []Result {
 			continue
 		}
 		if enabled {
-			results = append(results, Result{Status: WARN, Message: fmt.Sprintf("config.json registers tools.mcp.servers.%s but no installed integration provides it; tools.mcp.enabled is on, so the gateway will try to start it and every chat turn fails if it cannot — remove the entry (or reinstall the integration with 'piccolo integration add <package>')", key)})
+			results = append(results, Result{Status: WARN,
+				Message: fmt.Sprintf("config.json registers tools.mcp.servers.%s but no installed integration provides it", key),
+				Hint:    "tools.mcp.enabled is on, so the gateway will try to start it and every chat turn fails if it cannot — remove the entry (or reinstall the integration with 'piccolo integration add <package>')"})
 			continue
 		}
-		results = append(results, Result{Status: WARN, Message: fmt.Sprintf("config.json registers tools.mcp.servers.%s but no installed integration provides it; the entry is inert while tools.mcp.enabled is off", key)})
+		results = append(results, Result{Status: WARN,
+			Message: fmt.Sprintf("config.json registers tools.mcp.servers.%s but no installed integration provides it", key),
+			Hint:    "the entry is inert while tools.mcp.enabled is off"})
 	}
 	return results
 }
@@ -455,7 +333,10 @@ func checkMCPAccess(workspace string, cfg picoclaw.Config, configData []byte) []
 	sort.Strings(registered)
 	sort.Strings(disabled)
 	if len(disabled) > 0 {
-		add(WARN, "mcp: server %s is registered but disabled — its tools are not offered to any agent", strings.Join(disabled, ", "))
+		results = append(results, Result{Status: WARN,
+			Message: fmt.Sprintf("mcp: server %s is registered but disabled", strings.Join(disabled, ", ")),
+			Hint:    "its tools are not offered to any agent",
+		})
 	}
 	if len(registered) == 0 {
 		return results
@@ -463,7 +344,10 @@ func checkMCPAccess(workspace string, cfg picoclaw.Config, configData []byte) []
 	names := strings.Join(registered, ", ")
 
 	if raw.Tools.MCP.Enabled == nil || !*raw.Tools.MCP.Enabled {
-		add(WARN, "mcp: tools.mcp.enabled is not true while server(s) {%s} are registered — PicoClaw skips MCP initialization entirely, so agents are handed none of these integrations' tools even though their binaries run; enable it with 'piccolo setup' \u2192 Tools \u2192 MCP tool servers", names)
+		results = append(results, Result{Status: WARN,
+			Message: fmt.Sprintf("mcp: tools.mcp.enabled is not true while server(s) {%s} are registered", names),
+			Hint:    "PicoClaw skips MCP initialization entirely, so agents are handed none of these integrations' tools even though their binaries run; enable it with 'piccolo setup' \u2192 Tools \u2192 MCP tool servers",
+		})
 		return results
 	}
 
@@ -484,7 +368,10 @@ func checkMCPAccess(workspace string, cfg picoclaw.Config, configData []byte) []
 			continue // checkAgents reports this precisely.
 		}
 		if len(fm.Tools) > 0 {
-			add(WARN, "mcp: coordinator %q declares an AGENT.md tools: allowlist — PicoClaw matches tool names exactly and MCP tools are named mcp_<server>_<tool> at runtime, so this agent cannot receive any tool from {%s}; Piccolo generates the coordinator with no tools: line, and deleting that line grants it every tool config.json enables", a.ID, names)
+			results = append(results, Result{Status: WARN,
+				Message: fmt.Sprintf("mcp: coordinator %q declares an AGENT.md tools: allowlist", a.ID),
+				Hint:    fmt.Sprintf("PicoClaw matches tool names exactly and MCP tools are named mcp_<server>_<tool> at runtime, so this agent cannot receive any tool from {%s}; Piccolo generates the coordinator with no tools: line, and deleting that line grants it every tool config.json enables", names),
+			})
 			continue
 		}
 		add(OK, "mcp: %d server(s) reachable by coordinator %q (%s)", len(registered), a.ID, names)
@@ -500,13 +387,13 @@ func checkMCPAccess(workspace string, cfg picoclaw.Config, configData []byte) []
 // describes. imagePresent comes from the presence check: when the image is
 // simply not here, that check already said so, and repeating it as a content
 // complaint would be two warnings for one problem.
-func checkImageDrift(ctx context.Context, engine Engine, m *manifest.Manifest, imagePresent bool) []Result {
-	if engine == nil || !isPiccoloLocalRuntimeImage(m.Container.Image) || !imagePresent {
+func checkImageDrift(ctx context.Context, facts dockerFacts, m *manifest.Manifest, imagePresent bool) []Result {
+	if !facts.live || !isPiccoloLocalRuntimeImage(m.Container.Image) || !imagePresent {
 		return nil
 	}
-	info, err := runtimeplan.Check(ctx, engine, m)
+	info, err := runtimeplan.Check(ctx, facts, m)
 	if err != nil {
-		return []Result{{Status: WARN, Message: fmt.Sprintf("runtime image currency: could not verify (%v)", err)}}
+		return []Result{{Status: WARN, Message: fmt.Sprintf("runtime image currency: could not verify (%v)", err), Hint: "an unverifiable check never blocks serve"}}
 	}
 	if !info.Verifiable {
 		return nil
@@ -517,13 +404,14 @@ func checkImageDrift(ctx context.Context, engine Engine, m *manifest.Manifest, i
 	case runtimeplan.DriftTemplate:
 		// Content is right; the tag is only cosmetically behind. Reporting this as
 		// a problem would push the user toward a rebuild that changes nothing.
-		return []Result{{Status: OK, Message: fmt.Sprintf("runtime image content matches this workspace (%s); the tag predates a Piccolo recipe change (%s)", info.Current, info.Desired)}}
+		return []Result{{Status: OK, Message: fmt.Sprintf("runtime image content matches this workspace (%s)", info.Current), Hint: fmt.Sprintf("the tag predates a Piccolo recipe change (%s); no rebuild needed", info.Desired)}}
 	}
 	return []Result{{
 		Status: WARN,
 		Message: fmt.Sprintf(
-			"runtime image is stale: %s, wants %s (%s) — rebuild with 'piccolo image build --set && piccolo restart'; Piccolo never rebuilds implicitly",
+			"runtime image is stale: %s, wants %s (%s)",
 			info.Current, info.Desired, strings.Join(info.Reasons, "; ")),
+		Hint: "rebuild with 'piccolo image build --set && piccolo restart'; Piccolo never rebuilds implicitly",
 	}}
 }
 
@@ -531,18 +419,17 @@ func checkImageDrift(ctx context.Context, engine Engine, m *manifest.Manifest, i
 // references any more. It is a warning with a count, a size, and the command:
 // deleting images on the user's behalf is never doctor's job, and the rollback
 // target in particular is the one image nothing else can recover.
-func checkImageRetention(ctx context.Context, engine Engine, m *manifest.Manifest) []Result {
-	if engine == nil {
+func checkImageRetention(facts dockerFacts, m *manifest.Manifest) []Result {
+	if !facts.live {
 		return nil
 	}
-	images, err := engine.ListImages(ctx)
-	if err != nil {
-		return []Result{{Status: WARN, Message: fmt.Sprintf("runtime image retention: could not check (%v)", err)}}
+	if facts.imagesErr != nil {
+		return []Result{{Status: WARN, Message: fmt.Sprintf("runtime image retention: could not check (%v)", facts.imagesErr)}}
 	}
-	containers, err := engine.ContainerImages(ctx)
-	if err != nil {
-		return []Result{{Status: WARN, Message: fmt.Sprintf("runtime image retention: could not check (%v)", err)}}
+	if facts.containerImagesErr != nil {
+		return []Result{{Status: WARN, Message: fmt.Sprintf("runtime image retention: could not check (%v)", facts.containerImagesErr)}}
 	}
+	images, containers := facts.images, facts.containerImages
 	candidates := make([]runtimeplan.ImageInfo, 0, len(images))
 	for _, img := range images {
 		for _, ref := range img.RepoTags {
@@ -560,11 +447,12 @@ func checkImageRetention(ctx context.Context, engine Engine, m *manifest.Manifes
 		return []Result{{Status: OK, Message: "runtime image retention: no unreferenced runtime images"}}
 	}
 	if len(plan.Removable) < unreferencedImageWarnCount && plan.Reclaimable < unreferencedImageWarnBytes {
-		return []Result{{Status: OK, Message: fmt.Sprintf("runtime image retention: %d unreferenced image(s) (%s), below the reporting threshold", len(plan.Removable), humanBytes(plan.Reclaimable))}}
+		return []Result{{Status: OK, Message: fmt.Sprintf("runtime image retention: %d unreferenced image(s) (%s)", len(plan.Removable), humanBytes(plan.Reclaimable)), Hint: "below the reporting threshold"}}
 	}
 	return []Result{{Status: WARN, Message: fmt.Sprintf(
-		"runtime image retention: %d unreferenced runtime image(s), up to %s — reclaim with 'piccolo image prune' (keeps the image in use and the rollback target); Piccolo never deletes images on its own",
-		len(plan.Removable), humanBytes(plan.Reclaimable))}}
+		"runtime image retention: %d unreferenced runtime image(s), up to %s",
+		len(plan.Removable), humanBytes(plan.Reclaimable)),
+		Hint: "reclaim with 'piccolo image prune' (keeps the image in use and the rollback target); Piccolo never deletes images on its own"}}
 }
 
 func humanBytes(n int64) string {
@@ -613,10 +501,15 @@ func checkGeneratedProvenance(dir string) []Result {
 		// when it plainly does. Say which file was found, so the remedy is obvious
 		// rather than a mystery to debug.
 		if _, err := os.Stat(filepath.Join(dir, generate.LegacyFileName)); err == nil {
-			add(OK, "generated-file provenance: record found under the old name %s — 'piccolo setup' rewrites it as %s on the next change", generate.LegacyFileName, generate.LockFileName)
+			results = append(results, Result{Status: OK,
+				Message: fmt.Sprintf("generated-file provenance: record found under the old name %s", generate.LegacyFileName),
+				Hint:    fmt.Sprintf("'piccolo setup' rewrites it as %s on the next change", generate.LockFileName),
+			})
 			return results
 		}
-		add(OK, "generated-file provenance: no record (workspace generated before provenance existed) — 'piccolo setup' writes it on the next change")
+		results = append(results, Result{Status: OK,
+			Message: "generated-file provenance: no record (workspace generated before provenance existed)",
+			Hint:    "'piccolo setup' writes it on the next change"})
 		return results
 	}
 
@@ -625,14 +518,20 @@ func checkGeneratedProvenance(dir string) []Result {
 		data, readErr := os.ReadFile(filepath.Join(dir, filepath.FromSlash(rel)))
 		if readErr != nil {
 			missing++
-			add(WARN, "generated file is missing: %s (source %s) — restore it or delete its entry from %s", rel, prov.Source(rel), generate.LockFileName)
+			results = append(results, Result{Status: WARN,
+				Message: fmt.Sprintf("generated file is missing: %s (source %s)", rel, prov.Source(rel)),
+				Hint:    fmt.Sprintf("restore it or delete its entry from %s", generate.LockFileName),
+			})
 			continue
 		}
 		rendered, _ := generate.CurrentRender(prov.Source(rel))
 		switch prov.Classify(rel, data, rendered) {
 		case generate.StatusStale:
 			stale++
-			add(WARN, "generated file predates the current template: %s — refresh with 'piccolo setup' (fix belongs in %s, not in the copy)", rel, prov.Source(rel))
+			results = append(results, Result{Status: WARN,
+				Message: fmt.Sprintf("generated file predates the current template: %s", rel),
+				Hint:    fmt.Sprintf("refresh with 'piccolo setup' (fix belongs in %s, not in the copy)", prov.Source(rel)),
+			})
 		case generate.StatusCustomised:
 			customised++
 		default:
@@ -676,7 +575,9 @@ func checkGitignoreHygiene(dir string) []Result {
 	for _, entry := range missing {
 		quoted = append(quoted, fmt.Sprintf("%q", entry))
 	}
-	return append(results, Result{Status: WARN, Message: fmt.Sprintf("workspace .gitignore is missing %s — run 'piccolo init' here (it appends missing entries and never overwrites your files) or add them by hand", strings.Join(quoted, ", "))})
+	return append(results, Result{Status: WARN,
+		Message: fmt.Sprintf("workspace .gitignore is missing %s", strings.Join(quoted, ", ")),
+		Hint:    "run 'piccolo init' here (it appends missing entries and never overwrites your files) or add them by hand"})
 }
 
 func checkRuntimeToolchain(m *manifest.Manifest) []Result {
@@ -767,7 +668,9 @@ func checkExecSafety(configData []byte) []Result {
 		return results
 	}
 	if raw.Tools.Exec.AllowRemote != nil && *raw.Tools.Exec.AllowRemote {
-		results = append(results, Result{Status: WARN, Message: "exec: tools.exec.allow_remote is true — remote chats can request shell commands inside the container subject to PicoClaw safety checks; enable only for trusted channels/users"})
+		results = append(results, Result{Status: WARN,
+			Message: "exec: tools.exec.allow_remote is true",
+			Hint:    "remote chats can request shell commands inside the container subject to PicoClaw safety checks; enable only for trusted channels/users"})
 	}
 	// Absent means restricted; only an explicit false clears it. Piccolo generates
 	// false, so this fires on a workspace hand-hardened or created by an older
@@ -775,9 +678,13 @@ func checkExecSafety(configData []byte) []Result {
 	restricted := raw.Agents.Defaults.RestrictToWorkspace == nil || *raw.Agents.Defaults.RestrictToWorkspace
 	if restricted {
 		if raw.Tools.Exec.Enabled != nil && *raw.Tools.Exec.Enabled {
-			results = append(results, Result{Status: WARN, Message: "exec: agents.defaults.restrict_to_workspace is true while tools.exec is enabled — PicoClaw blocks shell commands naming any path outside the agent's own workspace (\"Command blocked by safety guard (path outside working dir)\"), and allow_read_outside_workspace does NOT relax that exec check; turn it off with 'piccolo setup' → Tools → Workspace path guard unless you want the sandbox"})
+			results = append(results, Result{Status: WARN,
+				Message: "exec: agents.defaults.restrict_to_workspace is true while tools.exec is enabled",
+				Hint:    "PicoClaw blocks shell commands naming any path outside the agent's own workspace (\"Command blocked by safety guard (path outside working dir)\"), and allow_read_outside_workspace does NOT relax that exec check; turn it off with 'piccolo setup' → Tools → Workspace path guard unless you want the sandbox"})
 		} else {
-			results = append(results, Result{Status: WARN, Message: "agents.defaults.restrict_to_workspace is true — write/edit/append stay confined to each agent workspace (Piccolo now generates false; the container is the boundary). Change it with 'piccolo setup' → Tools → Workspace path guard"})
+			results = append(results, Result{Status: WARN,
+				Message: "agents.defaults.restrict_to_workspace is true",
+				Hint:    "write/edit/append stay confined to each agent workspace (Piccolo now generates false; the container is the boundary). Change it with 'piccolo setup' → Tools → Workspace path guard"})
 		}
 	}
 	return results
@@ -787,31 +694,57 @@ func checkExecSafety(configData []byte) []Result {
 // state: enabled channel without a real token (empty/placeholder). A token in
 // picoclaw/.security.yml counts, and the `[NOT_HERE]` sentinel in config.json is
 // PicoClaw saying exactly that — it is not a placeholder to warn about.
+//
+// A DISABLED channel is never a finding. Upstream skips `!bc.Enabled` before a
+// channel is constructed and before its HTTP handler is mounted
+// (pkg/channels/manager.go:1074,1128,1136), so an off entry binds nothing and
+// dials nothing — it is the absence of a configuration, not a broken one. What
+// doctor does separate is *why* it is off: an entry that still holds a
+// credential was configured and switched off by someone, while an empty one is
+// almost certainly PicoClaw's own default (defaultChannels in
+// pkg/config/defaults.go, merged into any file it loads and re-serialized on any
+// save). Those two get different lines, and the empty ones get ONE line between
+// them rather than fifteen, because they cannot be cleaned up — deleting them is
+// undone by the next save through the gateway.
 func checkChannels(configData []byte, secrets picoclaw.Secrets) []Result {
 	var results []Result
 	add := func(s Status, format string, args ...any) {
 		results = append(results, Result{Status: s, Message: fmt.Sprintf(format, args...)})
 	}
-	var raw struct {
-		ChannelList map[string]struct {
-			Enabled   bool           `json:"enabled"`
-			Type      string         `json:"type"`
-			AllowFrom []string       `json:"allow_from"`
-			Settings  map[string]any `json:"settings"`
-		} `json:"channel_list"`
-	}
-	if err := json.Unmarshal(configData, &raw); err != nil || len(raw.ChannelList) == 0 {
+	list, ok := parseChannelList(configData)
+	if !ok {
 		return results // absent/other shape: not a failure, config is user-owned
 	}
-	names := make([]string, 0, len(raw.ChannelList))
-	for n := range raw.ChannelList {
+	if len(list) == 0 {
+		return results
+	}
+	sidecar := sidecarCredentials(secrets)
+
+	names := make([]string, 0, len(list))
+	for n := range list {
 		names = append(names, n)
 	}
 	sort.Strings(names)
+	var stubs []string
 	for _, name := range names {
-		ch := raw.ChannelList[name]
+		ch := list[name]
 		if !ch.Enabled {
-			add(OK, "channel: %s (disabled)", name)
+			cred := channelCredential(name, ch, sidecar)
+			if !cred.Found {
+				stubs = append(stubs, name)
+				continue
+			}
+			// Parked, not stranded: the credential is there because turning the
+			// channel back on is meant to work. Not a warning — and Piccolo cannot
+			// fix it anyway, since .security.yml is PicoClaw's file to write.
+			switch {
+			case cred.InSidecar && cred.InJSON:
+				add(OK, "channel: %s (disabled; credential parked in config.json and picoclaw/.security.yml)", name)
+			case cred.InSidecar:
+				add(OK, "channel: %s (disabled; credential parked in picoclaw/.security.yml)", name)
+			default:
+				add(OK, "channel: %s (disabled; credential parked in config.json)", name)
+			}
 			continue
 		}
 		tokenKey := ""
@@ -851,7 +784,10 @@ func checkChannels(configData []byte, secrets picoclaw.Secrets) []Result {
 			add(WARN, "channel %q: config.json carries a token but picoclaw/.security.yml sets %q empty, so the gateway starts with no token", name, tokenKey)
 			continue
 		case sc.Matched && picoclaw.HasUsableKey(sc.Value) && jsonUsable && sc.Value != tok:
-			add(WARN, "channel %q: config.json %q is ignored — picoclaw/.security.yml sets that field, so change the token there", name, tokenKey)
+			results = append(results, Result{Status: WARN,
+				Message: fmt.Sprintf("channel %q: config.json %q is ignored", name, tokenKey),
+				Hint:    "picoclaw/.security.yml sets that field, so change the token there",
+			})
 			continue
 		case sc.Matched && !picoclaw.HasUsableKey(sc.Value):
 			// Sidecar governs and carries nothing usable, with nothing behind it in
@@ -864,14 +800,20 @@ func checkChannels(configData []byte, secrets picoclaw.Secrets) []Result {
 			// The value lives only in the sidecar; the OK line says so below.
 		default:
 			if picoclaw.IsSidecarSentinel(tok) {
-				add(WARN, "channel %q: config.json marks %q as stored in picoclaw/.security.yml, but that file carries no usable value — the gateway starts with no token", name, tokenKey)
+				results = append(results, Result{Status: WARN,
+					Message: fmt.Sprintf("channel %q: config.json marks %q as stored in picoclaw/.security.yml, but that file carries no usable value", name, tokenKey),
+					Hint:    "the gateway starts with no token",
+				})
 			} else {
 				add(WARN, "channel %q is enabled but %q is empty or a placeholder", name, tokenKey)
 			}
 			continue
 		}
 		if len(ch.AllowFrom) == 0 {
-			add(WARN, "channel %q: allow_from is empty — PicoClaw accepts messages from ANYONE (set user IDs or use \"*\" to acknowledge)", name)
+			results = append(results, Result{Status: WARN,
+				Message: fmt.Sprintf("channel %q: allow_from is empty", name),
+				Hint:    "PicoClaw accepts messages from ANYONE (set user IDs or use \"*\" to acknowledge)",
+			})
 			continue
 		}
 		if len(ch.AllowFrom) == 1 && ch.AllowFrom[0] == "*" {
@@ -884,7 +826,184 @@ func checkChannels(configData []byte, secrets picoclaw.Secrets) []Result {
 			add(OK, "channel: %s", name)
 		}
 	}
+	if len(stubs) > 0 {
+		// One line for all of them. Naming each individually would imply each is a
+		// thing to look at, and the list is long precisely because it is upstream's
+		// defaults rather than anyone's choices.
+		results = append(results, Result{Status: OK,
+			Message: fmt.Sprintf("channels: %d disabled with no credential anywhere (%s)", len(stubs), strings.Join(stubs, ", ")),
+			Hint:    "PicoClaw writes a default entry for every channel type it knows, so these are not yours to clean up",
+		})
+	}
+	// The mirror of the orphan model-key rule, and the state that rule cannot see:
+	// a sidecar credential for a channel config.json never lists. PicoClaw merges
+	// the sidecar over config.json per channel and CREATES the entry when it is
+	// missing (ChannelsConfig.UnmarshalYAML), so deleting a channel from
+	// config.json leaves its credential behind in a file Piccolo will not touch.
+	for _, cred := range secrets.ChannelsWithUsableSecrets() {
+		if _, present := list[cred.Channel]; present {
+			continue
+		}
+		results = append(results, Result{Status: WARN, Section: SecCredentials,
+			Message: fmt.Sprintf("picoclaw/.security.yml channel %q holds %s but config.json lists no such channel", cred.Channel, fieldList(cred.Fields)),
+			Hint:    "PicoClaw re-adds the entry (disabled) when it merges the sidecar, so its credential survives the deletion",
+		})
+	}
 	return results
+}
+
+// channelEntry is the part of a channel_list entry doctor reads. The document is
+// parsed raw because channel_list is user-owned and absent from picoclaw.Config:
+// a field Piccolo has never seen must not fail a check.
+type channelEntry struct {
+	Enabled   bool           `json:"enabled"`
+	Type      string         `json:"type"`
+	AllowFrom []string       `json:"allow_from"`
+	Settings  map[string]any `json:"settings"`
+}
+
+// parseChannelList returns config.json's channel_list. The bool is false only
+// when the document does not parse or the key is absent, which every caller
+// reads as "no channel findings", never as "no channels".
+func parseChannelList(configData []byte) (map[string]channelEntry, bool) {
+	var raw struct {
+		ChannelList map[string]channelEntry `json:"channel_list"`
+	}
+	if err := json.Unmarshal(configData, &raw); err != nil || raw.ChannelList == nil {
+		return nil, false
+	}
+	return raw.ChannelList, true
+}
+
+// sidecarCredentials indexes the sidecar's channels that hold a usable value, by
+// channel name. Channels the sidecar lists with nothing in them are absent from
+// this map, which is what tells a parked credential apart from upstream noise.
+func sidecarCredentials(secrets picoclaw.Secrets) map[string]picoclaw.ChannelCredential {
+	out := map[string]picoclaw.ChannelCredential{}
+	for _, cred := range secrets.ChannelsWithUsableSecrets() {
+		out[cred.Channel] = cred
+	}
+	return out
+}
+
+// channelCred reports whether a channel entry has a usable credential in
+// either file, and in which ones. It returns field names and file names, never
+// values: an enabled-channel warning that carried a token would leak the secret
+// into whatever the user pastes doctor output into.
+type channelCred struct {
+	Found     bool
+	Field     string // one secure field name that carries a value
+	InJSON    bool   // config.json settings hold it
+	InSidecar bool   // picoclaw/.security.yml holds it
+}
+
+func channelCredential(name string, ch channelEntry, sidecar map[string]picoclaw.ChannelCredential) channelCred {
+	var cred channelCred
+	for _, k := range picoclaw.SecretFieldName {
+		if tok, ok := ch.Settings[k].(string); ok && picoclaw.HasUsableKey(tok) {
+			cred.Found, cred.Field, cred.InJSON = true, k, true
+			break
+		}
+	}
+	if sc, ok := sidecar[name]; ok {
+		cred.Found, cred.InSidecar = true, true
+		if cred.Field == "" && len(sc.Fields) > 0 {
+			cred.Field = sc.Fields[0]
+		}
+	}
+	return cred
+}
+
+// picoChannelType is the PicoClaw channel the launcher's dashboard chat rides
+// on. Verified against v0.3.1: the launcher reverse-proxies /pico/ws to the
+// gateway (web/backend/api/pico.go:26), the gateway's /pico/ handler is the pico
+// channel itself (pkg/channels/pico/pico.go:277), and a channel mounts its
+// handler only when it is enabled and decodes with a token
+// (pkg/channels/manager.go:1001,1040,1074,1128).
+const picoChannelType = "pico"
+
+// checkConsoleChat covers the one console state the dashboard cannot report for
+// itself: it opens, the login works, and the chat connects to nothing — because
+// the channel that serves its websocket is off or keyless while everything Piccolo
+// can see about the console (port published, launcher image, gateway healthy)
+// still reads fine.
+//
+// A workspace with NO pico entry is deliberately silent. The launcher creates and
+// enables one itself on startup (EnsurePicoChannel, web/backend/main.go:651), so
+// warning about its absence would warn about a first-run state that fixes itself.
+func checkConsoleChat(m *manifest.Manifest, configData []byte, secrets picoclaw.Secrets) []Result {
+	var results []Result
+	add := func(s Status, format string, args ...any) {
+		results = append(results, Result{Status: s, Message: fmt.Sprintf(format, args...)})
+	}
+	// Console off is clean and never warned; a :18800 bound to a non-launcher
+	// image is already a dead-port warning from checkWebConsole, and adding a
+	// second finding about a chat that cannot exist would double-report one fault.
+	if !publishesContainerPort(m.Container.Ports, 18800) || !isLauncherImage(m.Container.Image) {
+		return results
+	}
+	list, ok := parseChannelList(configData)
+	if !ok || len(list) == 0 {
+		return results
+	}
+	name, ch, found := findPicoChannel(list)
+	if !found {
+		return results
+	}
+	switch cred := channelCredential(name, ch, sidecarCredentials(secrets)); {
+	case !ch.Enabled:
+		results = append(results, Result{Status: WARN,
+			Message: fmt.Sprintf("web console chat: channel %q is disabled, so the gateway mounts no /pico/ handler", name),
+			Hint:    "the dashboard opens and logs in but cannot chat; enable it ('piccolo setup' → Channels), or restart the console, whose launcher re-enables it and rewrites config.json",
+		})
+	case !cred.Found:
+		results = append(results, Result{Status: WARN,
+			Message: fmt.Sprintf("web console chat: channel %q is enabled but holds no token in config.json or picoclaw/.security.yml", name),
+			Hint:    "PicoClaw never starts it and the dashboard cannot chat; set one with 'piccolo setup' → Channels",
+		})
+	default:
+		add(OK, "web console chat: channel %q enabled", name)
+	}
+	return results
+}
+
+// findPicoChannel locates the pico-typed entry. Upstream resolves the type from
+// `type` and falls back to the map key (pkg/channels/manager.go:1070), so the
+// same rule is used here, and pico is a singleton upstream — the first match in
+// sorted order is deterministic if that is ever violated.
+func findPicoChannel(list map[string]channelEntry) (string, channelEntry, bool) {
+	names := make([]string, 0, len(list))
+	for name := range list {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		ch := list[name]
+		typeName := ch.Type
+		if typeName == "" {
+			typeName = name
+		}
+		if typeName == picoChannelType {
+			return name, ch, true
+		}
+	}
+	return "", channelEntry{}, false
+}
+
+// fieldList names secure fields for a report. It is given names, never values.
+func fieldList(fields []string) string {
+	switch len(fields) {
+	case 0:
+		return "a credential"
+	case 1:
+		return fmt.Sprintf("%q", fields[0])
+	default:
+		quoted := make([]string, len(fields))
+		for i, f := range fields {
+			quoted[i] = fmt.Sprintf("%q", f)
+		}
+		return strings.Join(quoted, ", ")
+	}
 }
 
 // checkWebConsole verifies the optional web console is configured
@@ -897,8 +1016,10 @@ func checkWebConsole(m *manifest.Manifest) []Result {
 		return results // console disabled — nothing to report
 	}
 	if !isLauncherImage(m.Container.Image) {
-		results = append(results, Result{Status: WARN, Message: fmt.Sprintf(
-			"piccolo.yaml publishes :18800 (web console) but image %q is not the launcher image — the port would have nothing listening", m.Container.Image)})
+		results = append(results, Result{Status: WARN,
+			Message: fmt.Sprintf(
+				"piccolo.yaml publishes :18800 (web console) but image %q is not the launcher image", m.Container.Image),
+			Hint: "the port would have nothing listening; use the launcher image or remove the binding"})
 		return results
 	}
 	results = append(results, Result{Status: OK, Message: "web console: enabled (:18800, launcher image)"})
@@ -1055,10 +1176,15 @@ func checkModels(cfg picoclaw.Config, secrets picoclaw.Secrets) []Result {
 			// Both files carry a key and the sidecar's is the one loaded: the config.json
 			// value the user can SEE is dead. Named by its sidecar key, because that is
 			// what they have to edit — and without repeating it twice in one line.
-			add(WARN, "model %q (%s): config.json api_keys is ignored — picoclaw/.security.yml key %q overrides it, so this value is never loaded; edit the key there, or run 'piccolo secrets encrypt' to drop the dead copy",
-				mdl.ModelName, mdl.Model, shield[i].Key)
+			results = append(results, Result{Status: WARN,
+				Message: fmt.Sprintf("model %q (%s): config.json api_keys is ignored", mdl.ModelName, mdl.Model),
+				Hint:    fmt.Sprintf("picoclaw/.security.yml key %q overrides it, so this value is never loaded; edit the key there, or run 'piccolo secrets encrypt' to drop the dead copy", shield[i].Key),
+			})
 		case shield[i].Matched && shield[i].HasKeys:
-			add(OK, "model: %s (%s) — key from picoclaw/.security.yml", mdl.ModelName, mdl.Model)
+			results = append(results, Result{Status: OK,
+				Message: fmt.Sprintf("model: %s (%s)", mdl.ModelName, mdl.Model),
+				Hint:    "key from picoclaw/.security.yml",
+			})
 		case shield[i].Matched && !shield[i].HasKeys && jsonKey:
 			add(WARN, "model %q: config.json carries an api key but picoclaw/.security.yml key %s lists none, so the gateway runs this model with no key",
 				mdl.ModelName, shield[i].Key)
@@ -1075,7 +1201,14 @@ func checkModels(cfg picoclaw.Config, secrets picoclaw.Secrets) []Result {
 	// exists while the renamed model runs with whatever config.json says. Silent
 	// either way, and invisible from config.json alone.
 	for _, orphan := range secrets.OrphanKeys(cfg.ModelAliases()) {
-		add(WARN, "picoclaw/.security.yml %s matches no model_list entry — a model renamed or deleted in config.json leaves its key behind here", orphan)
+		// The subject here is the sidecar entry, not the model, so this finding
+		// belongs to the credentials section even though the helper that found it
+		// is a model check. tag() fills only undeclared sections, so declaring it
+		// here is what moves it.
+		results = append(results, Result{Status: WARN, Section: SecCredentials,
+			Message: fmt.Sprintf("picoclaw/.security.yml %s matches no model_list entry", orphan),
+			Hint:    "a model renamed or deleted in config.json leaves its key behind here",
+		})
 	}
 	// Every model alias config.json references must exist in model_list. Walked
 	// per location and reported with it, so a dangling alias says where to fix
@@ -1171,7 +1304,9 @@ func checkImageUnderstanding(workspace string, cfg picoclaw.Config, configData [
 	}
 
 	if strings.TrimSpace(cfg.Agents.Defaults.ImageModel) == "" {
-		add(WARN, "image understanding: agents.defaults.image_model is not configured — image attachments may be received but not visually interpreted")
+		results = append(results, Result{Status: WARN,
+			Message: "image understanding: agents.defaults.image_model is not configured",
+			Hint:    "image attachments may be received but not visually interpreted; set one with 'piccolo setup' → Models"})
 	} else {
 		add(OK, "image understanding: image_model %s", cfg.Agents.Defaults.ImageModel)
 	}
@@ -1185,7 +1320,9 @@ func checkImageUnderstanding(workspace string, cfg picoclaw.Config, configData [
 				Enabled *bool `json:"enabled"`
 			}
 			if err := json.Unmarshal(msg, &tool); err == nil && tool.Enabled != nil && !*tool.Enabled {
-				add(WARN, "image understanding: tools.load_image.enabled is false — agents cannot visually inspect local image attachments")
+				results = append(results, Result{Status: WARN,
+					Message: "image understanding: tools.load_image.enabled is false",
+					Hint:    "agents cannot visually inspect local image attachments; enable it with 'piccolo setup' → Tools"})
 			}
 		}
 	}
@@ -1282,11 +1419,11 @@ func parseFrontmatter(path string) (*frontmatter, error) {
 // That is exactly how this was observed: piccolo-gws 0.3.4 still serving, the manifest
 // naming the 0.3.5 image, and `invalid character 'C' looking for beginning of value`
 // on each turn.
-func checkRunningImage(ctx context.Context, engine Engine, m *manifest.Manifest) []Result {
-	if engine == nil || m == nil {
+func checkRunningImage(m *manifest.Manifest, facts dockerFacts) []Result {
+	if !facts.live || m == nil {
 		return nil
 	}
-	state, err := engine.StateByName(ctx, m.Container.Name)
+	state, err := facts.state, facts.stateErr
 	if err != nil || !state.Found || state.Image == "" {
 		// No daemon, or no container: the image-store and stale-container checks
 		// already speak to that, and inventing a second complaint about the same
@@ -1305,7 +1442,8 @@ func checkRunningImage(ctx context.Context, engine Engine, m *manifest.Manifest)
 	if !state.Running {
 		verb = "was created from"
 	}
-	return []Result{{Status: WARN, Message: fmt.Sprintf("container %q %s image %q, but piccolo.yaml names %q — the running gateway holds the OLD integration binaries while config.json is re-read immediately; run 'piccolo restart' before enabling anything the new image provides", m.Container.Name, verb, state.Image, m.Container.Image)}}
+	return []Result{{Status: WARN, Message: fmt.Sprintf("container %q %s image %q, but piccolo.yaml names %q", m.Container.Name, verb, state.Image, m.Container.Image),
+		Hint: "the running gateway holds the OLD integration binaries while config.json is re-read immediately; run 'piccolo restart' before enabling anything the new image provides"}}
 }
 
 // checkCredentialEncryption reports whether an encrypted workspace can actually be
@@ -1401,9 +1539,6 @@ func configPath2(workspaceDir string) string {
 
 func checkCredentialEncryption(workspaceDir, configPath string, configData []byte, m *manifest.Manifest, secrets picoclaw.Secrets) []Result {
 	var results []Result
-	add := func(s Status, format string, args ...any) {
-		results = append(results, Result{Status: s, Message: fmt.Sprintf(format, args...)})
-	}
 
 	// Counted across BOTH files. A credential that lives only in the overlay is
 	// still encrypted, and counting config.json alone made an overlay-only
@@ -1424,8 +1559,10 @@ func checkCredentialEncryption(workspaceDir, configPath string, configData []byt
 	for _, f := range []string{configPath, configPath + ".bak"} {
 		if perm, ok := readableBeyondOwner(f); ok && jsonHoldsPlaintextCredential(f) {
 			rel := relPath(workspaceDir, f)
-			add(WARN, "%s is readable by group/others (%o) and holds a plaintext credential — chmod 600 %s, or delete it and run 'piccolo secrets encrypt'",
-				rel, perm, rel)
+			results = append(results, Result{Status: WARN,
+				Message: fmt.Sprintf("%s is readable by group/others (%o) and holds a plaintext credential", rel, perm),
+				Hint:    fmt.Sprintf("chmod 600 %s, or delete it and run 'piccolo secrets encrypt'", rel),
+			})
 		}
 	}
 
@@ -1435,8 +1572,10 @@ func checkCredentialEncryption(workspaceDir, configPath string, configData []byt
 	// for — but leaving it invisible is a claim of protection that is not true.
 	if m.Passphrase() != "" {
 		if fi, err := os.Stat(configPath2(workspaceDir)); err == nil && fi.Mode().Perm()&0o077 != 0 {
-			add(WARN, "piccolo.yaml is readable by group/others (%o) and holds the enc:// passphrase — chmod 600 %s",
-				fi.Mode().Perm(), workspace.ManifestName)
+			results = append(results, Result{Status: WARN,
+				Message: fmt.Sprintf("piccolo.yaml is readable by group/others (%o) and holds the enc:// passphrase", fi.Mode().Perm()),
+				Hint:    fmt.Sprintf("chmod 600 %s", workspace.ManifestName),
+			})
 		}
 	}
 
@@ -1449,16 +1588,25 @@ func checkCredentialEncryption(workspaceDir, configPath string, configData []byt
 		return results
 	}
 	if n == 0 && m.Passphrase() != "" {
-		add(WARN, "piccolo.yaml records secrets.passphrase but config.json holds no enc:// credential — the workspace is configured for encryption and is storing plaintext; run 'piccolo secrets encrypt' to seal it (a missing or deleted %s causes this)", filepath.Join(workspace.PicoclawDir, workspace.KeysDirName, workspace.KeyFileName))
+		results = append(results, Result{Status: WARN,
+			Message: "piccolo.yaml records secrets.passphrase but config.json holds no enc:// credential",
+			Hint:    fmt.Sprintf("the workspace is configured for encryption and is storing plaintext; run 'piccolo secrets encrypt' to seal it (a missing or deleted %s causes this)", filepath.Join(workspace.PicoclawDir, workspace.KeysDirName, workspace.KeyFileName)),
+		})
 	}
 	if m.Passphrase() == "" {
-		add(WARN, "config.json holds %d enc:// credential(s) but piccolo.yaml has no secrets.passphrase — serve cannot deliver a passphrase and the gateway will not start", n)
+		results = append(results, Result{Status: WARN,
+			Message: fmt.Sprintf("config.json holds %d enc:// credential(s) but piccolo.yaml has no secrets.passphrase", n),
+			Hint:    "serve cannot deliver a passphrase and the gateway will not start",
+		})
 	}
 	// Checked whether or not the passphrase is present: a workspace missing both
 	// needs two fixes, and reporting only the first would send the user back to
 	// doctor after each one.
 	if keyErr != nil {
-		add(WARN, "%d enc:// credential(s) are held but the key file %s is missing or unreadable — PicoClaw derives its AES key from that file's bytes, so no credential can be decrypted without it", n, workspace.KeysDirName+"/"+workspace.KeyFileName)
+		results = append(results, Result{Status: WARN,
+			Message: fmt.Sprintf("%d enc:// credential(s) are held but the key file %s is missing or unreadable", n, workspace.KeysDirName+"/"+workspace.KeyFileName),
+			Hint:    "PicoClaw derives its AES key from that file's bytes, so no credential can be decrypted without it",
+		})
 		return results
 	}
 	if m.Passphrase() == "" {
@@ -1470,8 +1618,10 @@ func checkCredentialEncryption(workspaceDir, configPath string, configData []byt
 	// the false green light in its purest form.
 	if len(plaintext) > 0 {
 		sort.Strings(plaintext)
-		add(WARN, "picoclaw/%s still holds %d plaintext credential value(s) (%s) that override config.json on load — the gateway reads these, not the enc:// values; run 'piccolo secrets encrypt' to seal them",
-			picoclaw.SecurityFileName, len(plaintext), strings.Join(plaintext, ", "))
+		results = append(results, Result{Status: WARN,
+			Message: fmt.Sprintf("picoclaw/%s still holds %d plaintext credential value(s) (%s) that override config.json on load", picoclaw.SecurityFileName, len(plaintext), strings.Join(plaintext, ", ")),
+			Hint:    "the gateway reads these, not the enc:// values; run 'piccolo secrets encrypt' to seal them",
+		})
 	}
 
 	// Credentials are counted across both files, and the split is named: with the
@@ -1479,11 +1629,20 @@ func checkCredentialEncryption(workspaceDir, configPath string, configData []byt
 	// model still had a key there.
 	switch {
 	case overlayCount > 0 && configJSONCount > 0:
-		add(OK, "credential encryption: %d enc:// value(s), %d in config.json and %d in picoclaw/%s, passphrase in piccolo.yaml, key present — note: piccolo.yaml is committed, so a copy of this workspace can still be decrypted", n, configJSONCount, overlayCount, picoclaw.SecurityFileName)
+		results = append(results, Result{Status: OK,
+			Message: fmt.Sprintf("credential encryption: %d enc:// value(s), %d in config.json and %d in picoclaw/%s, passphrase in piccolo.yaml, key present", n, configJSONCount, overlayCount, picoclaw.SecurityFileName),
+			Hint:    "note: piccolo.yaml is committed, so a copy of this workspace can still be decrypted",
+		})
 	case overlayCount > 0:
-		add(OK, "credential encryption: %d enc:// value(s), all in picoclaw/%s, passphrase in piccolo.yaml, key present — note: piccolo.yaml is committed, so a copy of this workspace can still be decrypted", n, picoclaw.SecurityFileName)
+		results = append(results, Result{Status: OK,
+			Message: fmt.Sprintf("credential encryption: %d enc:// value(s), all in picoclaw/%s, passphrase in piccolo.yaml, key present", n, picoclaw.SecurityFileName),
+			Hint:    "note: piccolo.yaml is committed, so a copy of this workspace can still be decrypted",
+		})
 	default:
-		add(OK, "credential encryption: %d enc:// value(s) in config.json, passphrase in piccolo.yaml, key present — note: piccolo.yaml is committed, so a copy of this workspace can still be decrypted", n)
+		results = append(results, Result{Status: OK,
+			Message: fmt.Sprintf("credential encryption: %d enc:// value(s) in config.json, passphrase in piccolo.yaml, key present", n),
+			Hint:    "note: piccolo.yaml is committed, so a copy of this workspace can still be decrypted",
+		})
 	}
 	return results
 }

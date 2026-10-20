@@ -131,7 +131,7 @@ func statuses(results []Result) map[Status]int {
 
 func find(results []Result, substr string) *Result {
 	for i := range results {
-		if strings.Contains(results[i].Message, substr) {
+		if strings.Contains(results[i].Text(), substr) {
 			return &results[i]
 		}
 	}
@@ -187,8 +187,8 @@ func TestDoctorWarnsOnInstalledButUnregisteredIntegration(t *testing.T) {
 		t.Fatalf("expected never-registered WARN, got %v", results)
 	}
 	for _, want := range []string{"google_workspace", "piccolo integration setup github:kimus/piccolo-gws"} {
-		if !strings.Contains(r.Message, want) {
-			t.Fatalf("WARN must name %q so the user knows what to run: %s", want, r.Message)
+		if !strings.Contains(r.Text(), want) {
+			t.Fatalf("WARN must name %q so the user knows what to run: %s", want, r.Text())
 		}
 	}
 	// The installed line carries a followable handle too, not empty parentheses.
@@ -284,7 +284,7 @@ func TestDoctorWarnsAbandonedSetupContainers(t *testing.T) {
 	}
 	found := false
 	for _, r := range results {
-		if r.Status == WARN && strings.Contains(r.Message, "abandoned integration one-shot") {
+		if r.Status == WARN && strings.Contains(r.Text(), "abandoned integration one-shot") {
 			found = true
 		}
 	}
@@ -606,8 +606,8 @@ func TestDoctorWarnsWhenRunningContainerLagsManifestImage(t *testing.T) {
 		t.Fatalf("expected stale-running-image WARN, got %v", results)
 	}
 	for _, want := range []string{"piccolo/picoclaw-runtime:OLDGENERATION", m.Container.Image, "piccolo restart"} {
-		if !strings.Contains(r.Message, want) {
-			t.Fatalf("WARN must name %q so the user can act: %s", want, r.Message)
+		if !strings.Contains(r.Text(), want) {
+			t.Fatalf("WARN must name %q so the user can act: %s", want, r.Text())
 		}
 	}
 	if Failed(results) {
@@ -630,7 +630,7 @@ func TestDoctorReportsMatchingRunningImage(t *testing.T) {
 		t.Fatalf("expected matching-image OK, got %v", results)
 	}
 	if r := find(results, "but piccolo.yaml names"); r != nil {
-		t.Fatalf("matching images must not warn: %s", r.Message)
+		t.Fatalf("matching images must not warn: %s", r.Text())
 	}
 }
 
@@ -640,7 +640,7 @@ func TestDoctorSilentOnRunningImageWhenNoContainer(t *testing.T) {
 	dir := initWorkspace(t)
 	results := Run(context.Background(), Options{Workspace: dir, Engine: fakeEngine{imageExists: true}})
 	if r := find(results, "piccolo.yaml names"); r != nil {
-		t.Fatalf("no container should mean no running-image finding: %s", r.Message)
+		t.Fatalf("no container should mean no running-image finding: %s", r.Text())
 	}
 }
 
@@ -677,8 +677,8 @@ func TestDoctorWarnsOnExecPathGuard(t *testing.T) {
 	if r == nil || r.Status != WARN {
 		t.Fatalf("expected exec path-guard WARN, got %v", results)
 	}
-	if !strings.Contains(r.Message, "allow_read_outside_workspace does NOT relax") {
-		t.Fatalf("WARN must state that read access does not relax exec, got: %s", r.Message)
+	if !strings.Contains(r.Text(), "allow_read_outside_workspace does NOT relax") {
+		t.Fatalf("WARN must state that read access does not relax exec, got: %s", r.Text())
 	}
 	if Failed(results) {
 		t.Fatalf("path guard is a user choice, never a FAIL: %v", results)
@@ -728,8 +728,8 @@ func TestDoctorWarnsOnRegisteredButUnreachableMCPServer(t *testing.T) {
 	if r == nil || r.Status != WARN {
 		t.Fatalf("expected unreachable-MCP WARN, got %v", results)
 	}
-	if !strings.Contains(r.Message, "google_workspace") {
-		t.Fatalf("WARN must name the registered server: %s", r.Message)
+	if !strings.Contains(r.Text(), "google_workspace") {
+		t.Fatalf("WARN must name the registered server: %s", r.Text())
 	}
 	if Failed(results) {
 		t.Fatalf("unreachable MCP is a WARN, not a FAIL: %v", results)
@@ -768,8 +768,8 @@ func TestDoctorWarnsWhenCoordinatorDeclaresToolAllowlist(t *testing.T) {
 	if r == nil || r.Status != WARN {
 		t.Fatalf("expected coordinator-allowlist WARN, got %v", results)
 	}
-	if !strings.Contains(r.Message, "mcp_<server>_<tool>") {
-		t.Fatalf("WARN must explain why the list cannot name MCP tools: %s", r.Message)
+	if !strings.Contains(r.Text(), "mcp_<server>_<tool>") {
+		t.Fatalf("WARN must explain why the list cannot name MCP tools: %s", r.Text())
 	}
 }
 
@@ -789,7 +789,7 @@ func TestDoctorReportsMCPReachableForGeneratedCoordinator(t *testing.T) {
 		t.Fatalf("expected reachable OK, got %v", results)
 	}
 	if r := find(results, "tools.mcp.enabled is not true"); r != nil {
-		t.Fatalf("unexpected WARN while MCP is reachable: %s", r.Message)
+		t.Fatalf("unexpected WARN while MCP is reachable: %s", r.Text())
 	}
 }
 
@@ -952,7 +952,7 @@ func TestCheckChannels(t *testing.T) {
 	res := checkChannels(cfg, picoclaw.Secrets{})
 	var got = map[string]Status{}
 	for _, r := range res {
-		got[r.Message] = r.Status
+		got[r.Text()] = r.Status
 	}
 	if len(res) != 4 {
 		t.Fatalf("results = %+v", res)
@@ -960,13 +960,13 @@ func TestCheckChannels(t *testing.T) {
 	byName := map[string]Result{}
 	for _, r := range res {
 		switch {
-		case strings.Contains(r.Message, "discord"):
+		case strings.Contains(r.Text(), "discord"):
 			byName["discord"] = r
-		case strings.Contains(r.Message, "telegram"):
+		case strings.Contains(r.Text(), "telegram"):
 			byName["telegram"] = r
-		case strings.Contains(r.Message, "slack"):
+		case strings.Contains(r.Text(), "slack"):
 			byName["slack"] = r
-		case strings.Contains(r.Message, `"*"`) && strings.Contains(r.Message, "open"):
+		case strings.Contains(r.Text(), `"*"`) && strings.Contains(r.Text(), "open"):
 			byName["open"] = r
 		}
 	}
@@ -1034,11 +1034,11 @@ func TestDoctorReportsStaleRuntimeImage(t *testing.T) {
 	if r == nil || r.Status != WARN {
 		t.Fatalf("expected a stale warning: %#v", results)
 	}
-	if !strings.Contains(r.Message, "toolchain package list changed") {
-		t.Errorf("stale warning lost the reason: %s", r.Message)
+	if !strings.Contains(r.Text(), "toolchain package list changed") {
+		t.Errorf("stale warning lost the reason: %s", r.Text())
 	}
-	if !strings.Contains(r.Message, "piccolo image build --set") {
-		t.Errorf("stale warning must name the rebuild command: %s", r.Message)
+	if !strings.Contains(r.Text(), "piccolo image build --set") {
+		t.Errorf("stale warning must name the rebuild command: %s", r.Text())
 	}
 	if Failed(results) {
 		t.Error("stale image must warn, never fail")
@@ -1049,7 +1049,7 @@ func TestDoctorReportsStaleRuntimeImage(t *testing.T) {
 	// the "not present locally" reason, which the presence check already covers.)
 	results = Run(ctx, Options{Workspace: dir, Engine: fakeEngine{imageExists: true, labelsFound: true}})
 	r = find(results, "runtime image is stale")
-	if r == nil || !strings.Contains(r.Message, "predates Piccolo content labels") {
+	if r == nil || !strings.Contains(r.Text(), "predates Piccolo content labels") {
 		t.Fatalf("expected the predates-labels reason: %#v", results)
 	}
 
@@ -1057,7 +1057,7 @@ func TestDoctorReportsStaleRuntimeImage(t *testing.T) {
 	// check stays quiet rather than reporting the same problem twice.
 	results = Run(ctx, Options{Workspace: dir, Engine: fakeEngine{imageExists: false}})
 	if r := find(results, "runtime image is stale"); r != nil {
-		t.Errorf("a missing image must not also be reported as content drift: %s", r.Message)
+		t.Errorf("a missing image must not also be reported as content drift: %s", r.Text())
 	}
 	if r := find(results, "local Piccolo runtime image not present"); r == nil {
 		t.Errorf("expected the presence warning: %#v", results)
@@ -1073,7 +1073,7 @@ func TestDoctorReportsStaleRuntimeImage(t *testing.T) {
 		imageExists: true, labelsFound: true, imageLabels: desired.Labels(),
 	}})
 	if r := find(results, "runtime image is stale"); r != nil {
-		t.Errorf("template-only drift reported as stale: %s", r.Message)
+		t.Errorf("template-only drift reported as stale: %s", r.Text())
 	}
 	if r := find(results, "runtime image content matches this workspace"); r == nil || r.Status != OK {
 		t.Fatalf("expected an OK content-match line for template drift: %#v", results)
@@ -1089,8 +1089,8 @@ func TestDoctorReportsParkedPromotionTarget(t *testing.T) {
 	if r == nil || r.Status != WARN {
 		t.Fatalf("expected a parked-target warning: %#v", results)
 	}
-	if !strings.Contains(r.Message, "piccolo serve") {
-		t.Errorf("parked target message should name the repair: %s", r.Message)
+	if !strings.Contains(r.Text(), "piccolo serve") {
+		t.Errorf("parked target message should name the repair: %s", r.Text())
 	}
 }
 
@@ -1130,13 +1130,224 @@ func TestDoctorReportsUnreferencedRuntimeImages(t *testing.T) {
 	if r == nil || r.Status != WARN {
 		t.Fatalf("expected a retention warning: %#v", results)
 	}
-	if !strings.Contains(r.Message, "2 unreferenced") {
-		t.Errorf("count wrong (a stopped container must protect 'held'): %s", r.Message)
+	if !strings.Contains(r.Text(), "2 unreferenced") {
+		t.Errorf("count wrong (a stopped container must protect 'held'): %s", r.Text())
 	}
-	if !strings.Contains(r.Message, "piccolo image prune") {
-		t.Errorf("warning must name the reclaim command: %s", r.Message)
+	if !strings.Contains(r.Text(), "piccolo image prune") {
+		t.Errorf("warning must name the reclaim command: %s", r.Text())
 	}
 	if Failed(results) {
 		t.Error("disk accumulation must warn, never fail")
+	}
+}
+
+// patchManifest rewrites piccolo.yaml through a generic mutation, the way the
+// console tests need to flip a workspace onto the launcher image.
+func patchManifest(t *testing.T, dir string, mutate func(*manifest.Manifest)) {
+	t.Helper()
+	path := filepath.Join(dir, "piccolo.yaml")
+	m, err := manifest.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mutate(m)
+	if err := m.Write(path); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// PicoClaw serializes its whole default channel map into config.json on any save
+// (defaultChannels in pkg/config/defaults.go, merged in by
+// ChannelsConfig.UnmarshalJSON). A workspace with one real channel therefore
+// shows fifteen entries, fourteen of which nobody chose. They are inert upstream
+// (pkg/channels/manager.go skips !bc.Enabled before the channel is built), they
+// cannot be cleaned up, and per-line reporting gave every healthy workspace
+// fourteen lines of noise above the one that mattered.
+func TestCheckChannelsCollapsesUnconfiguredDefaults(t *testing.T) {
+	cfg := []byte(`{"channel_list":{
+		"discord":{"enabled":true,"type":"discord","allow_from":["1"],"settings":{"token":"real-token"}},
+		"slack":{"enabled":false,"type":"slack","settings":{}},
+		"telegram":{"enabled":false,"type":"telegram","settings":{"proxy":""}},
+		"matrix":{"enabled":false,"type":"matrix","settings":{"homeserver":"https://matrix.org"}}
+	}}`)
+	res := checkChannels(cfg, picoclaw.Secrets{})
+	if len(res) != 2 {
+		t.Fatalf("want the discord line plus ONE stub summary, got %+v", res)
+	}
+	for _, r := range res {
+		if r.Status != OK {
+			t.Errorf("disabled unconfigured channels must never be a finding: %s", r.Text())
+		}
+	}
+	r := find(res, "disabled with no credential anywhere")
+	if r == nil {
+		t.Fatalf("no stub summary line: %+v", res)
+	}
+	if !strings.Contains(r.Text(), "3 ") {
+		t.Errorf("stub summary must count them: %s", r.Text())
+	}
+	for _, name := range []string{"slack", "telegram", "matrix"} {
+		if !strings.Contains(r.Text(), name) {
+			t.Errorf("stub summary omits %s, so a user cannot tell which entries are theirs: %s", name, r.Text())
+		}
+	}
+	// The enabled channel is still reported on its own line.
+	if find(res, "channel: discord") == nil {
+		t.Errorf("enabled channel lost its line: %+v", res)
+	}
+}
+
+// "Disabled" is not one state. An entry that still holds a credential was
+// configured and then switched off, which is what a user does on purpose; an
+// empty one is upstream's default. Only the first is worth a line of its own.
+func TestCheckChannelsNamesWhereADisabledCredentialIsParked(t *testing.T) {
+	cfg := []byte(`{"channel_list":{
+		"slack":{"enabled":false,"type":"slack","settings":{"bot_token":"xoxb-parked"}},
+		"telegram":{"enabled":false,"type":"telegram","settings":{}}
+	}}`)
+	res := checkChannels(cfg, picoclaw.Secrets{})
+	r := find(res, "channel: slack")
+	if r == nil || r.Status != OK {
+		t.Fatalf("parked slack channel not reported: %+v", res)
+	}
+	if !strings.Contains(r.Text(), "credential parked in config.json") {
+		t.Errorf("parked line must say where the credential sits: %s", r.Text())
+	}
+	if strings.Contains(r.Text(), "xoxb-parked") {
+		t.Errorf("line leaked the token value: %s", r.Text())
+	}
+	// telegram holds nothing, so it belongs in the summary rather than a line.
+	summary := find(res, "disabled with no credential anywhere")
+	if summary == nil {
+		t.Fatalf("empty default not collapsed: %+v", res)
+	}
+	if !strings.Contains(summary.Text(), "telegram") {
+		t.Errorf("summary must list telegram: %s", summary.Text())
+	}
+	if find(res, "channel: telegram") != nil {
+		t.Errorf("telegram got both a parked line and a stub line: %+v", res)
+	}
+}
+
+// A sidecar credential for a channel config.json no longer lists is the channel
+// mirror of the orphan model-key rule, and it is invisible from config.json:
+// PicoClaw re-creates the entry while merging the sidecar, so deleting the
+// channel does not drop the secret guarding it.
+func TestDoctorWarnsStrandedSidecarChannelCredential(t *testing.T) {
+	dir := initWorkspace(t)
+	patchConfig(t, dir, func(cfg map[string]any) {
+		cfg["channel_list"] = map[string]any{
+			"discord": map[string]any{
+				"enabled": true, "type": "discord",
+				"allow_from": []any{"12345"},
+				"settings":   map[string]any{"token": "dt-in-config"},
+			},
+		}
+	})
+	writeSidecar(t, dir, "channel_list:\n  discord:\n    settings:\n      token: dt-current\n  line:\n    settings:\n      channel_access_token: stranded-secret\n")
+
+	results := Run(context.Background(), Options{Workspace: dir, Engine: fakeEngine{imageExists: true}})
+	r := find(results, "config.json lists no such channel")
+	if r == nil || r.Status != WARN {
+		t.Fatalf("stranded sidecar channel must WARN, got %v", results)
+	}
+	if !strings.Contains(r.Text(), `"line"`) || !strings.Contains(r.Text(), "channel_access_token") {
+		t.Errorf("warning must name the channel and the field: %s", r.Text())
+	}
+	if strings.Contains(r.Text(), "stranded-secret") || strings.Contains(r.Text(), "dt-current") {
+		t.Errorf("warning leaked a credential value: %s", r.Text())
+	}
+	// A sidecar channel that config.json DOES list is parked, not stranded.
+	if find(results, `"discord" holds`) != nil {
+		t.Errorf("listed channel reported as stranded: %v", results)
+	}
+}
+
+func launcherConsoleManifest() *manifest.Manifest {
+	return &manifest.Manifest{Container: manifest.Container{
+		Image: generate.LauncherImage, Name: "piccolo-gateway", Network: "bridge",
+		Ports: []string{"127.0.0.1:18800:18800"},
+	}}
+}
+
+// The dashboard chat rides on the pico channel: the launcher proxies /pico/ws to
+// the gateway, and the gateway's /pico/ handler IS that channel
+// (pkg/channels/pico/pico.go WebhookPath). A console whose every Piccolo-visible
+// setting is fine can therefore have no chat at all.
+func TestCheckConsoleChatRequiresAnEnabledPicoChannel(t *testing.T) {
+	const picoOff = `{"channel_list":{"pico":{"enabled":false,"type":"pico","settings":{"token":"pico-token"}}}}`
+	const picoNoKey = `{"channel_list":{"pico":{"enabled":true,"type":"pico","settings":{}}}}`
+	const picoOK = `{"channel_list":{"pico":{"enabled":true,"type":"pico","settings":{"token":"pico-token"}}}}`
+	const picoTyped = `{"channel_list":{"webchat":{"enabled":false,"type":"pico","settings":{"token":"pico-token"}}}}`
+	const noPico = `{"channel_list":{"discord":{"enabled":true,"type":"discord","allow_from":["1"],"settings":{"token":"t"}}}}`
+
+	cases := []struct {
+		name    string
+		m       *manifest.Manifest
+		cfg     string
+		want    Status // ignored when quiet is set
+		quiet   bool   // the state must produce no result at all
+		message string
+	}{
+		{"disabled channel breaks chat", launcherConsoleManifest(), picoOff, WARN, false, "mounts no /pico/ handler"},
+		{"enabled without a token never starts", launcherConsoleManifest(), picoNoKey, WARN, false, "holds no token"},
+		{"enabled with a token is fine", launcherConsoleManifest(), picoOK, OK, false, `web console chat: channel "pico" enabled`},
+		{"matched by type, not map key", launcherConsoleManifest(), picoTyped, WARN, false, "webchat"},
+		{"never set up is the launcher's own first run", launcherConsoleManifest(), noPico, 0, true, ""},
+		{"console off is clean", &manifest.Manifest{Container: manifest.Container{
+			Image: generate.LauncherImage, Name: "piccolo-gateway",
+		}}, picoOff, 0, true, ""},
+		{"dead port is already one warning", &manifest.Manifest{Container: manifest.Container{
+			Image: generate.DefaultImage, Name: "piccolo-gateway",
+			Ports: []string{"127.0.0.1:18800:18800"},
+		}}, picoOff, 0, true, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			res := checkConsoleChat(tc.m, []byte(tc.cfg), picoclaw.Secrets{})
+			if tc.quiet {
+				if len(res) != 0 {
+					t.Fatalf("want no result, got %+v", res)
+				}
+				return
+			}
+			if len(res) != 1 || res[0].Status != tc.want {
+				t.Fatalf("want one %v, got %+v", tc.want, res)
+			}
+			if !strings.Contains(res[0].Message, tc.message) {
+				t.Errorf("message must state %q: %s", tc.message, res[0].Message)
+			}
+			if strings.Contains(res[0].Message, "pico-token") {
+				t.Errorf("console chat line leaked the token: %s", res[0].Message)
+			}
+		})
+	}
+}
+
+// The pico token lives in the sidecar once anything saves through PicoClaw, and
+// an enabled channel whose only credential is there is a working console.
+func TestDoctorConsoleChatCountsSidecarTokenAsConfigured(t *testing.T) {
+	dir := initWorkspace(t)
+	patchConfig(t, dir, func(cfg map[string]any) {
+		cfg["channel_list"] = map[string]any{
+			"pico": map[string]any{"enabled": true, "type": "pico", "settings": map[string]any{}},
+		}
+	})
+	patchManifest(t, dir, func(m *manifest.Manifest) {
+		m.Container.Image = generate.LauncherImage
+		m.Container.Ports = []string{"127.0.0.1:18800:18800"}
+	})
+	writeSidecar(t, dir, "channel_list:\n  pico:\n    settings:\n      token: pico-from-sidecar\n")
+
+	results := Run(context.Background(), Options{Workspace: dir, Engine: fakeEngine{imageExists: true}})
+	if r := find(results, "holds no token"); r != nil {
+		t.Errorf("sidecar-held pico token read as missing: %s", r.Text())
+	}
+	r := find(results, "web console chat:")
+	if r == nil || r.Status != OK {
+		t.Fatalf("console chat not reported OK: %v", results)
+	}
+	if strings.Contains(r.Text(), "pico-from-sidecar") {
+		t.Errorf("line leaked the token: %s", r.Text())
 	}
 }
