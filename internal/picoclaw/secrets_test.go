@@ -3,6 +3,7 @@ package picoclaw
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -272,5 +273,64 @@ func TestSecretFieldNameExcludesAmbiguousNames(t *testing.T) {
 		if !IsSecretFieldName(n) {
 			t.Errorf("%q must be treated as a credential", n)
 		}
+	}
+}
+
+// ChannelsWithUsableSecrets is the accessor behind doctor's channel findings, and
+// its job is to NOT list the empty entries upstream writes for every channel type
+// it knows: one configured channel produces a sidecar naming fifteen, and treating
+// those as credentials would warn on a healthy workspace. It also decides which
+// disabled channel is "parked" rather than "never configured".
+func TestChannelsWithUsableSecretsSkipsEmptyDefaults(t *testing.T) {
+	body := `channel_list:
+  dingtalk:
+    settings: {}
+  discord:
+    settings:
+      token: dt-real
+  pico:
+    settings:
+      token: enc://abcdefgh
+  telegram:
+    settings:
+      token: ""
+  slack:
+    settings:
+      bot_token: YOUR_SLACK_TOKEN
+      app_token: xapp-real
+`
+	s := LoadSecrets(sidecarFixture(t, body))
+	if s.Err != nil {
+		t.Fatalf("parse: %v", s.Err)
+	}
+	want := []ChannelCredential{
+		{Channel: "discord", Fields: []string{"token"}},
+		{Channel: "pico", Fields: []string{"token"}},
+		{Channel: "slack", Fields: []string{"app_token"}},
+	}
+	got := s.ChannelsWithUsableSecrets()
+	if len(got) != len(want) {
+		t.Fatalf("ChannelsWithUsableSecrets() = %+v, want %+v", got, want)
+	}
+	for i := range want {
+		if got[i].Channel != want[i].Channel {
+			t.Errorf("entry %d: channel %q, want %q (sorted by name)", i, got[i].Channel, want[i].Channel)
+		}
+		if strings.Join(got[i].Fields, ",") != strings.Join(want[i].Fields, ",") {
+			t.Errorf("entry %d: fields %v, want %v", i, got[i].Fields, want[i].Fields)
+		}
+	}
+	// Field names only. This type exists so a report can point at a credential
+	// without holding it.
+	for _, cred := range got {
+		for _, leaked := range []string{"dt-real", "enc://abcdefgh", "xapp-real"} {
+			if strings.Contains(cred.Channel+strings.Join(cred.Fields, ","), leaked) {
+				t.Errorf("credential value leaked into %s: %s", cred.Channel, leaked)
+			}
+		}
+	}
+	// The zero value means "no sidecar" and must stay safe to call.
+	if n := len(Secrets{}.ChannelsWithUsableSecrets()); n != 0 {
+		t.Errorf("zero-value sidecar reported %d channels", n)
 	}
 }

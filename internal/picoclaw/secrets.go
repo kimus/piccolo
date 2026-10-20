@@ -285,6 +285,43 @@ func (s Secrets) EncryptedSecureValues() []string {
 	return append([]string(nil), s.encrypted...)
 }
 
+// ChannelCredential names one channel the sidecar carries a usable credential
+// for, and which fields. The values are deliberately absent: a caller must be
+// able to ask whether anything guards a channel without holding the secret.
+type ChannelCredential struct {
+	Channel string
+	Fields  []string // sorted secure-field names holding a usable value, never the values
+}
+
+// ChannelsWithUsableSecrets lists the sidecar's channels that hold a real
+// credential, sorted by channel name.
+//
+// A channel the sidecar writes with an empty `settings: {}` is NOT listed, and
+// that distinction is the whole method. PicoClaw's SaveConfig serializes its
+// entire default channel map (pkg/config/defaults.go defaultChannels, merged into
+// the loaded file by ChannelsConfig.UnmarshalJSON), so a workspace with one
+// configured channel gains a sidecar entry for every channel type upstream knows
+// — fifteen of them at v0.3.1 — each holding nothing. Counting those as
+// credentials would flag a healthy workspace for the shape of PicoClaw's defaults.
+func (s Secrets) ChannelsWithUsableSecrets() []ChannelCredential {
+	var out []ChannelCredential
+	for name, fields := range s.channels {
+		var usable []string
+		for field, value := range fields {
+			if HasUsableKey(value) {
+				usable = append(usable, field)
+			}
+		}
+		if len(usable) == 0 {
+			continue
+		}
+		sort.Strings(usable)
+		out = append(out, ChannelCredential{Channel: name, Fields: usable})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Channel < out[j].Channel })
+	return out
+}
+
 func (s Secrets) ChannelSecret(channel, field string) ChannelSecret {
 	v, ok := s.channels[channel][field]
 	if !ok {
